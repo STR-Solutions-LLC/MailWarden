@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mailwarden.filter</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/MailWarden.app/Contents/MacOS/python</string>
+        <string>/Applications/MailWarden.app/Contents/Resources/launcher.py</string>
+        <string>--run-filter</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- PYTHONHOME tells the bundled python.org binary where its
+             stdlib lives. Without it, python falls back to its
+             compile-time default which only exists on the build machine.
+             On any other Mac, init_fs_encoding crashes with
+             ModuleNotFoundError: No module named 'encodings' before
+             launcher.py ever runs. -->
+        <key>PYTHONHOME</key>
+        <string>/Applications/MailWarden.app/Contents/Resources</string>
+        <key>PYTHONUTF8</key>
+        <string>1</string>
+        <key>LC_ALL</key>
+        <string>en_US.UTF-8</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <!-- Wake every 5 minutes. This is the MINIMUM wake cadence, not the
+         user's chosen interval. The user's "check inbox every N minutes"
+         setting lives in config.json (filter.interval_minutes) and is
+         enforced inside spam_filter.py by an elapsed-time gate: a scheduled
+         wake that fires sooner than N minutes after the last real run exits
+         early before any IMAP login. SMAppService plists are static and
+         signed read-only, so the cadence cannot be rewritten per-user here;
+         the in-filter gate is what makes the setting take effect. -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- StandardOutPath / StandardErrorPath / WorkingDirectory removed.
+         SMAppService does NOT expand $(HOME) in plist string values; the
+         literal "$(HOME)/..." paths cause launchd to fail spawn with
+         EX_CONFIG (78). Python's logging.handlers.RotatingFileHandler
+         already writes to the correct ~/MailWarden/logs/spam_filter.log
+         using Path.home() which resolves via pwd.getpwuid() independent
+         of $HOME. _run_user_script in app_entrypoint.py also chdir's to
+         paths.MAILWARDEN_ROOT, so WorkingDirectory is redundant. See
+         menubar plist for full diagnostic notes. -->
+</dict>
+</plist>

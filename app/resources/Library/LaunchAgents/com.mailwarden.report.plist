@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mailwarden.report</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/MailWarden.app/Contents/MacOS/python</string>
+        <string>/Applications/MailWarden.app/Contents/Resources/launcher.py</string>
+        <string>--run-report</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- See com.mailwarden.filter.plist for why PYTHONHOME is required
+             when launchd invokes the bundled python directly. -->
+        <key>PYTHONHOME</key>
+        <string>/Applications/MailWarden.app/Contents/Resources</string>
+        <key>PYTHONUTF8</key>
+        <string>1</string>
+        <key>LC_ALL</key>
+        <string>en_US.UTF-8</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>8</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <!-- StandardOutPath / StandardErrorPath / WorkingDirectory removed —
+         SMAppService does not expand $(HOME). See filter / menubar plists
+         for full notes. Python handles its own logging + chdir. -->
+</dict>
+</plist>

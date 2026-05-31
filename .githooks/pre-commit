@@ -1,0 +1,88 @@
+#!/bin/sh
+# (c) 2026 STR Solutions, LLC. All rights reserved.
+#
+# Pre-commit hook for MailWarden installer repo.
+# Scans staged files for real Anthropic API keys (40+ chars after sk-ant-),
+# developer email addresses, developer hostnames, and private payload files.
+# Doc references like "sk-ant-YOUR-KEY-HERE" are tolerated.
+#
+# Install: cp .githooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+
+FAIL=0
+
+# Meta-scanner files legitimately contain the patterns they check for.
+# They are part of the build tooling, not the shipped payload.
+is_meta_scanner() {
+    case "$1" in
+        .githooks/pre-commit|\
+        build_installer.sh|\
+        scripts/audit_payload.sh|\
+        scripts/scrub_signals.py|\
+        app/mailwarden_app/bootstrap.py|\
+        app/mailwarden_app/launchd_install.py)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+staged_real_files() {
+    git diff --cached --name-only --diff-filter=ACMR -z \
+        | xargs -0 -I {} sh -c '[ -f "$1" ] && printf "%s\n" "$1"' _ {}
+}
+
+scan_pattern() {
+    pattern="$1"
+    label="$2"
+    # Scan the STAGED BLOB (`git show :$f`) rather than the working-tree
+    # file. Otherwise a developer could stage a secret, remove it from the
+    # worktree, and commit — the hook would see the clean working copy and
+    # pass even though the staged content still contains the secret.
+    staged_real_files | while read -r f; do
+        is_meta_scanner "$f" && continue
+        if git show ":$f" 2>/dev/null | grep -qE "$pattern"; then
+            printf "BLOCKED: %s (staged content) contains %s\n" "$f" "$label" >&2
+            echo "1"
+        fi
+    done
+}
+
+# Real API keys (40+ chars after sk-ant-)
+HITS="$(scan_pattern 'sk-ant-[A-Za-z0-9_-]{40,}' 'a real Anthropic API key')"
+[ -n "$HITS" ] && FAIL=1
+
+# Developer email addresses
+HITS="$(scan_pattern '(matt@nthmonkey\.com|@nthmonkey\.com|dumbmachine@|@First-Chairbook|info@firstchairmarketing\.com|@firstchairmarketing\.com)' 'a developer email address')"
+[ -n "$HITS" ] && FAIL=1
+
+# Developer hostnames / user paths
+HITS="$(scan_pattern '(box5275\.bluehost\.com|First-Chairbook|/Users/mattrosenberg|/Users/dumbmachine)' 'a developer hostname or user path')"
+[ -n "$HITS" ] && FAIL=1
+
+# Forbidden payload paths (config.json, raw eml files, decision logs)
+staged_real_files | while read -r f; do
+    case "$f" in
+        payload/MailWarden/config/config.json)
+            echo "BLOCKED: $f (real credentials — never commit)" >&2
+            echo "1"
+            ;;
+        payload/MailWarden/spam_examples/*.eml)
+            echo "BLOCKED: $f (private email content — never commit)" >&2
+            echo "1"
+            ;;
+        payload/MailWarden/memory/decisions.log)
+            echo "BLOCKED: $f (dev classification log — never commit)" >&2
+            echo "1"
+            ;;
+    esac
+done | grep -q 1 && FAIL=1
+
+if [ $FAIL -ne 0 ]; then
+    echo ""
+    echo "Commit aborted. Remove the flagged content and re-stage."
+    echo "If this is a false positive in documentation, use a placeholder"
+    echo "like 'sk-ant-YOUR-KEY-HERE' (under 40 chars) instead of a real value."
+    exit 1
+fi
+
+exit 0

@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- (c) 2026 STR Solutions, LLC. All rights reserved. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mailwarden.menubar</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/MailWarden.app/Contents/MacOS/python</string>
+        <string>/Applications/MailWarden.app/Contents/Resources/launcher.py</string>
+        <string>--menu-bar</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- See com.mailwarden.filter.plist for why PYTHONHOME is required
+             when launchd invokes the bundled python directly.
+             Without this, the bundled python crashes on init with
+             ModuleNotFoundError: No module named 'encodings'. -->
+        <key>PYTHONHOME</key>
+        <string>/Applications/MailWarden.app/Contents/Resources</string>
+        <key>PYTHONUTF8</key>
+        <string>1</string>
+        <key>LC_ALL</key>
+        <string>en_US.UTF-8</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- KeepAlive=true makes launchd restart the menu bar agent if it ever
+         dies (crash, OOM, user Cmd-Q from menu). This is what makes the
+         icon persist like an antivirus indicator. User can disable it
+         explicitly from Dashboard -> Settings -> Menu bar. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <!-- NOTE: StandardOutPath / StandardErrorPath / WorkingDirectory removed.
+         SMAppService-managed launchd agents do NOT perform $(HOME) shell
+         expansion the way traditional launchctl-loaded plists do — `launchctl
+         print` shows the literal string "$(HOME)/MailWarden/logs/menubar.log"
+         and launchd then fails to open the path during spawn, killing the
+         agent with EX_CONFIG (78) before any code runs. The Python process
+         handles its own logging via Path.home() / "MailWarden" / "logs" /
+         ... which uses pwd.getpwuid(os.getuid()) — independent of the HOME
+         env var that launchd doesn't set for these agents. Stderr (Cocoa
+         warnings, etc.) goes to the system log instead of a file — visible
+         in Console.app if needed. Diagnosed 2026-05-29 against v1.6.0-beta.3
+         after agent showed 1157 spawn failures with exit code 78. -->
+</dict>
+</plist>

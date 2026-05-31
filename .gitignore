@@ -1,0 +1,73 @@
+# (c) 2026 STR Solutions, LLC. All rights reserved.
+
+# --- Compiled installer artifacts (never commit binaries) ---
+*.pkg
+build/
+dist/
+MailWarden-component.pkg
+
+# --- Built .app bundle (produced locally by py2app) ---
+app/MailWarden.app/
+app/build/
+app/dist/
+app/build-venv/
+app/resources/defaults/
+app/resources/payload/
+app/resources/app_icon.preview.png
+
+# RTF renders of welcome/readme/eula (generated at build from .html source)
+resources/welcome.rtf
+resources/readme.rtf
+resources/eula.rtf
+
+# --- Payload exclusions: dev data must never enter the payload ---
+payload/MailWarden/config/config.json
+payload/MailWarden/memory/*.json
+payload/MailWarden/memory/decisions.log
+payload/MailWarden/memory/eula_sent.json
+payload/MailWarden/spam_examples/
+payload/MailWarden/false_positives/
+payload/MailWarden/logs/
+payload/MailWarden/.git/
+payload/MailWarden/.gitignore
+payload/MailWarden/venv/
+payload/MailWarden/CLAUDE.md
+payload/MailWarden/README.md
+payload/MailWarden/instructions.md
+payload/MailWarden/docs/
+payload/MailWarden/__pycache__/
+
+# --- Signing & notarization (never commit secrets) ---
+codesign/*.p12
+codesign/*.key
+codesign/*.cer
+codesign/*.pem
+codesign/.notarize_credentials
+codesign/AuthKey_*.p8
+codesign/apple_id.txt
+codesign/apple_id_password.txt
+codesign/team_id.txt
+
+# --- Python/macOS noise ---
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.env
+venv/
+
+# --- pip-quoting artifacts (see §0.8) ---
+=*
+>=*
+<=*
+~=*
+
+# --- Editor/IDE ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.orig
+.bak
+.tmp

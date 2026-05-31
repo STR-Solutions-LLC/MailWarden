@@ -1,0 +1,43 @@
+{
+  "version": "1.1",
+  "last_updated": "",
+  "derived_from_examples": 0,
+  "signals": {
+    "hard_signals": [
+      "Benign conversational text block (meeting scheduling, personal reflection) prepended before promotional/scam content - used as filter evasion",
+      "CSS class names using random nature/object word combinations (e.g., 'nebula-quartz', 'pebble-orbit', 'aurora-cinder', 'thistle-comet') in HTML emails",
+      "Homoglyph substitution in subject lines: 'I' replaced with 'l' (pIan, TooI, compIimentary), '0' replaced with 'O' (0nly, 35OOWatt, 1OO)"
+    ],
+    "soft_signals": [
+      "Artificial scarcity claims with specific round numbers: 'Total allocation: 500 sets', 'Total allocation: 800 kits'",
+      "Subject line pattern: urgency word + 'Today' or 'Tomorrow' combined with brand impersonation",
+      "Body text offering premium gifts as apology for fabricated service failures (lost packages, service issues)",
+      "Mismatch between casual/personal opening paragraphs and promotional closing content",
+      "Phrases like 'You may qualify', 'eligible recipients', 'residents in your area' combined with free item offers",
+      "Medicare kit offers combined with coverage plan change notifications",
+      "Points/rewards expiration urgency with specific dollar amounts ($100)"
+    ],
+    "known_impersonated_brands": [
+      "FedEx",
+      "Costco",
+      "Sam's Club",
+      "AAA",
+      "Marriott",
+      "Harbor Freight",
+      "Tractor Supply",
+      "BlueCross"
+    ],
+    "known_sending_infrastructure": [
+      "103.188.77.x IP block",
+      "venpp.com",
+      "wildgoosechef.com",
+      "amplifiloyality.com",
+      "visitlibertycity.com",
+      "verifytrker.com",
+      "vidumanpetha.com",
+      "Relay hostname patterns: [word][number].[domain].com (e.g., token9709, solid7134, copper6141, flame4339)",
+      "Sending domains using compromised/unrelated legitimate-looking domains (ligamorazan.com, galluplionsclubrodeo.com, comandosfilmes.com, tenislibre.com, benjaminrausseo.com, macadomi.com, dalhfuneralchapel.com, jawwhiskey.com, shopgreatescape.com, factorypricedjewelry.com, beachhouseshakes.com, instrumentacionanalitica.com, bubcash.com, crusincountryradio.com, bonusfivicai.com, asianeyestry.com, lemegethat.com)"
+    ],
+    "learner_notes": "Derived from sample spam patterns. Will expand as users forward 'Fwd: SPAM Example' emails."
+  }
+}

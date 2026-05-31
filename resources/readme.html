@@ -1,0 +1,70 @@
+<!-- (c) 2026 STR Solutions, LLC. All rights reserved. -->
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+body { font-family: -apple-system, Helvetica, Arial, sans-serif;
+       line-height: 1.45; margin: 16px 20px; }
+h2 { margin-top: 0; }
+h3 { margin-top: 18px; margin-bottom: 4px; }
+code { font-family: Menlo, Monaco, monospace; font-size: 12px; }
+ul { padding-left: 20px; }
+li { margin-bottom: 4px; }
+</style>
+</head>
+<body>
+<h2>About this installer</h2>
+
+<p>MailWarden installs two things:</p>
+
+<h3>1. <code>/Applications/MailWarden.app</code></h3>
+<p>The graphical interface. Launches the Setup Assistant on first run and
+the Dashboard on every subsequent run. You can remove it by dragging
+<code>MailWarden.app</code> to the Trash.</p>
+
+<h3>2. <code>~/MailWarden/</code></h3>
+<p>The filter runtime. Contains the code that runs on an interval you
+choose (default 15 minutes, adjustable from 5 to 360 minutes), the
+learned spam signals, your whitelist and blacklist, your API usage
+history, and logs. This folder is created on your first launch of
+MailWarden.app — nothing is written here during .pkg installation.</p>
+
+<h3>Background tasks</h3>
+<p>MailWarden registers three background agents through macOS
+(Apple's SMAppService) from inside the app bundle the first time you
+launch it. They appear in <em>System Settings → General → Login Items</em>,
+where you approve MailWarden:</p>
+<ul>
+  <li><code>com.mailwarden.filter</code> — runs the spam filter on your
+      chosen interval (default 15 minutes, adjustable from 5 to 360
+      minutes).</li>
+  <li><code>com.mailwarden.report</code> — sends you a daily summary email
+      at the time you choose (default 8:00 AM).</li>
+  <li><code>com.mailwarden.menubar</code> — starts the menu bar icon at
+      login, if enabled.</li>
+</ul>
+
+<h3>Anthropic API usage</h3>
+<p>MailWarden uses your own Anthropic account to classify emails. API
+charges are billed directly to Anthropic, not to STR Solutions. Typical
+usage is pennies per day. You can check usage any time from the Dashboard.</p>
+
+<h3>Upgrades</h3>
+<p>If you install MailWarden over an existing installation, your settings,
+API key, learned signals, whitelist, and blacklist are preserved. A
+safety backup is written to <code>~/MailWarden-upgrade-backup/</code>
+before anything changes, and is not deleted automatically so you can
+restore manually if needed.</p>
+
+<h3>System sleep</h3>
+<p>The filter and daily report only run while your Mac is awake. To keep
+MailWarden active around the clock, open
+<em>System Settings → Battery → Options</em> and turn on
+<em>“Prevent automatic sleeping when the display is off”</em>. Screen
+sleep is fine; full system sleep is not.</p>
+
+<h3>Feedback</h3>
+<p>Questions, bug reports, and feature requests: <code>info@rentalist.pro</code></p>
+</body>
+</html>

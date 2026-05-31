@@ -1,0 +1,55 @@
+<!-- (c) 2026 STR Solutions, LLC. All rights reserved. -->
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+body { font-family: -apple-system, Helvetica, Arial, sans-serif;
+       line-height: 1.45; margin: 16px 20px; }
+h2 { margin-top: 0; }
+.warn { border-left: 4px solid #d97706; padding: 6px 12px; margin: 12px 0;
+        font-style: italic; }
+ul { padding-left: 20px; }
+li { margin-bottom: 4px; }
+</style>
+</head>
+<body>
+<h2>Welcome to MailWarden</h2>
+
+<p>MailWarden is an AI-powered spam filter that runs entirely on your Mac.
+It connects to your own email account, uses your own Anthropic API key to
+classify incoming messages, and moves anything it flags as spam into your
+junk folder. It learns from emails you forward it and is controlled
+entirely by you.</p>
+
+<p>This installer will:</p>
+<ul>
+  <li>Install <code>MailWarden.app</code> into <code>/Applications/</code>.</li>
+  <li>On first launch, set up <code>~/MailWarden/</code> with the filter code
+      and the background tasks that run it on an interval you choose
+      (default 15 minutes, adjustable from 5 to 360 minutes).</li>
+  <li>Walk you through a one-time Setup Assistant that asks for your
+      Anthropic API key, your email credentials, and a few preferences.</li>
+</ul>
+
+<div class="warn">
+<p><strong>Install on one Mac per email account.</strong>
+MailWarden should run on only one Mac per set of email accounts. If you
+install it on a second Mac that also checks the same email, you will pay
+for every spam classification twice and your inbox will get duplicate
+confirmation replies. Install on multiple Macs only when each Mac
+monitors a different, non-overlapping set of accounts.</p>
+</div>
+
+<p>What you will need:</p>
+<ul>
+  <li>An <strong>Anthropic API key</strong> (starts with <code>sk-ant-</code>).
+      Get one at <code>console.anthropic.com</code>.</li>
+  <li>Your <strong>email credentials</strong>. Gmail and AOL require an
+      App Password, not your regular account password.</li>
+  <li>About five minutes.</li>
+</ul>
+
+<p>Click <strong>Continue</strong> to review the license agreement.</p>
+</body>
+</html>

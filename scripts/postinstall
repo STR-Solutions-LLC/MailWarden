@@ -1,0 +1,45 @@
+#!/bin/bash
+# (c) 2026 STR Solutions, LLC. All rights reserved.
+#
+# .pkg postinstall script.
+#
+# Runs as root after /Applications/MailWarden.app is installed. Launches
+# MailWarden.app as the target user so the Setup Assistant appears immediately.
+# All ~/MailWarden/ creation is handled by the app itself (bootstrap.py) on
+# first launch — this script does not touch the user's home directory.
+
+set -u
+
+# Resolve the target user. $USER during pkg install is typically root; the
+# logged-in console user is the real target.
+TARGET_USER="${USER:-}"
+if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = "root" ]; then
+    TARGET_USER="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
+fi
+
+if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = "root" ]; then
+    echo "postinstall: could not identify logged-in user; skipping app launch." >&2
+    exit 0
+fi
+
+TARGET_HOME="$(dscl . read "/Users/$TARGET_USER" NFSHomeDirectory 2>/dev/null \
+    | awk '{print $2}')"
+if [ -z "$TARGET_HOME" ]; then
+    TARGET_HOME="/Users/$TARGET_USER"
+fi
+
+# Clean up the legacy v1.4 learner launchd agent if still present. Harmless
+# if missing — we just want it gone before bootstrap runs.
+LEGACY_PLIST="$TARGET_HOME/Library/LaunchAgents/com.mailwarden.learn.plist"
+if [ -f "$LEGACY_PLIST" ]; then
+    launchctl asuser "$(id -u "$TARGET_USER")" launchctl unload "$LEGACY_PLIST" 2>/dev/null || true
+    rm -f "$LEGACY_PLIST"
+fi
+
+# Launch MailWarden.app as the target user. The app will bootstrap
+# ~/MailWarden/ from its bundled Resources and then run either the Setup
+# Assistant (fresh) or Dashboard (upgrade).
+sudo -u "$TARGET_USER" -H /usr/bin/open /Applications/MailWarden.app \
+    >/dev/null 2>&1 || true
+
+exit 0

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- (c) 2026 STR Solutions, LLC. All rights reserved. -->
+<installer-gui-script minSpecVersion="2">
+    <title>MailWarden</title>
+    <welcome file="welcome.rtf"/>
+    <readme  file="readme.rtf"/>
+    <license file="eula.rtf"/>
+
+    <options customize="never" allow-external-scripts="no" rootVolumeOnly="true"/>
+    <os-version min="11.0"/>
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.strsolutions.mailwarden.app"/>
+        </line>
+    </choices-outline>
+
+    <choice id="default"/>
+    <choice id="com.strsolutions.mailwarden.app" visible="false">
+        <pkg-ref id="com.strsolutions.mailwarden.app"/>
+    </choice>
+
+    <pkg-ref id="com.strsolutions.mailwarden.app"
+             version="1.6.0-beta.12"
+             onConclusion="none">MailWarden-component.pkg</pkg-ref>
+</installer-gui-script>

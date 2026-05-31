@@ -1,0 +1,31 @@
+# Display names too generic to blacklist safely.
+# When a dragged .eml's sender name matches one of these,
+# only the address is blacklisted. The name is never added.
+# Add any name you consider too generic to block globally.
+# This applies to both IMAP folder drags and filesystem drags.
+
+Support
+Team
+Newsletter
+Info
+Noreply
+No-reply
+Updates
+Alerts
+Notification
+Notifications
+News
+Hello
+Welcome
+Admin
+Account
+Accounts
+Service
+Services
+Customer
+Help
+Contact
+Do Not Reply
+DoNotReply
+Mail
+Mailer

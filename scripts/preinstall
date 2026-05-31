@@ -1,0 +1,69 @@
+#!/bin/bash
+# (c) 2026 STR Solutions, LLC. All rights reserved.
+#
+# Runs BEFORE macOS Installer replaces files on disk.
+#
+# v1.6.0: MailWarden now uses SMAppService for agent lifecycle.
+# The manual launchctl bootout / pkill logic from v1.5.x is REMOVED.
+# SMAppService handles re-registration automatically on app update.
+#
+# This script's only job is a ONE-TIME MIGRATION:
+#   If legacy v1.5.x plists exist at ~/Library/LaunchAgents/com.mailwarden.*,
+#   bootout + remove them so they don't conflict with SMAppService.
+#
+# Log: /Users/Shared/MailWarden-preinstall.log
+
+set -u  # -e intentionally NOT set — best-effort cleanup
+
+LOG_FILE="/Users/Shared/MailWarden-preinstall.log"
+
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+touch "$LOG_FILE" 2>/dev/null || true
+chmod 666 "$LOG_FILE" 2>/dev/null || true
+
+log() {
+    echo "[$(date '+%Y-%m-%dT%H:%M:%S')] preinstall: $*" >> "$LOG_FILE"
+}
+
+log "===== preinstall starting (v1.6.0) ====="
+log "Running as UID=$(id -u) EUID=$(id -u) USER=${USER:-unset} HOME=${HOME:-unset}"
+
+# Determine the console user (the actual human logged in at the GUI).
+CONSOLE_USER="$(stat -f '%Su' /dev/console 2>/dev/null || echo '')"
+CONSOLE_UID=""
+CONSOLE_HOME=""
+if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ]; then
+    CONSOLE_UID="$(id -u "$CONSOLE_USER" 2>/dev/null || echo '')"
+    CONSOLE_HOME="$(dscl . read "/Users/$CONSOLE_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+    if [ -z "$CONSOLE_HOME" ]; then
+        CONSOLE_HOME="/Users/$CONSOLE_USER"
+    fi
+fi
+log "CONSOLE_USER=$CONSOLE_USER CONSOLE_UID=${CONSOLE_UID:-unset} CONSOLE_HOME=${CONSOLE_HOME:-unset}"
+
+# ONE-TIME MIGRATION: remove legacy v1.5.x LaunchAgent plists if present.
+# These lived at ~/Library/LaunchAgents/com.mailwarden.{filter,report,menubar}.plist
+# under the old launchd-install approach. SMAppService manages agents from inside
+# the .app bundle now; the old plists would be orphaned and could confuse launchd.
+# rc=5 from bootout means "not loaded" — acceptable, log and continue.
+if [ -n "$CONSOLE_UID" ] && [ -n "$CONSOLE_HOME" ]; then
+    LEGACY_LAUNCH_AGENTS_DIR="$CONSOLE_HOME/Library/LaunchAgents"
+    for label in com.mailwarden.filter com.mailwarden.report com.mailwarden.menubar; do
+        plist="$LEGACY_LAUNCH_AGENTS_DIR/${label}.plist"
+        if [ -f "$plist" ]; then
+            log "Found legacy plist: $plist — booting out and removing"
+            rc=0
+            launchctl asuser "$CONSOLE_UID" launchctl bootout "gui/$CONSOLE_UID/$label" \
+                >> "$LOG_FILE" 2>&1 || rc=$?
+            log "  bootout $label rc=$rc (rc=5 means not loaded, ok)"
+            rm -f "$plist" && log "  removed $plist" || log "  could not remove $plist"
+        else
+            log "No legacy plist at $plist (ok)"
+        fi
+    done
+else
+    log "WARNING: could not determine console user — skipping legacy plist migration"
+fi
+
+log "===== preinstall finished ====="
+exit 0
