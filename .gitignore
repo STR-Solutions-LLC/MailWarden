@@ -55,6 +55,8 @@ __pycache__/
 .DS_Store
 .env
 venv/
+tests/.venv/
+tests/_out/
 
 # --- pip-quoting artifacts (see §0.8) ---
 =*
@@ -71,3 +73,8 @@ venv/
 .orig
 .bak
 .tmp
+# Local-only test fixtures and agent tooling — never commit (contains real personal email/PII)
+tests/fixtures/
+*.eml
+.claude/
+.claude-mpm/

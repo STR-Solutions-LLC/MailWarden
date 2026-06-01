@@ -297,6 +297,173 @@ def _run_user_script(script_name: str) -> int:
     return 0
 
 
+def _run_classify_eml() -> int:
+    """Offline classification harness: classify a raw .eml from disk through the
+    REAL pre-classifier + AI path, with NO IMAP, NO processed-ids, NO folder
+    moves, and NO writes to the live decisions log or token usage. The primary
+    local regression tool (build machine) and on-device confidence check (M1).
+
+    Usage:
+      MailWarden --classify-eml "<path.eml>" [--account NAME] [--signals PATH]
+                 [--model NAME] [--threshold 0.85] [--dnsbl]
+
+    API key resolution (read-only): $ANTHROPIC_API_KEY, else the anthropic.api_key
+    in ~/MailWarden/config/config.json (the same key the app uses). Never printed.
+    """
+    import json as _json
+    import logging as _logging
+
+    argv = sys.argv
+
+    def _opt(name, default=None):
+        if name in argv:
+            i = argv.index(name)
+            if i + 1 < len(argv):
+                return argv[i + 1]
+        return default
+
+    idx = argv.index("--classify-eml")
+    eml_path = None
+    for a in argv[idx + 1:]:
+        if not a.startswith("--"):
+            eml_path = a
+            break
+    if not eml_path:
+        sys.stderr.write(
+            'Usage: MailWarden --classify-eml "<path to .eml>" '
+            '[--account NAME] [--signals PATH] [--model NAME] '
+            '[--threshold N] [--dnsbl]\n')
+        return 2
+
+    account = _opt("--account")
+    signals_override = _opt("--signals")
+    model_override = _opt("--model")
+    threshold_override = _opt("--threshold")
+    run_dnsbl = "--dnsbl" in argv
+
+    p = Path(eml_path).expanduser()
+    if not p.is_file():
+        sys.stderr.write(f"MailWarden: no such .eml file: {p}\n")
+        return 2
+
+    # Locate the filter src and import it. Prefer the installed runtime copy
+    # (~/MailWarden/src); fall back to the build tree's payload/MailWarden/src.
+    bundled_src = None
+    if (paths.SRC_DIR / "spam_filter.py").exists():
+        bundled_src = paths.SRC_DIR
+    else:
+        here = Path(__file__).resolve()
+        for ancestor in list(here.parents):
+            cand = ancestor / "payload" / "MailWarden" / "src"
+            if cand.is_dir():
+                bundled_src = cand
+                break
+    if bundled_src is None:
+        sys.stderr.write("MailWarden: could not locate filter src (spam_filter.py)\n")
+        return 2
+    if str(bundled_src) not in sys.path:
+        sys.path.insert(0, str(bundled_src))
+
+    import spam_filter  # noqa: E402
+
+    # Resolve signals (read-only): --signals override, else runtime user signals,
+    # else shipped defaults. Offline classify NEVER writes signals.
+    signals = {"signals": {}}
+    signals_src = "(empty)"
+    candidates = []
+    if signals_override:
+        candidates.append(Path(signals_override).expanduser())
+    candidates.append(paths.SIGNALS_PATH)
+    candidates.append(get_bundled_defaults_dir() / "signals.json")
+    for c in candidates:
+        try:
+            if c and c.is_file():
+                with c.open(encoding="utf-8") as f:
+                    signals = _json.load(f)
+                signals_src = str(c)
+                break
+        except Exception as e:
+            sys.stderr.write(f"MailWarden: could not read signals {c}: {e}\n")
+
+    # Resolve api key + model + threshold (read-only) from env or runtime config.
+    cfg = {}
+    try:
+        if paths.CONFIG_PATH.is_file():
+            with paths.CONFIG_PATH.open(encoding="utf-8") as f:
+                cfg = _json.load(f)
+    except Exception:
+        cfg = {}
+    anthro = cfg.get("anthropic", {}) if isinstance(cfg, dict) else {}
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "") or anthro.get("api_key", "") or ""
+    model = model_override or anthro.get("model") or "claude-haiku-4-5-20251001"
+    threshold = 0.85
+    if threshold_override is not None:
+        try:
+            threshold = float(threshold_override)
+        except ValueError:
+            pass
+    elif isinstance(cfg, dict):
+        threshold = cfg.get("filter", {}).get("confidence_threshold", 0.85)
+
+    raw = p.read_bytes()
+
+    # Stderr logger only — never touch the live filter log.
+    log = _logging.getLogger("classify_eml")
+    log.setLevel(_logging.INFO)
+    if not log.handlers:
+        h = _logging.StreamHandler(sys.stderr)
+        h.setFormatter(_logging.Formatter("    [%(levelname)s] %(message)s"))
+        log.addHandler(h)
+
+    res = spam_filter.classify_eml_offline(
+        raw, signals,
+        api_key=api_key, model=model, max_tokens=500,
+        threshold=threshold, account_name=account,
+        run_dnsbl=run_dnsbl, logger=log,
+    )
+
+    pre = res.get("pre_classifier", {})
+    ai = res.get("ai")
+    usage = res.get("usage")
+    print("=" * 64)
+    print("MailWarden --classify-eml")
+    print(f"  file:     {p}")
+    print(f"  from:     {res.get('from_email', '')}")
+    print(f"  subject:  {res.get('subject', '')}")
+    print(f"  signals:  {signals_src}")
+    if account:
+        print(f"  account:  {account}")
+    print("-" * 64)
+    print("PRE-CLASSIFIER (header checks — free, no AI):")
+    print(f"  hard signals: {pre.get('hard_signals') or '(none)'}")
+    print(f"  soft signals: {pre.get('soft_signals') or '(none)'}")
+    if pre.get("verdict") == "SPAM":
+        print(f"  -> BLOCKED HERE at {pre.get('confidence'):.2f} — no Claude call made ($0)")
+    else:
+        print("  -> not blocked here; routed to Claude")
+    print("-" * 64)
+    if ai is None:
+        print("AI: (not called — pre-classifier already decided)")
+    elif ai.get("error"):
+        print(f"AI: ERROR — {ai['error']}")
+    else:
+        print("AI CLASSIFIER (Claude):")
+        print(f"  decision:   {ai.get('decision')}")
+        print(f"  confidence: {ai.get('confidence')}")
+        print(f"  signals:    {ai.get('signals_hit')}")
+        print(f"  reasoning:  {ai.get('reasoning')}")
+    if usage:
+        print(f"  tokens:     in={usage['input_tokens']} out={usage['output_tokens']} "
+              f"model={usage['model']}")
+    print("-" * 64)
+    final = res.get("final_decision")
+    label = {"JUNK": "WOULD JUNK", "PASS": "WOULD PASS",
+             "UNKNOWN": "UNDECIDED"}.get(final, str(final))
+    print(f"FINAL: {label}   (decided by {res.get('decided_by')})")
+    print("=" * 64)
+    return 0
+
+
 def main() -> int:
     """Dispatch to a filter run, menu bar, Setup Assistant, or Dashboard."""
     # Build-time gates. Neither should touch the user's ~/MailWarden/.
@@ -304,6 +471,8 @@ def main() -> int:
         return _run_diagnose()
     if "--test-validate" in sys.argv:
         return _run_test_validate()
+    if "--classify-eml" in sys.argv:
+        return _run_classify_eml()
 
     from . import startup_log
     startup_log.session_start()

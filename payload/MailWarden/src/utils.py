@@ -194,26 +194,145 @@ def check_auth_results(headers: dict) -> dict:
     return {"signal": None, "detail": ""}
 
 
-def check_spam_score(headers: dict) -> dict:
-    """Signal 2: X-Spam-Score / X-Spam-Flag (Bluehost SpamAssassin).
-    Soft signal if score >= 3.0 or flag is YES."""
-    score_hdr = headers.get("X-Spam-Score", "") or ""
-    flag_hdr = headers.get("X-Spam-Flag", "") or ""
+def summarize_authentication(headers: dict, from_domain: str = "") -> dict:
+    """Summarize SPF/DKIM/DMARC results + the cryptographically VERIFIED sending
+    domain(s) for the AI classifier (F3). HOST-AGNOSTIC.
 
-    if flag_hdr.strip().upper() == "YES":
+    Parses the RFC 8601 ``Authentication-Results`` header — emitted by virtually
+    every modern mail provider (Gmail, Outlook/Office365, Yahoo/AOL, Proofpoint,
+    cPanel/Exim, Zoho, Fastmail, …) — plus its ARC-sealed variant
+    ``ARC-Authentication-Results`` (present when mail is forwarded/relayed, e.g.
+    through Microsoft) and the standalone ``Received-SPF`` header. It reads only
+    STANDARD tokens (``spf=``, ``dkim=``, ``dmarc=``, ``header.from=``,
+    ``header.d=``, ``header.i=@``, ``smtp.mailfrom=``), never any host-specific
+    format, so it is independent of the user's email provider. Opaque
+    provider-private blobs (X-YMailISG, X-Spam-*, etc.) are ignored.
+
+    Security: a domain is listed in ``authenticated_domains`` ONLY when the
+    relevant check actually PASSED. A bare ``DKIM-Signature: d=`` (an unverified
+    *claim* any sender can write) is reported separately as
+    ``claimed_dkim_domain`` and is NOT treated as authenticated. When a host
+    emits no auth headers at all, every result is ``"none"`` and
+    ``authenticated_domains`` is empty — the classifier then judges on other
+    evidence (and, per policy, leans toward NOT_SPAM).
+
+    Returns a dict: spf, dkim, dmarc, dmarc_from, spf_mailfrom,
+    claimed_dkim_domain, authenticated_domains (sorted), from_domain.
+    """
+    auth = "  ".join(p for p in (
+        str(headers.get("Authentication-Results", "") or ""),
+        str(headers.get("ARC-Authentication-Results", "") or ""),
+    ) if p)
+    received_spf = str(headers.get("Received-SPF", "") or "")
+    dkim_sig = str(headers.get("DKIM-Signature", "") or "")
+
+    def _result(token, text):
+        m = re.search(r'\b' + token + r'\s*=\s*(\w+)', text, re.IGNORECASE)
+        return m.group(1).lower() if m else ""
+
+    def _domain_of(value):
+        value = value.strip().strip('<>"').lower()
+        if "@" in value:
+            value = value.split("@", 1)[1]
+        return value.rstrip(".")
+
+    spf = _result("spf", auth)
+    if not spf and received_spf:
+        spf = (received_spf.strip().split(None, 1)[0] or "").lower()
+    dmarc = _result("dmarc", auth)
+    dkim_all = [r.lower() for r in re.findall(r'\bdkim\s*=\s*(\w+)', auth, re.IGNORECASE)]
+    dkim = "pass" if "pass" in dkim_all else (dkim_all[0] if dkim_all else "")
+
+    authenticated = set()
+
+    # DKIM-authenticated domains — only when DKIM passed.
+    if dkim == "pass":
+        for m in re.finditer(r'header\.(?:i\s*=\s*@?|d\s*=\s*)([a-z0-9.\-]+)',
+                             auth, re.IGNORECASE):
+            authenticated.add(m.group(1).lower().lstrip("@").rstrip("."))
+
+    # DMARC alignment domain (the From: organizational domain) — only when DMARC passed.
+    dmarc_from = ""
+    m = re.search(r'header\.from\s*=\s*([a-z0-9.\-]+)', auth, re.IGNORECASE)
+    if m:
+        dmarc_from = m.group(1).lower().rstrip(".")
+        if dmarc == "pass":
+            authenticated.add(dmarc_from)
+
+    # SPF-authenticated envelope domain — only when SPF passed.
+    spf_mailfrom = ""
+    m = re.search(r'smtp\.mailfrom\s*=\s*([^\s;()]+)', auth, re.IGNORECASE)
+    if m:
+        spf_mailfrom = _domain_of(m.group(1))
+    if not spf_mailfrom and received_spf:
+        m = re.search(r'domain of\s+([^\s)]+)', received_spf, re.IGNORECASE)
+        if m:
+            spf_mailfrom = _domain_of(m.group(1))
+    if spf == "pass" and spf_mailfrom:
+        authenticated.add(spf_mailfrom)
+
+    # Unverified DKIM-Signature d= CLAIM — never authenticated unless DKIM passed.
+    claimed_dkim = ""
+    m = re.search(r'\bd\s*=\s*([a-z0-9.\-]+)', dkim_sig, re.IGNORECASE)
+    if m:
+        claimed_dkim = m.group(1).lower().rstrip(".")
+        if dkim == "pass":
+            authenticated.add(claimed_dkim)
+
+    return {
+        "spf": spf or "none",
+        "dkim": dkim or "none",
+        "dmarc": dmarc or "none",
+        "dmarc_from": dmarc_from,
+        "spf_mailfrom": spf_mailfrom,
+        "claimed_dkim_domain": claimed_dkim,
+        "authenticated_domains": sorted(authenticated),
+        "from_domain": (from_domain or "").lower().lstrip("@").rstrip("."),
+    }
+
+
+def check_spam_score(headers: dict) -> dict:
+    """Signal 2: SpamAssassin verdict (Bluehost / cPanel).
+
+    IMPORTANT (F1): the ``X-Spam-Score`` header is the SpamAssassin score
+    multiplied by TEN — a clean score of 1.6 is stamped as ``X-Spam-Score: 16``.
+    Reading that integer as the score made clean mail look like 16 and was a
+    primary false-positive source. We now IGNORE ``X-Spam-Score`` entirely and
+    read the REAL decimal from ``X-Spam-Status`` (``score=N.N``) plus the verdict
+    from ``X-Spam-Flag`` / ``X-Spam-Status``.
+
+    SpamAssassin runs UPSTREAM of MailWarden, so genuinely spammy mail is
+    normally moved out before we ever see it — nearly everything we evaluate is
+    ``Flag: NO`` with a low score. Therefore only a genuinely HIGH verdict counts
+    as spam evidence (and even then it is a SOFT signal that routes to the AI; it
+    never auto-junks):
+      - ``X-Spam-Flag: YES``, or
+      - ``X-Spam-Status`` verdict ``Yes``, or
+      - real decimal score >= 5.0 (SpamAssassin's usual spam threshold; covers
+        'tag-only' configs that still deliver flagged mail to the inbox).
+    The normal low range is treated as NO signal (mild evidence of legitimacy,
+    not spam). AOL/Yahoo do not stamp ``X-Spam-*`` at all → no signal there.
+    """
+    flag_hdr = (headers.get("X-Spam-Flag", "") or "").strip().upper()
+    status_hdr = headers.get("X-Spam-Status", "") or ""
+
+    if flag_hdr == "YES":
         return {"signal": "ELEVATED_SPAM_SCORE", "detail": "X-Spam-Flag: YES"}
 
-    if score_hdr:
-        try:
-            # Extract the first float-looking number
-            m = re.search(r'-?\d+\.?\d*', str(score_hdr))
-            if m:
-                score = float(m.group(0))
-                if score >= 3.0:
+    # X-Spam-Status looks like:  "No, score=1.6 required=5.0 ..."  or  "Yes, score=7.2 ..."
+    if status_hdr:
+        if re.match(r'\s*yes\b', status_hdr, re.IGNORECASE):
+            return {"signal": "ELEVATED_SPAM_SCORE",
+                    "detail": f"X-Spam-Status verdict Yes ({status_hdr.strip()[:60]})"}
+        m = re.search(r'score=(-?\d+\.?\d*)', status_hdr, re.IGNORECASE)
+        if m:
+            try:
+                score = float(m.group(1))
+                if score >= 5.0:
                     return {"signal": "ELEVATED_SPAM_SCORE",
-                            "detail": f"X-Spam-Score: {score}"}
-        except (ValueError, TypeError):
-            pass
+                            "detail": f"SpamAssassin score {score} (>=5.0)"}
+            except ValueError:
+                pass
 
     return {"signal": None, "detail": ""}
 
@@ -735,15 +854,18 @@ def check_header_signals(headers: dict, plain_text_body: str,
             soft_signals.append(s7["signal"])
             signal_details[s7["signal"]] = s7["detail"]
 
-    # Compute verdict
+    # Compute verdict.
+    # F2 (Matt-locked): ONLY hard signals may auto-junk. A stack of soft signals
+    # — no matter how many — is NEVER auto-junked; it is routed to the AI as
+    # context for a real decision. Previously >=3 soft auto-junked at 0.88, which
+    # silently junked legitimate bulk/transactional mail (e.g. Dashlane) with no
+    # AI call. The soft_signals list is still returned so the caller can pass it
+    # to the classifier as non-dispositive context.
     verdict = None
     confidence = 0.0
     if hard_signals:
         verdict = "SPAM"
         confidence = 0.95
-    elif len(soft_signals) >= 3:
-        verdict = "SPAM"
-        confidence = 0.88
 
     return {
         "hard_signals": hard_signals,
