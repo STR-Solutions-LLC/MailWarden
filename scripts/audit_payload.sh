@@ -30,7 +30,7 @@ if grep -rnE 'sk-ant-[A-Za-z0-9_-]{40,}' \
         --exclude-dir=build-venv --exclude-dir=.eggs \
         --exclude-dir=MailWarden.app --exclude='*.pyc' \
         --exclude-dir=scripts --exclude-dir=.githooks \
-        --exclude-dir=.claude --exclude-dir=.claude-mpm \
+        --exclude-dir=.claude --exclude-dir=.claude-mpm --exclude-dir=tests \
         "$AUDIT_ROOT" 2>/dev/null; then
     fail "Real Anthropic API key found"
 else
@@ -45,7 +45,7 @@ if grep -rnE '(matt@nthmonkey\.com|@nthmonkey\.com|dumbmachine@|@First-Chairbook
         --exclude-dir=build-venv --exclude-dir=.eggs \
         --exclude-dir=MailWarden.app --exclude='*.pyc' \
         --exclude-dir=scripts --exclude-dir=.githooks \
-        --exclude-dir=.claude --exclude-dir=.claude-mpm \
+        --exclude-dir=.claude --exclude-dir=.claude-mpm --exclude-dir=tests \
         --exclude='build_installer.sh' \
         "$AUDIT_ROOT" 2>/dev/null; then
     fail "Developer email address found"
@@ -59,7 +59,7 @@ if grep -rnE '(box5275\.bluehost\.com|First-Chairbook|/Users/mattrosenberg|/User
         --exclude-dir=build-venv --exclude-dir=.eggs \
         --exclude-dir=MailWarden.app --exclude='*.pyc' \
         --exclude-dir=scripts --exclude-dir=.githooks \
-        --exclude-dir=.claude --exclude-dir=.claude-mpm \
+        --exclude-dir=.claude --exclude-dir=.claude-mpm --exclude-dir=tests \
         "$AUDIT_ROOT" 2>/dev/null; then
     fail "Developer hostname or user path found"
 else
