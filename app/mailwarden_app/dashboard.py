@@ -21,6 +21,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from . import config_io
+from . import explain_text
 from . import help_content
 from . import paths
 from . import smappservice_install
@@ -131,6 +132,7 @@ class Dashboard(tk.Tk):
         self.accounts_tab = AccountsTab(self.notebook, self)
         self.lists_tab = ListsTab(self.notebook, self)
         self.signals_tab = SignalsTab(self.notebook, self)
+        self.check_tab = CheckEmailTab(self.notebook, self)
         self.usage_tab = UsageTab(self.notebook, self)
         self.settings_tab = SettingsTab(self.notebook, self)
         self.diagnostics_tab = DiagnosticsTab(self.notebook, self)
@@ -141,6 +143,7 @@ class Dashboard(tk.Tk):
             (self.accounts_tab, "Accounts"),
             (self.lists_tab, "Whitelist / Blacklist"),
             (self.signals_tab, "Signal History"),
+            (self.check_tab, "Check an Email"),
             (self.usage_tab, "API Usage"),
             (self.settings_tab, "Settings"),
             (self.diagnostics_tab, "Diagnostics"),
@@ -1724,6 +1727,406 @@ class _ScrollableTab(ttk.Frame):
     def _on_mousewheel(self, event):
         # multiplier=1: v1.5.7 calibration — do not change.
         self._canvas.yview_scroll(-1 * (event.delta // 120 or 1), "units")
+
+
+class CheckEmailTab(ttk.Frame):
+    """Phase 1a — "Check an Email" (Explain half).
+
+    Paste a raw email and see, in plain English, why MailWarden would block it
+    or let it through. A thin GUI caller of spam_filter.classify_eml_offline +
+    the explain_text library: NO IMAP, NO writes — the same code path as the
+    --classify-eml CLI harness, plus the user's allow/block lists so the answer
+    matches the live filter exactly. (The "Teach" buttons are added separately.)
+    """
+
+    def __init__(self, parent, app: "Dashboard"):
+        super().__init__(parent)
+        self.app = app
+        self._busy = False
+        self._tip = None
+        self._scroll = _ScrollableTab(self)
+        self._scroll.pack(fill=tk.BOTH, expand=True)
+        self._f = ttk.Frame(self._scroll.body, padding=(12, 8))
+        self._f.pack(fill=tk.BOTH, expand=True)
+        self._build()
+
+    def _build(self):
+        ttk.Label(self._f, text="Check an Email",
+                  style="Subheading.TLabel").pack(anchor=tk.W)
+        ttk.Label(
+            self._f, style="Muted.TLabel", wraplength=780,
+            text=("Paste an email below to see how MailWarden would handle it — "
+                  "and why. Nothing is sent, moved, or changed; this only checks.")
+        ).pack(anchor=tk.W, pady=(2, 8))
+
+        row = ttk.Frame(self._f)
+        row.pack(fill=tk.X, anchor=tk.W)
+        ttk.Label(row, text="Paste the full raw email (headers + body):").pack(side=tk.LEFT)
+        help_lbl = ttk.Label(row, text="   (?) how do I get this?",
+                             style="Muted.TLabel", cursor="question_arrow")
+        help_lbl.pack(side=tk.LEFT)
+        help_lbl.bind("<Button-1>", lambda _e: messagebox.showinfo(
+            "How to get an email's raw source", explain_text.RAW_SOURCE_HELP))
+        help_lbl.bind("<Enter>", self._show_tip)
+        help_lbl.bind("<Leave>", self._hide_tip)
+
+        txt_wrap = ttk.Frame(self._f)
+        txt_wrap.pack(fill=tk.BOTH, expand=False, pady=(4, 4))
+        self._paste = tk.Text(txt_wrap, height=12, wrap="none", undo=True)
+        yscroll = ttk.Scrollbar(txt_wrap, orient="vertical",
+                                command=self._paste.yview)
+        self._paste.configure(yscrollcommand=yscroll.set)
+        self._paste.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        yscroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        btnrow = ttk.Frame(self._f)
+        btnrow.pack(fill=tk.X, pady=(2, 4))
+        self._check_btn = ttk.Button(btnrow, text="Check this email",
+                                     command=self._on_check)
+        self._check_btn.pack(side=tk.LEFT)
+        self._status = ttk.Label(btnrow, text="", style="Muted.TLabel")
+        self._status.pack(side=tk.LEFT, padx=(10, 0))
+
+        self._results = ttk.Frame(self._f)
+        self._results.pack(fill=tk.BOTH, expand=True)
+
+    # ---- (?) raw-source help tooltip ----
+
+    def _show_tip(self, _e):
+        try:
+            if self._tip is not None:
+                return
+            x = self.winfo_pointerx() + 14
+            y = self.winfo_pointery() + 14
+            tip = tk.Toplevel(self)
+            tip.wm_overrideredirect(True)
+            tip.wm_geometry(f"+{x}+{y}")
+            ttk.Label(tip, text=explain_text.RAW_SOURCE_HELP, justify="left",
+                      wraplength=440, relief="solid", borderwidth=1,
+                      padding=(8, 6)).pack()
+            self._tip = tip
+        except Exception:
+            self._tip = None
+
+    def _hide_tip(self, _e):
+        try:
+            if self._tip is not None:
+                self._tip.destroy()
+        except Exception:
+            pass
+        self._tip = None
+
+    # ---- check flow ----
+
+    def _on_check(self):
+        if self._busy:
+            return
+        raw_text = self._paste.get("1.0", "end-1c")
+        if not raw_text.strip():
+            self._status.config(text="Paste an email first.")
+            return
+        self._clear_results()
+        if not explain_text.looks_like_email(raw_text):
+            self._result_line(
+                self._results,
+                "That doesn't look like a full email. Please paste the entire raw "
+                "source, including the header lines at the top. Click \"(?) how do "
+                "I get this?\" above for the steps in your mail app.",
+                style="Subheading.TLabel")
+            return
+        self._busy = True
+        self._check_btn.config(state="disabled")
+        self._status.config(text="Checking…")
+        raw_bytes = raw_text.encode("utf-8", errors="replace")
+        self._last_raw = raw_bytes   # reused by the Teach buttons
+        import threading
+        threading.Thread(target=self._do_check, args=(raw_bytes,),
+                         daemon=True).start()
+
+    def _do_check(self, raw_bytes: bytes):
+        try:
+            import sys as _sys
+            if (paths.SRC_DIR / "spam_filter.py").exists() \
+                    and str(paths.SRC_DIR) not in _sys.path:
+                _sys.path.insert(0, str(paths.SRC_DIR))
+            import spam_filter
+
+            signals = config_io.load_signals()
+            whitelist = config_io.load_whitelist()
+            blacklist = config_io.load_blacklist()
+            cfg = config_io.load_config()
+            anthro = cfg.get("anthropic", {}) or {}
+            api_key = os.environ.get("ANTHROPIC_API_KEY", "") \
+                or anthro.get("api_key", "") or ""
+            model = anthro.get("model") or "claude-haiku-4-5-20251001"
+            threshold = (cfg.get("filter", {}) or {}).get(
+                "confidence_threshold", 0.85)
+
+            res = spam_filter.classify_eml_offline(
+                raw_bytes, signals, api_key=api_key, model=model,
+                threshold=threshold, account_name=None,
+                whitelist=whitelist, blacklist=blacklist)
+            self.app.after(0, self._render_result, res, threshold)
+        except Exception as e:  # noqa: BLE001
+            self.app.after(0, self._render_error, f"{type(e).__name__}: {e}")
+
+    def _render_error(self, msg: str):
+        self._busy = False
+        self._check_btn.config(state="normal")
+        self._status.config(text="")
+        self._clear_results()
+        self._result_line(
+            self._results,
+            "Something went wrong checking this email: " + msg,
+            style="Subheading.TLabel")
+
+    def _render_result(self, res: dict, threshold: float):
+        self._busy = False
+        self._check_btn.config(state="normal")
+        self._status.config(text="")
+        self._clear_results()
+        body = self._results
+        decided_by = res.get("decided_by")
+        final = res.get("final_decision")
+        pre = res.get("pre_classifier", {}) or {}
+        ai = res.get("ai")
+
+        self._result_line(
+            body,
+            f"From: {res.get('from_email', '(unknown)')}     "
+            f"Subject: {res.get('subject', '(none)')}",
+            style="Muted.TLabel")
+
+        if decided_by == "lists":
+            self._result_line(
+                body, "Decided by your allow/block list — no Claude request needed.",
+                style="Subheading.TLabel", pady=(6, 0))
+            self._result_line(body, explain_text.explain_list_match(
+                res.get("list_match")))
+        elif decided_by == "pre-classifier":
+            self._result_line(
+                body, "Blocked instantly by the built-in checks — no Claude "
+                      "request needed. Here's what it caught:",
+                style="Subheading.TLabel", pady=(6, 0))
+            ex = explain_text.explain_pre_signals(
+                pre.get("hard_signals"), pre.get("soft_signals"),
+                pre.get("signal_details"))
+            for s in ex["blocked"]:
+                self._result_line(body, "•  " + s)
+        else:
+            ex = explain_text.explain_pre_signals(
+                pre.get("hard_signals"), pre.get("soft_signals"),
+                pre.get("signal_details"))
+            if ex["noticed"]:
+                self._result_line(
+                    body, "MailWarden noticed a few things, but none was enough "
+                          "to block on its own, so it asked Claude:",
+                    style="Subheading.TLabel", pady=(6, 0))
+                for s in ex["noticed"]:
+                    self._result_line(body, "•  " + s)
+            out = explain_text.explain_ai_outcome(ai, final, threshold)
+            self._result_line(body, out["headline"],
+                              style="Subheading.TLabel", pady=(6, 0))
+            if out["why"]:
+                self._result_line(body, "Why: " + out["why"])
+
+        if final == "UNKNOWN":
+            self._result_line(
+                body, "What MailWarden would do: it couldn't reach a decision — "
+                      "see the note above.",
+                style="Subheading.TLabel", pady=(10, 0))
+        else:
+            do = {"JUNK": "move this to Junk",
+                  "PASS": "let this through to the inbox"}.get(final, str(final))
+            by = {"lists": "your allow/block list",
+                  "pre-classifier": "the built-in checks",
+                  "ai": "Claude"}.get(decided_by, decided_by or "—")
+            self._result_line(
+                body, f"What MailWarden would do: {do}  (decided by {by}).",
+                style="Subheading.TLabel", pady=(10, 0))
+
+        # Teach controls (operate on the email just checked).
+        self._render_teach(body)
+
+    # ---- rendering primitives ----
+
+    def _clear_results(self):
+        for w in self._results.winfo_children():
+            w.destroy()
+
+    def _result_line(self, parent, text, style=None, wraplength=780, pady=(2, 0)):
+        kw = {"wraplength": wraplength, "text": text}
+        if style:
+            kw["style"] = style
+        ttk.Label(parent, **kw).pack(anchor=tk.W, pady=pady)
+
+    # ---- Teach ----
+
+    def _render_teach(self, parent):
+        """Render the Teach controls under a result: optional 'why' box, the
+        per-account scope picker (no silent default — pick at least one), and the
+        two direction buttons. Routes through learn_signals.propose_from_teaching,
+        which derives a generalized, scoped rule (or declines and adds nothing)
+        and lands it in Signal History -> Pending for approval."""
+        ttk.Separator(parent, orient="horizontal").pack(fill=tk.X, pady=(12, 6))
+        self._result_line(parent, "Teach MailWarden", style="Subheading.TLabel")
+
+        self._result_line(
+            parent, "Optionally, tell MailWarden what gave it away (in your own "
+                    "words):", style="Muted.TLabel")
+        self._reason_var = tk.StringVar()
+        ttk.Entry(parent, textvariable=self._reason_var, width=92).pack(
+            anchor=tk.W, pady=(2, 0))
+        self._result_line(
+            parent, "MailWarden only uses your reason if it can turn it into a "
+                    "reliable, general rule — vague hunches are ignored.",
+            style="Muted.TLabel")
+
+        accounts = config_io.load_config().get("accounts", []) or []
+        usernames = [a.get("username", "") for a in accounts if a.get("username")]
+        self._teach_usernames = usernames
+        self._teach_vars = []
+        if usernames:
+            self._result_line(
+                parent, "Apply what it learns to which account(s)?",
+                style="Muted.TLabel", pady=(6, 0))
+            self._result_line(
+                parent, "This email isn't tied to an account, so pick at least "
+                        "one — the rule only affects the accounts you choose.",
+                style="Muted.TLabel")
+            srow = ttk.Frame(parent)
+            srow.pack(anchor=tk.W)
+            for u in usernames:
+                var = tk.BooleanVar(value=False)
+                ttk.Checkbutton(srow, text=u, variable=var,
+                                command=self._update_teach_state).pack(
+                                    side=tk.LEFT, padx=(0, 12))
+                self._teach_vars.append((u, var))
+
+        brow = ttk.Frame(parent)
+        brow.pack(anchor=tk.W, pady=(8, 0))
+        self._btn_spam = ttk.Button(
+            brow, text="This should be blocked (it's spam)",
+            command=lambda: self._on_teach("spam"))
+        self._btn_spam.pack(side=tk.LEFT, padx=(0, 8))
+        self._btn_legit = ttk.Button(
+            brow, text="This is safe — MailWarden was wrong",
+            command=lambda: self._on_teach("legitimate"))
+        self._btn_legit.pack(side=tk.LEFT)
+
+        self._teach_status = ttk.Label(parent, text="", style="Muted.TLabel",
+                                       wraplength=780)
+        self._teach_status.pack(anchor=tk.W, pady=(6, 0))
+        self._update_teach_state()
+
+    def _update_teach_state(self):
+        has_accounts = bool(getattr(self, "_teach_vars", []))
+        any_on = any(v.get() for (_u, v) in getattr(self, "_teach_vars", []))
+        ok = any_on or not has_accounts
+        state = "normal" if ok else "disabled"
+        try:
+            self._btn_spam.config(state=state)
+            self._btn_legit.config(state=state)
+        except Exception:
+            pass
+        if not ok:
+            self._teach_status.config(text="Pick at least one account to teach.")
+        elif self._teach_status.cget("text") == "Pick at least one account to teach.":
+            self._teach_status.config(text="")
+
+    def _on_teach(self, direction: str):
+        if self._busy or not getattr(self, "_last_raw", None):
+            return
+        usernames = getattr(self, "_teach_usernames", [])
+        vars_ = getattr(self, "_teach_vars", [])
+        if vars_:
+            on = [u for (u, v) in vars_ if v.get()]
+            if not on:
+                self._teach_status.config(text="Pick at least one account to teach.")
+                return
+            scope = scope_from_toggle_state(usernames, on)
+        else:
+            scope = "all"
+        reason = self._reason_var.get().strip() if hasattr(self, "_reason_var") else ""
+
+        cfg = config_io.load_config()
+        anthro = cfg.get("anthropic", {}) or {}
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "") \
+            or anthro.get("api_key", "") or ""
+        if not api_key:
+            self._teach_status.config(
+                text="MailWarden needs your Claude API key (Settings) to learn "
+                     "from an email.")
+            return
+        model = anthro.get("model") or "claude-haiku-4-5-20251001"
+
+        self._busy = True
+        try:
+            self._btn_spam.config(state="disabled")
+            self._btn_legit.config(state="disabled")
+        except Exception:
+            pass
+        self._teach_status.config(text="Thinking…")
+        import threading
+        threading.Thread(
+            target=self._do_teach,
+            args=(self._last_raw, direction, reason, scope, api_key, model),
+            daemon=True).start()
+
+    def _do_teach(self, raw, direction, reason, scope, api_key, model):
+        try:
+            import sys as _sys
+            import logging as _logging
+            if (paths.SRC_DIR / "learn_signals.py").exists() \
+                    and str(paths.SRC_DIR) not in _sys.path:
+                _sys.path.insert(0, str(paths.SRC_DIR))
+            import learn_signals
+            log = _logging.getLogger("teach")
+            if not log.handlers:
+                log.addHandler(_logging.NullHandler())
+            out = learn_signals.propose_from_teaching(
+                raw, direction=direction, user_explanation=reason, scope=scope,
+                api_config={"api_key": api_key, "model": model}, logger=log)
+            self.app.after(0, self._render_teach_outcome, out)
+        except Exception as e:  # noqa: BLE001
+            self.app.after(0, self._render_teach_outcome,
+                           {"status": "error", "reason": f"{type(e).__name__}: {e}"})
+
+    def _render_teach_outcome(self, out: dict):
+        self._busy = False
+        try:
+            self._update_teach_state()  # re-enable per current selection
+        except Exception:
+            pass
+        status = (out or {}).get("status")
+        if status == "proposed":
+            ref = out.get("refinement", {}) or {}
+            hl = ref.get("headline", "a new rule")
+            self._teach_status.config(
+                text=f"MailWarden learned a rule: “{hl}”. It's waiting "
+                     f"for your OK in Signal History → Pending — nothing "
+                     f"changes until you approve it.")
+            try:
+                self.app.signals_tab.refresh()
+            except Exception:
+                pass
+        elif status == "declined":
+            self._teach_status.config(
+                text="MailWarden couldn't turn that into a reliable, general rule, "
+                     "so it added nothing. " + (out.get("reason") or ""))
+        elif status == "already_known":
+            self._teach_status.config(
+                text="MailWarden already has a rule that covers this — nothing to "
+                     "add.")
+        else:
+            self._teach_status.config(
+                text="MailWarden couldn't analyze this email right now. "
+                     + (out.get("reason") or ""))
+
+    def refresh(self):
+        # Tab-change hook. Nothing to reload destructively (don't wipe a paste or
+        # a result in progress).
+        return
 
 
 class SignalsTab(ttk.Frame):

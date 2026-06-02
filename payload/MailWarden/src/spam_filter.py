@@ -1618,10 +1618,21 @@ def build_classifier_prompt(signals: dict, account_name: str = None) -> str:
         headline = (r.get("headline") or "").strip()
         if not headline:
             continue
-        line = f"- LEARNED REFINEMENT: {headline}"
         rationale = (r.get("rationale") or "").strip()
+        verdict = (r.get("verdict") or "spam").strip().lower()
+        if verdict == "legitimate":
+            # A user-taught legitimacy rule. Render it as guidance toward
+            # NOT_SPAM, but keep it CONDITIONAL ("unless ... impersonation") so a
+            # later phishing look-alike that matches the pattern is not rescued —
+            # the authentication-vs-brand RULES in BASE_SYSTEM_PROMPT still win.
+            line = (f"- LEARNED LEGITIMATE PATTERN: {headline} — the user "
+                    f"confirmed mail matching this is legitimate; treat it as "
+                    f"NOT_SPAM unless the SERVER-VERIFIED AUTHENTICATION block "
+                    f"indicates impersonation/spoofing.")
+        else:
+            line = f"- LEARNED REFINEMENT: {headline}"
         if rationale:
-            line += f" — {rationale[:300]}"
+            line += f" {rationale[:300]}" if verdict == "legitimate" else f" — {rationale[:300]}"
         learned_parts.append(line)
 
     learned_text = "\n".join(learned_parts) if learned_parts else "No additional learned signals yet."
@@ -1934,6 +1945,26 @@ def classify_email(client: anthropic.Anthropic, system_prompt: str,
     return None, None
 
 
+def _ensure_list_sets(d: dict) -> dict:
+    """Return a copy of an allow/block-list dict with the lookup sets the
+    check_* helpers expect, computing them from the raw lists when absent.
+
+    The live filter loads lists via load_whitelist/load_blacklist (which build
+    the ``_*_set`` keys). The offline screen may pass raw config dicts instead,
+    so build the sets here when missing. Accepts None (treated as empty)."""
+    d = dict(d or {})
+    if "_addresses_set" not in d:
+        d["_addresses_set"] = {a.lower() for a in d.get("addresses", [])}
+    if "_domains_set" not in d:
+        d["_domains_set"] = {x.lower().lstrip("@") for x in d.get("domains", [])}
+    if "_display_names_set" not in d:
+        d["_display_names_set"] = {n.strip().lower() for n in d.get("display_names", [])}
+    if "_subject_keywords_lower" not in d:
+        d["_subject_keywords_lower"] = [k.strip().lower()
+                                        for k in d.get("subject_keywords", []) if k.strip()]
+    return d
+
+
 def classify_eml_offline(raw_email: bytes, signals: dict, *,
                          api_key: str = "",
                          model: str = "claude-haiku-4-5-20251001",
@@ -1941,6 +1972,8 @@ def classify_eml_offline(raw_email: bytes, signals: dict, *,
                          threshold: float = 0.85,
                          account_name: str = None,
                          run_dnsbl: bool = False,
+                         whitelist: dict = None,
+                         blacklist: dict = None,
                          logger: logging.Logger = None) -> dict:
     """Classify a raw .eml through the REAL pre-classifier + AI path, OFFLINE.
 
@@ -1976,6 +2009,49 @@ def classify_eml_offline(raw_email: bytes, signals: dict, *,
 
     msg_data = extract_email_data(raw_email)
 
+    # Deterministic allow/block lists (Phase 1a). Applied here so the offline
+    # path (the --classify-eml CLI harness and the dashboard "Check an Email"
+    # screen) reaches the SAME verdict as the live run_filter loop. Same
+    # precedence order as run_filter:
+    #   1 address-whitelist  2 blacklist  3 subject-keyword  4 domain-whitelist
+    # Runs ONLY when the caller supplies the lists (backward compatible: the
+    # CLI/old callers that pass neither keep the pure header-checks + AI path).
+    if whitelist is not None or blacklist is not None:
+        wl = _ensure_list_sets(whitelist)
+        bl = _ensure_list_sets(blacklist)
+        from_header = msg_data.get("from_header_raw", "") or msg_data.get("from_email", "")
+        subject = msg_data.get("subject", "")
+        list_match = None
+        list_decision = None
+        wl_addr = check_whitelist_address_only(from_header, wl)
+        if wl_addr:
+            list_match, list_decision = {"kind": "whitelist_address", "value": wl_addr}, "PASS"
+        else:
+            bt, bv = check_blacklist(from_header, bl)
+            if bt:
+                list_match, list_decision = {"kind": "blacklist_%s" % bt, "value": bv}, "JUNK"
+            else:
+                kw = check_subject_keywords(subject, bl)
+                if kw:
+                    list_match, list_decision = {"kind": "subject_keyword", "value": kw}, "JUNK"
+                else:
+                    wl_dom = check_whitelist(from_header, wl)
+                    if wl_dom:
+                        list_match, list_decision = {"kind": "whitelist_domain", "value": wl_dom}, "PASS"
+        if list_match:
+            return {
+                "from_email": msg_data.get("from_email", ""),
+                "subject": msg_data.get("subject", ""),
+                "pre_classifier": {"verdict": None, "confidence": 0.0,
+                                   "hard_signals": [], "soft_signals": [],
+                                   "signal_details": {}},
+                "ai": None,
+                "list_match": list_match,
+                "final_decision": list_decision,
+                "decided_by": "lists",
+                "reason": "Matched your %s: %s" % (list_match["kind"], list_match["value"]),
+            }
+
     # Mirror the production pre-classifier header assembly (see the filter loop).
     pre_headers = {
         "Authentication-Results": msg_data.get("auth_results", ""),
@@ -2009,6 +2085,7 @@ def classify_eml_offline(raw_email: bytes, signals: dict, *,
             "signal_details": pre_result["signal_details"],
         },
         "ai": None,
+        "list_match": None,
         "final_decision": None,
         "decided_by": None,
         "reason": "",

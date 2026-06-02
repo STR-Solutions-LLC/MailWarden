@@ -10,6 +10,7 @@ MailWarden connects to your email accounts (using your own Anthropic API key) an
 
 - **You can teach it with your own reasoning.** Forward it a spam example and add a sentence about *why* it's spam, and it learns from your explanation — not just the email.
 - **You decide what counts as unwanted.** Train it to treat *your* definition of junk as spam: mailing lists you can't escape, political or marketing mail that rotates sender addresses to dodge unsubscribes. If you don't want it, MailWarden learns to catch it.
+- **See why — and fix it when it's wrong.** A built-in "Check an Email" screen shows, in plain English, exactly why any message would be blocked or let through. If it got one wrong, you teach it right there — and it turns your example into a *general* rule, or tells you honestly when it can't.
 
 After a few weeks you don't have a generic filter — you have one that knows *your* spammers.
 

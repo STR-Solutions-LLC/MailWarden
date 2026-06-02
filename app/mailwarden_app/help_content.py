@@ -8,7 +8,7 @@ across surfaces and a single edit updates every spot.
 # ---------------------------------------------------------------------------
 # Version and repo
 # ---------------------------------------------------------------------------
-VERSION = "1.6.0-beta.12"
+VERSION = "1.6.0-beta.13"
 GITHUB_URL = "https://github.com/STR-Solutions-LLC/MailWarden"
 FEEDBACK_EMAIL = "info@rentalist.pro"
 ANTHROPIC_CONSOLE_URL = "https://console.anthropic.com"
@@ -432,6 +432,47 @@ UNINSTALL_MAILWARDEN = (
 )
 
 
+CHECK_AND_TEACH_HELP = (
+    "The \"Check an Email\" tab lets you paste any email's raw source and see, in "
+    "plain English, exactly how MailWarden would handle it — and why.\n\n"
+    "WHY IT WAS BLOCKED OR ALLOWED\n"
+    "- If your allow/block list or the built-in header checks decide it, you see "
+    "that instantly, with no Claude request.\n"
+    "- Otherwise MailWarden asks Claude and shows Claude's verdict and its "
+    "plain-English reasoning.\n"
+    "- The bottom line tells you whether the email would go to Junk or the inbox, "
+    "and what made the decision.\n\n"
+    "To get an email's raw source, use your mail app's \"Show original\", \"View "
+    "source\", or \"View raw message\" command — there's a \"(?)\" on the screen "
+    "with step-by-step instructions for Gmail, Apple Mail, Outlook, Yahoo, AOL, "
+    "Thunderbird and more — then copy everything and paste it in.\n\n"
+    "TEACHING MAILWARDEN\n"
+    "If MailWarden got it wrong, you can teach it from the same screen:\n"
+    "- Choose \"This should be blocked (it's spam)\" or \"This is safe — "
+    "MailWarden was wrong.\"\n"
+    "- You can optionally type, in your own words, what gave it away. MailWarden "
+    "uses your reason only if it can turn it into a reliable, general rule; a "
+    "vague hunch is ignored.\n"
+    "- Pick which of your accounts the lesson should apply to.\n"
+    "- MailWarden asks Claude to turn the example into a GENERAL rule — not just a "
+    "rule about this one sender. If it can't find a dependable, general pattern, "
+    "it tells you and adds nothing.\n"
+    "- Nothing is ever applied automatically. Every taught rule waits in Signal "
+    "History -> Pending for your one-click approval, and you can re-scope or "
+    "delete it there at any time.\n\n"
+    "HOW MAILWARDEN DECIDES\n"
+    "- Mail whose sender identity is cryptographically verified AND matches the "
+    "brand it claims is trusted as legitimate.\n"
+    "- Only the built-in header checks and your block-list move mail to Junk "
+    "instantly. Anything merely borderline is sent to Claude for a real decision "
+    "instead of being junked automatically — MailWarden would rather ask than "
+    "wrongly junk a legitimate message.\n"
+    "- Learned rules are strong guidance to Claude; your allow/block lists are "
+    "absolute. You can limit any learned rule to specific accounts in Signal "
+    "History."
+)
+
+
 # ---------------------------------------------------------------------------
 # Dashboard Help tab — full text
 # ---------------------------------------------------------------------------
@@ -451,6 +492,7 @@ HELP_TAB_SECTIONS = [
     ("How spam gets handled — Junk, Trash, or Delete", SPAM_HANDLING_CHOICE),
     ("Why your API bill stays small (even with a big inbox)", UNREAD_CACHING_BEHAVIOR),
     ("Train your own filter — the coolest part", TRAIN_YOUR_FILTER),
+    ("Check an Email (see why, and teach)", CHECK_AND_TEACH_HELP),
     ("Trade-offs", TRADE_OFFS),
     ("Controlling MailWarden by email", EMAIL_COMMAND_CHEAT_SHEET),
     ("What each email command does", None),  # rendered specially from EMAIL_COMMAND_EXAMPLES

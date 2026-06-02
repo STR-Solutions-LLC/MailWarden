@@ -22,6 +22,6 @@
     </choice>
 
     <pkg-ref id="com.strsolutions.mailwarden.app"
-             version="1.6.0-beta.12"
+             version="1.6.0-beta.13"
              onConclusion="none">MailWarden-component.pkg</pkg-ref>
 </installer-gui-script>
