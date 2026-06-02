@@ -29,17 +29,35 @@ INPUT="${1:-}"
 
 CODESIGN_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# Notarization auth. PREFERRED: an App Store Connect API key
+# (codesign/AuthKey_*.p8 + api_key_id.txt + api_issuer_id.txt) — Apple's current
+# method. FALLBACK: the legacy Apple-ID + app-specific-password trio. Apple has
+# been disabling password ("primary") auth for notarization, so the API key
+# wins when present. All of these files are gitignored (never committed).
+API_KEY_FILE="$(ls "$CODESIGN_DIR"/AuthKey_*.p8 2>/dev/null | head -1 || true)"
+API_KEY_ID_FILE="$CODESIGN_DIR/api_key_id.txt"
+API_ISSUER_FILE="$CODESIGN_DIR/api_issuer_id.txt"
+
 TEAM_ID_FILE="$CODESIGN_DIR/team_id.txt"
 APPLE_ID_FILE="$CODESIGN_DIR/apple_id.txt"
 APPLE_PASS_FILE="$CODESIGN_DIR/apple_id_password.txt"
 
-for f in "$TEAM_ID_FILE" "$APPLE_ID_FILE" "$APPLE_PASS_FILE"; do
-    [ -f "$f" ] || die "Missing credential: $f — see header comment."
-done
+# Pre-set so `set -u` never trips on the auth path we don't use.
+API_KEY_ID=""; API_ISSUER=""; TEAM_ID=""; APPLE_ID=""; APPLE_PASS=""
+USE_API_KEY=0
 
-TEAM_ID="$(tr -d '[:space:]' < "$TEAM_ID_FILE")"
-APPLE_ID="$(tr -d '[:space:]' < "$APPLE_ID_FILE")"
-APPLE_PASS="$(tr -d '[:space:]' < "$APPLE_PASS_FILE")"
+if [ -n "$API_KEY_FILE" ] && [ -f "$API_KEY_ID_FILE" ] && [ -f "$API_ISSUER_FILE" ]; then
+    USE_API_KEY=1
+    API_KEY_ID="$(tr -d '[:space:]' < "$API_KEY_ID_FILE")"
+    API_ISSUER="$(tr -d '[:space:]' < "$API_ISSUER_FILE")"
+else
+    for f in "$TEAM_ID_FILE" "$APPLE_ID_FILE" "$APPLE_PASS_FILE"; do
+        [ -f "$f" ] || die "Missing credential: $f — see header comment, or add an App Store Connect API key (AuthKey_*.p8 + api_key_id.txt + api_issuer_id.txt)."
+    done
+    TEAM_ID="$(tr -d '[:space:]' < "$TEAM_ID_FILE")"
+    APPLE_ID="$(tr -d '[:space:]' < "$APPLE_ID_FILE")"
+    APPLE_PASS="$(tr -d '[:space:]' < "$APPLE_PASS_FILE")"
+fi
 
 # Find the "Developer ID Installer" identity that matches our team.
 # NOTE: use -p basic, not -p codesigning. The "Developer ID Installer"
@@ -58,21 +76,19 @@ productsign --sign "$IDENTITY" "$INPUT" "$SIGNED"
 log "Verifying signature..."
 pkgutil --check-signature "$SIGNED" | head -5
 
-log "Submitting to Apple notary service (may take 1–10 min)..."
 # Capture the full notarytool output so we have the submission ID for
-# later `notarytool log <id>` diagnosis if anything goes sideways. The
-# old form `notarytool submit ... --wait` without capture meant a
-# transient network blip would leave the user with nothing to poll on.
+# later `notarytool log <id>` diagnosis if anything goes sideways.
 NOTARY_LOG="$(mktemp -t mailwarden-notary-XXXXXX.log)"
-if ! xcrun notarytool submit "$SIGNED" \
-        --apple-id "$APPLE_ID" \
-        --team-id "$TEAM_ID" \
-        --password "$APPLE_PASS" \
-        --wait | tee "$NOTARY_LOG"; then
+if [ "$USE_API_KEY" -eq 1 ]; then
+    log "Submitting via App Store Connect API key (may take 1–10 min)..."
+    NOTARY_ARGS=(--key "$API_KEY_FILE" --key-id "$API_KEY_ID" --issuer "$API_ISSUER")
+else
+    log "Submitting via Apple ID + app-specific password (may take 1–10 min)..."
+    NOTARY_ARGS=(--apple-id "$APPLE_ID" --team-id "$TEAM_ID" --password "$APPLE_PASS")
+fi
+if ! xcrun notarytool submit "$SIGNED" "${NOTARY_ARGS[@]}" --wait | tee "$NOTARY_LOG"; then
     SUBMISSION_ID="$(grep -oE '[0-9a-f-]{36}' "$NOTARY_LOG" | head -1 || true)"
-    die "Notarization failed. Submission ID: ${SUBMISSION_ID:-unknown}. "\
-"Diagnose with: xcrun notarytool log ${SUBMISSION_ID:-<ID>} "\
-"--apple-id $APPLE_ID --team-id $TEAM_ID --password @keychain"
+    die "Notarization failed. Submission ID: ${SUBMISSION_ID:-unknown}. See the notary output above; for detail run: xcrun notarytool log ${SUBMISSION_ID:-<ID>} (with the same auth you submitted with)."
 fi
 rm -f "$NOTARY_LOG"
 

@@ -47,6 +47,9 @@ codesign/AuthKey_*.p8
 codesign/apple_id.txt
 codesign/apple_id_password.txt
 codesign/team_id.txt
+codesign/api_key_id.txt
+codesign/api_issuer_id.txt
+codesign/api_*.txt
 
 # --- Python/macOS noise ---
 __pycache__/
