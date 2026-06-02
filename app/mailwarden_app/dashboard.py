@@ -122,6 +122,11 @@ class Dashboard(tk.Tk):
 
         self.title(f"MailWarden  ·  {help_content.VERSION}")
         self.geometry("960x680")
+        # Allow the user to resize by dragging the window edges/corners. This is
+        # independent of minimize: minimize stays disabled below (Cmd-M no-op,
+        # NSWindow miniaturizable bit cleared, and the <Unmap> backstop). minsize
+        # keeps the layout from collapsing.
+        self.resizable(True, True)
         self.minsize(880, 600)
         theme.apply_theme(self)
 
@@ -1784,6 +1789,12 @@ class CheckEmailTab(ttk.Frame):
         self._check_btn = ttk.Button(btnrow, text="Check this email",
                                      command=self._on_check)
         self._check_btn.pack(side=tk.LEFT)
+        self._choose_btn = ttk.Button(btnrow, text="Choose email file…",
+                                      command=self._on_choose_file)
+        self._choose_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self._clear_btn = ttk.Button(btnrow, text="Clear",
+                                     command=self._on_clear)
+        self._clear_btn.pack(side=tk.LEFT, padx=(8, 0))
         self._status = ttk.Label(btnrow, text="", style="Muted.TLabel")
         self._status.pack(side=tk.LEFT, padx=(10, 0))
 
@@ -1817,6 +1828,53 @@ class CheckEmailTab(ttk.Frame):
         self._tip = None
 
     # ---- check flow ----
+
+    def _on_clear(self):
+        """Reset the screen to its first-open state: empty the paste field,
+        wipe every rendered result (pre-classifier reasons, Claude verdict,
+        bottom-line verdict, and the whole Teach section), clear the status
+        line, and forget the last-checked email so Teach has nothing to act
+        on. After this the tab looks exactly as it does on first open."""
+        if self._busy:
+            return
+        self._clear_results()
+        self._paste.delete("1.0", "end")
+        self._status.config(text="")
+        self._last_raw = None
+
+    def _on_choose_file(self):
+        """Pick an email file and run it through the SAME classify path the
+        paste field uses. An .eml file is the full raw source (all headers),
+        which is the requirement. We load its bytes into the paste field and
+        trigger the normal check so parse + parse-failure messaging is reused.
+        No pasted/loaded content is ever written to disk."""
+        if self._busy:
+            return
+        _init_dir = str(paths.MAILWARDEN_ROOT) \
+            if Path(paths.MAILWARDEN_ROOT).is_dir() else str(Path.home())
+        path = filedialog.askopenfilename(
+            parent=self.app, title="Choose email file",
+            initialdir=_init_dir,
+            filetypes=[("Email", "*.eml"), ("Text", "*.txt"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            raw_bytes = Path(path).read_bytes()
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror(
+                "Couldn't read that file", f"Could not read file: {e}",
+                parent=self.app)
+            return
+        # Decode for the paste field with the same replace policy the paste
+        # path already applies on encode, so file loading has identical
+        # fidelity to pasting. _on_check re-runs the exact same flow.
+        text = raw_bytes.decode("utf-8", errors="replace")
+        self._clear_results()
+        self._paste.delete("1.0", "end")
+        self._paste.insert("1.0", text)
+        self._status.config(text="")
+        self._on_check()
 
     def _on_check(self):
         if self._busy:
@@ -1975,8 +2033,15 @@ class CheckEmailTab(ttk.Frame):
             parent, "Optionally, tell MailWarden what gave it away (in your own "
                     "words):", style="Muted.TLabel")
         self._reason_var = tk.StringVar()
-        ttk.Entry(parent, textvariable=self._reason_var, width=92).pack(
-            anchor=tk.W, pady=(2, 0))
+        self._reason_entry = ttk.Entry(
+            parent, textvariable=self._reason_var, width=92, state="normal")
+        self._reason_entry.pack(anchor=tk.W, pady=(2, 0))
+        # The Teach section is embedded in a Canvas (via _ScrollableTab); on this
+        # Tk/macOS build a click inside an embedded Entry does not always grab
+        # keyboard focus, so typing went nowhere. Force focus on click so the
+        # box is freely editable. Reading stays via self._reason_var.get().
+        self._reason_entry.bind(
+            "<Button-1>", lambda _e: self._reason_entry.focus_set(), add="+")
         self._result_line(
             parent, "MailWarden only uses your reason if it can turn it into a "
                     "reliable, general rule — vague hunches are ignored.",
