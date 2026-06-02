@@ -20,8 +20,17 @@ import os
 SRC = os.path.join(os.path.dirname(__file__), "..", "payload", "MailWarden", "src")
 sys.path.insert(0, os.path.abspath(SRC))
 
+# The desktop app lives in app/mailwarden_app and is imported as a package
+# (its modules use `from . import paths`). Add app/ to the path so the
+# per-account scoping helpers in config_io / dashboard can be unit-tested.
+APP = os.path.join(os.path.dirname(__file__), "..", "app")
+sys.path.insert(0, os.path.abspath(APP))
+
 import utils  # noqa: E402
 import spam_filter  # noqa: E402
+import learn_signals  # noqa: E402
+from mailwarden_app import config_io  # noqa: E402
+from mailwarden_app import dashboard  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -304,3 +313,273 @@ def test_p1_all_scope_applies_everywhere():
 def test_p1_no_account_includes_everything():
     s = _signals_with_refinement(["commerce@example.com"])
     assert HEADLINE in spam_filter.build_classifier_prompt(s)  # no account -> no filtering
+
+
+# ---------------------------------------------------------------------------
+# P1 (continued) — scope CAPTURE at creation time. learn_signals.handle_new_pattern
+# must stamp the new refinement's scope from the example's forwarder so a rule
+# taught by forwarding from one inbox is, from the moment it is proposed, bound
+# to that inbox. A forwarder-less example cannot be account-scoped -> "all".
+# ---------------------------------------------------------------------------
+
+import logging as _logging  # noqa: E402
+
+_QUIET_LOGGER = _logging.getLogger("test_p1_scope")
+_QUIET_LOGGER.addHandler(_logging.NullHandler())
+
+
+def _run_handle_new_pattern(monkeypatch, forwarder):
+    """Drive learn_signals.handle_new_pattern with all IO stubbed out and
+    return the proposed_refinement dict that got written to pending_signals."""
+    captured = {}
+
+    def _fake_save_pending(data):
+        captured["pending"] = data
+
+    monkeypatch.setattr(learn_signals, "load_pending_signals",
+                        lambda: {"version": "1.0", "conversations": []})
+    monkeypatch.setattr(learn_signals, "save_pending_signals", _fake_save_pending)
+    monkeypatch.setattr(learn_signals, "append_refinement_log", lambda event: None)
+    monkeypatch.setattr(learn_signals, "_send",
+                        lambda *a, **k: True)
+
+    classification = {
+        "kind": "new_pattern",
+        "headline": "kill timeshare solicitations",
+        "rationale": "user taught this",
+        "what_this_doesnt_cover": "real travel confirmations",
+        "confidence": "medium",
+    }
+    example = {
+        "filename": "user-submitted-1.eml",
+        "from": "promo@example.net",
+        "subject": "Your resort getaway awaits",
+        "forwarder": forwarder,
+    }
+    signals_data = {"signals": {}, "ai_refinements": []}
+    config = {"accounts": [{"username": "owner@example.com"}],
+              "smtp": {"host": "smtp.example.com", "username": "owner@example.com"}}
+
+    ok = learn_signals.handle_new_pattern(
+        classification, example, signals_data, config, _QUIET_LOGGER)
+    assert ok is True
+    conv = captured["pending"]["conversations"][-1]
+    return conv["proposed_refinement"]
+
+
+def test_p1_handle_new_pattern_scopes_to_forwarder(monkeypatch):
+    ref = _run_handle_new_pattern(monkeypatch, "owner@example.com")
+    assert ref["scope"] == ["owner@example.com"]
+
+
+def test_p1_handle_new_pattern_uppercase_forwarder_is_lowercased(monkeypatch):
+    ref = _run_handle_new_pattern(monkeypatch, "Owner@Example.com")
+    assert ref["scope"] == ["owner@example.com"]
+
+
+def test_p1_handle_new_pattern_empty_forwarder_is_all(monkeypatch):
+    ref = _run_handle_new_pattern(monkeypatch, "")
+    assert ref["scope"] == "all"
+
+
+def test_p1_handle_new_pattern_missing_forwarder_is_all(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(learn_signals, "load_pending_signals",
+                        lambda: {"version": "1.0", "conversations": []})
+    monkeypatch.setattr(learn_signals, "save_pending_signals",
+                        lambda data: captured.update(pending=data))
+    monkeypatch.setattr(learn_signals, "append_refinement_log", lambda event: None)
+    monkeypatch.setattr(learn_signals, "_send", lambda *a, **k: True)
+    classification = {"kind": "new_pattern", "headline": "h", "rationale": "r"}
+    example = {"filename": "x.eml", "from": "a@example.net", "subject": "s"}  # no forwarder key
+    learn_signals.handle_new_pattern(
+        classification, example, {"signals": {}, "ai_refinements": []},
+        {"accounts": [], "smtp": {"host": "h", "username": "owner@example.com"}},
+        _QUIET_LOGGER)
+    ref = captured["pending"]["conversations"][-1]["proposed_refinement"]
+    assert ref["scope"] == "all"
+
+
+# ---------------------------------------------------------------------------
+# P1 (continued) — scope must SURVIVE persistence. apply_ai_refinement copies
+# the proposed refinement into signals.json[ai_refinements]; that copy must keep
+# the scope it was created with (apply_ai_refinement does record = dict(...)).
+# ---------------------------------------------------------------------------
+
+def _capture_apply_ai_refinement(monkeypatch, refinement):
+    """Call spam_filter.apply_ai_refinement with signals IO stubbed and return
+    the ai_refinements record that was persisted."""
+    saved = {}
+    monkeypatch.setattr(spam_filter, "load_signals",
+                        lambda: {"signals": {}, "ai_refinements": []})
+    monkeypatch.setattr(spam_filter, "save_signals",
+                        lambda data: saved.update(data=data))
+    monkeypatch.setattr(spam_filter, "append_refinement_log", lambda event: None)
+    spam_filter.apply_ai_refinement(refinement, _QUIET_LOGGER,
+                                    source="email", sfid="SFID-test")
+    return saved["data"]["ai_refinements"][-1]
+
+
+def test_p1_scope_survives_apply_ai_refinement_list(monkeypatch):
+    refinement = {"id": "R-1", "headline": "h", "rationale": "r",
+                  "scope": ["x@example.net"]}
+    record = _capture_apply_ai_refinement(monkeypatch, refinement)
+    assert record["scope"] == ["x@example.net"]
+
+
+def test_p1_scope_survives_apply_ai_refinement_all(monkeypatch):
+    refinement = {"id": "R-2", "headline": "h", "rationale": "r", "scope": "all"}
+    record = _capture_apply_ai_refinement(monkeypatch, refinement)
+    assert record["scope"] == "all"
+
+
+# ---------------------------------------------------------------------------
+# P1 (continued) — APPROVAL BACKSTOP. Proposals created before scope-capture
+# existed have no scope on their refinement. When such a proposal is approved
+# (here via config_io.apply_refinement_from_pending — the path both Dashboard
+# approve buttons delegate to), the conversation's forwarder must be carried
+# into scope so the rule still binds to the inbox that taught it. If the
+# refinement already carries a scope, the backstop must NOT overwrite it.
+# ---------------------------------------------------------------------------
+
+def _capture_apply_from_pending(monkeypatch, refinement, forwarder):
+    """Drive config_io.apply_refinement_from_pending with all IO stubbed and
+    return the ai_refinements record that was persisted to signals.json."""
+    conv = {
+        "id": "SFID-20260601-001",
+        "kind": "spam_example_proposal",
+        "status": "awaiting_reply",
+        "forwarder": forwarder,
+        "proposed_refinement": refinement,
+    }
+    saved = {}
+    monkeypatch.setattr(config_io, "load_pending_signals",
+                        lambda: {"version": "1.0", "conversations": [conv]})
+    monkeypatch.setattr(config_io, "save_pending_signals", lambda data: None)
+    monkeypatch.setattr(config_io, "load_signals",
+                        lambda: {"signals": {}, "ai_refinements": []})
+    monkeypatch.setattr(config_io, "save_signals",
+                        lambda data: saved.update(data=data))
+    monkeypatch.setattr(config_io, "append_refinement_log", lambda event: None)
+    applied = config_io.apply_refinement_from_pending(conv["id"], source="dashboard")
+    assert applied is not None
+    return saved["data"]["ai_refinements"][-1]
+
+
+def test_p1_backstop_carries_forwarder_into_missing_scope(monkeypatch):
+    refinement = {"id": "R-old", "headline": "h", "rationale": "r"}  # no scope (legacy)
+    record = _capture_apply_from_pending(monkeypatch, refinement, "x@example.net")
+    assert record["scope"] == ["x@example.net"]
+
+
+def test_p1_backstop_lowercases_forwarder(monkeypatch):
+    refinement = {"id": "R-old2", "headline": "h", "rationale": "r"}
+    record = _capture_apply_from_pending(monkeypatch, refinement, "X@Example.NET")
+    assert record["scope"] == ["x@example.net"]
+
+
+def test_p1_backstop_does_not_overwrite_existing_scope(monkeypatch):
+    refinement = {"id": "R-new", "headline": "h", "rationale": "r",
+                  "scope": ["a@example.com"]}
+    record = _capture_apply_from_pending(monkeypatch, refinement, "x@example.net")
+    assert record["scope"] == ["a@example.com"]
+
+
+def test_p1_backstop_no_forwarder_leaves_scope_absent(monkeypatch):
+    refinement = {"id": "R-old3", "headline": "h", "rationale": "r"}  # no scope
+    record = _capture_apply_from_pending(monkeypatch, refinement, "")
+    assert "scope" not in record  # absent -> treated as "all" by _refinement_in_scope
+
+
+# ---------------------------------------------------------------------------
+# P1 (continued) — pure DASHBOARD serialization helper. The per-account toggle
+# row computes the scope to persist:
+#   ALL configured accounts ON  -> "all"
+#   a SUBSET ON                 -> list of those usernames (lowercased)
+#   NONE ON                     -> []  (rule applies to no account)
+# Extracted as a pure function so the GUI stays thin and this can be tested
+# headlessly. Mirrors the read side in spam_filter._refinement_in_scope.
+# ---------------------------------------------------------------------------
+
+def test_p1_scope_from_toggles_all_on_is_all():
+    accounts = ["a@example.com", "b@example.net"]
+    assert dashboard.scope_from_toggle_state(accounts, accounts) == "all"
+
+
+def test_p1_scope_from_toggles_subset_is_list():
+    accounts = ["a@example.com", "b@example.net", "c@example.org"]
+    assert dashboard.scope_from_toggle_state(
+        accounts, ["a@example.com", "c@example.org"]) == ["a@example.com", "c@example.org"]
+
+
+def test_p1_scope_from_toggles_none_on_is_empty_list():
+    accounts = ["a@example.com", "b@example.net"]
+    assert dashboard.scope_from_toggle_state(accounts, []) == []
+
+
+def test_p1_scope_from_toggles_lowercases():
+    accounts = ["A@Example.com", "B@Example.net"]
+    # only the first toggled on, given in mixed case
+    assert dashboard.scope_from_toggle_state(accounts, ["A@Example.com"]) == ["a@example.com"]
+
+
+def test_p1_scope_from_toggles_single_account_on_is_all():
+    accounts = ["solo@example.com"]
+    assert dashboard.scope_from_toggle_state(accounts, ["solo@example.com"]) == "all"
+
+
+# --- inverse helper: which accounts should render ON for a given scope ---
+
+def test_p1_accounts_on_all_scope_all_on():
+    accounts = ["a@example.com", "b@example.net"]
+    assert set(dashboard.accounts_on_for_scope("all", accounts)) == set(accounts)
+
+
+def test_p1_accounts_on_missing_scope_all_on():
+    accounts = ["a@example.com", "b@example.net"]
+    assert set(dashboard.accounts_on_for_scope(None, accounts)) == set(accounts)
+
+
+def test_p1_accounts_on_list_scope_subset_on():
+    accounts = ["a@example.com", "b@example.net", "c@example.org"]
+    assert set(dashboard.accounts_on_for_scope(
+        ["a@example.com", "C@Example.org"], accounts)) == {"a@example.com", "c@example.org"}
+
+
+def test_p1_accounts_on_empty_scope_none_on():
+    accounts = ["a@example.com", "b@example.net"]
+    assert dashboard.accounts_on_for_scope([], accounts) == []
+
+
+def test_p1_toggle_roundtrip_is_stable():
+    # all-on -> "all" -> all-on ; subset -> list -> same subset
+    accounts = ["a@example.com", "b@example.net", "c@example.org"]
+    scope_all = dashboard.scope_from_toggle_state(accounts, accounts)
+    assert set(dashboard.accounts_on_for_scope(scope_all, accounts)) == set(accounts)
+    subset = ["a@example.com", "c@example.org"]
+    scope_sub = dashboard.scope_from_toggle_state(accounts, subset)
+    assert set(dashboard.accounts_on_for_scope(scope_sub, accounts)) == set(subset)
+
+
+# --- persistence: config_io.set_refinement_scope writes scope to signals.json ---
+
+def test_p1_set_refinement_scope_persists(monkeypatch):
+    data = {"signals": {}, "ai_refinements": [
+        {"id": "R-1", "headline": "h1"},
+        {"id": "R-2", "headline": "h2", "scope": "all"},
+    ]}
+    saved = {}
+    monkeypatch.setattr(config_io, "load_signals", lambda: data)
+    monkeypatch.setattr(config_io, "save_signals", lambda d: saved.update(d=d))
+    ok = config_io.set_refinement_scope("R-2", ["x@example.net"])
+    assert ok is True
+    target = next(r for r in saved["d"]["ai_refinements"] if r["id"] == "R-2")
+    assert target["scope"] == ["x@example.net"]
+
+
+def test_p1_set_refinement_scope_missing_id_returns_false(monkeypatch):
+    monkeypatch.setattr(config_io, "load_signals",
+                        lambda: {"signals": {}, "ai_refinements": []})
+    monkeypatch.setattr(config_io, "save_signals",
+                        lambda d: (_ for _ in ()).throw(AssertionError("should not save")))
+    assert config_io.set_refinement_scope("nope", "all") is False

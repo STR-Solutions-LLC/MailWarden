@@ -3850,6 +3850,17 @@ Conversation ID: {sfid}
                         if classification == "affirmative":
                             if conv_kind == "spam_example_proposal":
                                 refinement = conv.get("proposed_refinement") or {}
+                                # P1 approval backstop: a proposal created before
+                                # scope-capture existed has no scope. Carry the
+                                # conversation's forwarder into scope so an
+                                # email-approved legacy rule still binds to the
+                                # inbox that taught it. Never overwrite a scope
+                                # the proposal already carries.
+                                if "scope" not in refinement:
+                                    conv_forwarder = (
+                                        conv.get("forwarder") or "").strip().lower()
+                                    if conv_forwarder:
+                                        refinement["scope"] = [conv_forwarder]
                                 change_desc = apply_ai_refinement(
                                     refinement, logger,
                                     source="email", sfid=sfid)

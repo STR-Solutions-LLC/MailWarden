@@ -36,6 +36,49 @@ MODEL_CHOICES = [
 ]
 
 
+def scope_from_toggle_state(account_usernames, on_usernames):
+    """Serialize per-account toggle state into a learned-rule ``scope`` value.
+
+    This is the WRITE counterpart to spam_filter._refinement_in_scope (the
+    READ side). Kept pure (no tk, no IO) so the toggle UI stays a thin shell
+    and the serialization rule is unit-tested independently.
+
+    Rules:
+      * EVERY configured account ON  -> "all" (compact, future-proof: an
+        account added later is automatically in scope).
+      * a SUBSET ON                 -> the list of those usernames, lowercased,
+        in configured-account order.
+      * NONE ON                     -> [] (the rule applies to no account).
+
+    Comparison is case-insensitive; emitted usernames are lowercased to match
+    the read side, which lowercases both the scope entries and the account.
+    """
+    all_lower = [str(u).strip().lower() for u in account_usernames]
+    on_lower = {str(u).strip().lower() for u in on_usernames}
+    selected = [u for u in all_lower if u in on_lower]
+    if all_lower and len(selected) == len(all_lower):
+        return "all"
+    return selected
+
+
+def accounts_on_for_scope(scope, account_usernames):
+    """READ counterpart to scope_from_toggle_state: which configured accounts
+    should render as ON for a stored ``scope``.
+
+      * "all" or missing (None) -> every configured account ON
+      * a list                  -> the configured accounts present in it
+                                    (case-insensitive), lowercased
+      * []                      -> none
+
+    Pure (no tk, no IO) so the initial toggle state is testable headlessly.
+    """
+    all_lower = [str(u).strip().lower() for u in account_usernames]
+    if scope is None or scope == "all":
+        return list(all_lower)
+    scope_lower = {str(s).strip().lower() for s in scope}
+    return [u for u in all_lower if u in scope_lower]
+
+
 # =============================================================================
 # Main window
 # =============================================================================
@@ -671,11 +714,10 @@ class Dashboard(tk.Tk):
                                 data = (data or []) + [b"; INBOX. fallback: "] \
                                     + (data2 or [])
                     # Verify CREATE actually produced a visible folder.
-                    # Some servers return OK but stash the mailbox in a
-                    # namespace the user's mail client doesn't display
-                    # — we hit this on Dad's AOL account with v1.5.9.
-                    # The only reliable test is to LIST and see if it's
-                    # actually there.
+                    # Some servers (observed on AOL with v1.5.9) return OK but
+                    # stash the mailbox in a namespace the user's mail client
+                    # doesn't display. The only reliable test is to LIST and
+                    # see if it's actually there.
                     visible_as = self._find_train_folder(conn)
                     if rc == "OK" and visible_as:
                         # Tell the user where the folder lives if it's
@@ -1817,12 +1859,47 @@ class SignalsTab(ttk.Frame):
                     if len(evidence) > 5 else "")
             self._card_label(card, f"Evidence: {shown}{more}",
                               style="Muted.TLabel")
+        self._render_scope_toggles(card, r)
         btns = ttk.Frame(card)
         btns.pack(anchor=tk.W, pady=(6, 0))
         rid = r.get("id", "")
         ttk.Button(btns, text="Delete",
                    command=lambda i=rid: self._on_delete_active(i)).pack(
                        side=tk.LEFT)
+
+    def _render_scope_toggles(self, card, r: dict):
+        """P1: one on/off toggle per configured account, controlling which
+        inboxes this learned rule applies to. ALL on -> scope "all"; a subset
+        on -> that list; none on -> [] (applies to no inbox). Each change is
+        written to signals.json immediately and takes effect next filter tick.
+        """
+        accounts = config_io.load_config().get("accounts", []) or []
+        usernames = [a.get("username", "") for a in accounts if a.get("username")]
+        if not usernames:
+            return  # nothing to scope to
+        rid = r.get("id", "")
+        on_now = set(accounts_on_for_scope(r.get("scope", "all"), usernames))
+
+        ttk.Label(card, text="Applies to:", style="Muted.TLabel").pack(
+            anchor=tk.W, pady=(6, 0))
+        row = ttk.Frame(card)
+        row.pack(anchor=tk.W)
+        card_vars: list[tuple[str, tk.BooleanVar]] = []
+        for u in usernames:
+            var = tk.BooleanVar(value=(u.strip().lower() in on_now))
+            chk = ttk.Checkbutton(
+                row, text=u, variable=var,
+                command=lambda i=rid, uns=usernames, cv=card_vars:
+                    self._on_toggle_scope(i, uns, cv))
+            chk.pack(side=tk.LEFT, padx=(0, 12))
+            card_vars.append((u, var))
+
+    def _on_toggle_scope(self, refinement_id: str,
+                          usernames: list[str],
+                          card_vars: "list[tuple[str, tk.BooleanVar]]"):
+        on = [u for (u, v) in card_vars if v.get()]
+        scope = scope_from_toggle_state(usernames, on)
+        config_io.set_refinement_scope(refinement_id, scope)
 
     def _on_delete_active(self, refinement_id: str):
         if not refinement_id:
@@ -1888,6 +1965,15 @@ class SignalsTab(ttk.Frame):
         if refinement.get("confidence"):
             meta_parts.append(f"confidence {refinement['confidence']}")
         self._card_label(card, "  ·  ".join(meta_parts), style="Muted.TLabel")
+        # P1: show which inbox forwarded this example. On approval the rule is
+        # scoped to that account by default (see scope capture / backstop); an
+        # example with no forwarder becomes a global rule.
+        if kind == "spam_example_proposal":
+            forwarder = (conv.get("forwarder") or "").strip()
+            self._card_label(
+                card,
+                f"From account: {forwarder if forwarder else 'all accounts'}",
+                style="Muted.TLabel")
         if refinement.get("rationale"):
             self._card_label(card, f"Why: {refinement['rationale']}",
                               pady=(4, 0))

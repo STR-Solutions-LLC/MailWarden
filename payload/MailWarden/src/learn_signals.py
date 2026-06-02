@@ -725,6 +725,14 @@ def handle_new_pattern(classification: dict, example: dict,
         "status": "proposed",
         "signal_type": signal_type,
     }
+    # P1 scope capture: bind this learned rule to the inbox that taught it.
+    # The forwarder is the account username stamped on the example via the
+    # X-MailWarden-Forwarder header (both the training-folder drop and the
+    # forward-with-explanation paths set it). A forwarder-less example cannot
+    # be account-scoped, so it becomes an explicit global ("all"). The owner
+    # can re-scope later from Dashboard -> Signal History.
+    forwarder = (example.get("forwarder", "") or "").strip().lower()
+    refinement["scope"] = [forwarder] if forwarder else "all"
     if hard_rule is not None:
         refinement["hard_rule"] = hard_rule
 

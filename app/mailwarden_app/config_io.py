@@ -317,6 +317,24 @@ def delete_active_refinement(refinement_id: str, source: str = "dashboard",
     return True
 
 
+def set_refinement_scope(refinement_id: str, scope) -> bool:
+    """Set the per-account ``scope`` on an active refinement and persist.
+
+    ``scope`` is "all" or a list of account usernames (the value produced by
+    dashboard.scope_from_toggle_state). Returns True if a refinement with that
+    id was found and updated, False otherwise. Used by the Dashboard's
+    per-account toggle row so a scope change takes effect on the next filter
+    tick without an email round-trip.
+    """
+    data = load_signals()
+    for r in data.get("ai_refinements", []):
+        if r.get("id") == refinement_id:
+            r["scope"] = scope
+            save_signals(data)
+            return True
+    return False
+
+
 def apply_refinement_from_pending(sfid: str, source: str = "dashboard") -> dict | None:
     """Move a pending spam_example_proposal SFID into active refinements.
 
@@ -351,6 +369,15 @@ def apply_refinement_from_pending(sfid: str, source: str = "dashboard") -> dict 
         pass
     else:
         refinement = dict(refinement)
+        # P1 approval backstop: proposals created before scope-capture existed
+        # carry no scope. Bind them to the inbox that forwarded the example so
+        # the rule does not silently leak onto every account. Only fills a
+        # MISSING scope key — never overwrites a scope the proposal already has
+        # (including an empty list, which is a deliberate "no accounts").
+        if "scope" not in refinement:
+            conv_forwarder = (conv.get("forwarder") or "").strip().lower()
+            if conv_forwarder:
+                refinement["scope"] = [conv_forwarder]
         refinement["status"] = "active"
         refinement.setdefault("first_learned", now_iso())
         refinement.setdefault("last_reinforced", now_iso())
