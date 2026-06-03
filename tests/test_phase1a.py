@@ -406,6 +406,56 @@ def test_teaching_refinement_legitimate_has_null_rule_class():
     assert r["rule_class"] is None
 
 
+def test_propose_from_teaching_legitimate_end_to_end(monkeypatch):
+    # End-to-end exercise of the exact call the dashboard's "MailWarden was
+    # wrong — let it through" button makes: propose_from_teaching with
+    # direction="legitimate" and an explicit scope. Claude is stubbed (as the
+    # other learner tests do) and all IO is faked, so this asserts the GUI's
+    # restored false-positive-correction path lands a proposed LEGITIMATE rule
+    # with rule_class None — never a protect/curate threat rule.
+    saved = {}
+
+    def _fake_call_claude(prompt, api_config, logger, system=None):
+        # The legitimate prompt must be what's sent, and the model returns a
+        # legitimate-verdict new_pattern (no rule_class — legit is neither).
+        assert "legitimate" in prompt.lower()
+        return {
+            "verdict": "legitimate",
+            "kind": "new_pattern",
+            "headline": "Newsletters from the user's accountant are wanted",
+            "rationale": "Recurring opt-in business correspondence the owner reads.",
+            "what_this_doesnt_cover": "Look-alike domains spoofing the firm.",
+            "confidence": "high",
+        }
+
+    monkeypatch.setattr(learn_signals, "call_claude", _fake_call_claude)
+    monkeypatch.setattr(learn_signals, "load_signals",
+                        lambda: {"signals": {}, "ai_refinements": []})
+    monkeypatch.setattr(learn_signals, "load_pending_signals",
+                        lambda: {"version": "1.0", "conversations": []})
+    monkeypatch.setattr(learn_signals, "save_pending_signals",
+                        lambda data: saved.update(data))
+    monkeypatch.setattr(learn_signals, "append_refinement_log", lambda event: None)
+
+    import logging
+    out = learn_signals.propose_from_teaching(
+        RAW_NORMAL, direction="legitimate", user_explanation="this is my CPA",
+        scope="all", api_config={"api_key": "k", "model": "m"},
+        logger=logging.getLogger("t"), rule_class=None,
+        curate_mechanism=None, apply_scope="all")
+
+    assert out["status"] == "proposed"
+    ref = out["refinement"]
+    assert ref["verdict"] == "legitimate"
+    assert ref["rule_class"] is None
+    assert ref["scope"] == "all"
+    # And it was actually persisted to pending as a one-click-approval proposal.
+    conv = saved["conversations"][0]
+    assert conv["kind"] == "spam_example_proposal"
+    assert conv["proposed_refinement"]["verdict"] == "legitimate"
+    assert conv["proposed_refinement"]["rule_class"] is None
+
+
 def test_resolve_scope_protect_is_global():
     assert learn_signals._resolve_scope("protect", None, "x@e.com") == "all"
 

@@ -2019,9 +2019,14 @@ class CheckEmailTab(ttk.Frame):
     # ---- Teach ----
 
     def _render_teach(self, parent):
-        """Render the Teach controls under a result. Two JOBS, chosen by the user
-        and authoritative for the engine (no re-classification):
+        """Render the Teach controls under a result. THREE intents, chosen by the
+        user and authoritative for the engine (no re-classification):
 
+          * LEGITIMATE / "let it through" — MailWarden wrongly junked a real
+            email. Most prominent (first) because it's the most common
+            correction. Applies to ALL accounts by default. Optional 'why' note,
+            then Claude turns the example into a generalized LEGITIMATE rule
+            (direction="legitimate", rule_class=None).
           * PROTECT — a threat (scam / phish / impersonation). Global by default
             (applies to all accounts). Optional 'why' note, then Claude turns the
             example into a generalized protect rule.
@@ -2037,9 +2042,10 @@ class CheckEmailTab(ttk.Frame):
         self._result_line(parent, "Teach MailWarden", style="Subheading.TLabel")
 
         # Per-account scope picker. Built once; its checkboxes are pre-filled to
-        # the chosen category's default (Protect -> all; Curate -> this account)
-        # and stay editable. An account-less screen has no checkboxes and scopes
-        # to "all" (single-account installs behave identically either way).
+        # the chosen category's default (Let-it-through -> all; Protect -> all;
+        # Curate -> this account) and stay editable. An account-less screen has no
+        # checkboxes and scopes to "all" (single-account installs behave
+        # identically either way).
         accounts = config_io.load_config().get("accounts", []) or []
         usernames = [a.get("username", "") for a in accounts if a.get("username")]
         self._teach_usernames = usernames
@@ -2049,9 +2055,15 @@ class CheckEmailTab(ttk.Frame):
         # account. Single-account installs make Protect and Curate identical.
         self._teach_primary = usernames[0] if usernames else ""
 
-        # Two category buttons (the two jobs).
+        # Three category buttons. The false-positive correction comes FIRST and
+        # most prominent (it's the most common: MailWarden junked a real email).
         crow = ttk.Frame(parent)
         crow.pack(anchor=tk.W, pady=(4, 0))
+        self._btn_legit = ttk.Button(
+            crow,
+            text="MailWarden was wrong — this is legitimate, let it through",
+            command=self._on_choose_legit)
+        self._btn_legit.pack(side=tk.LEFT, padx=(0, 8))
         self._btn_protect = ttk.Button(
             crow, text="Protect — this is a threat",
             command=self._on_choose_protect)
@@ -2060,6 +2072,10 @@ class CheckEmailTab(ttk.Frame):
             crow, text="Curate — legit, I just don't want it",
             command=self._on_choose_curate)
         self._btn_curate.pack(side=tk.LEFT)
+        self._result_line(
+            parent, "Let it through: MailWarden wrongly junked a legitimate "
+                    "email — teach it this kind of mail is fine. Applies to all "
+                    "your accounts.", style="Muted.TLabel")
         self._result_line(
             parent, "Protect: a scam, phish, or impersonation. Applies to all "
                     "your accounts.", style="Muted.TLabel")
@@ -2133,6 +2149,36 @@ class CheckEmailTab(ttk.Frame):
             self._teach_status.config(text="Pick at least one account to teach.")
         elif self._teach_status.cget("text") == "Pick at least one account to teach.":
             self._teach_status.config(text="")
+
+    # ---- category: Legitimate ("let it through") ----
+
+    def _on_choose_legit(self):
+        if self._busy or not getattr(self, "_last_raw", None):
+            return
+        self._teach_choice = "legitimate"
+        # Let-it-through applies broadly: default the picker to ALL accounts
+        # (a wrongly-junked kind of mail is usually fine everywhere); narrowable.
+        self._build_scope_picker(getattr(self, "_teach_usernames", []))
+        self._render_legit_controls()
+        self._update_teach_state()
+
+    def _render_legit_controls(self):
+        for w in self._teach_sub.winfo_children():
+            w.destroy()
+        self._btn_block_sender = None
+        self._btn_block_like = None
+        self._result_line(
+            self._teach_sub, "Optionally, tell MailWarden why this is legitimate "
+                             "(in your own words):", style="Muted.TLabel",
+            pady=(8, 0))
+        self._make_reason_entry(self._teach_sub)
+        brow = ttk.Frame(self._teach_sub)
+        brow.pack(anchor=tk.W, pady=(8, 0))
+        self._btn_teach_confirm = ttk.Button(
+            brow, text="Teach this as legitimate", style="Primary.TButton",
+            command=lambda: self._submit_teach(
+                direction="legitimate", rule_class=None, curate_mechanism=None))
+        self._btn_teach_confirm.pack(side=tk.LEFT)
 
     # ---- category: Protect ----
 
@@ -2319,10 +2365,13 @@ class CheckEmailTab(ttk.Frame):
         except Exception:
             return False
 
-    def _submit_teach(self, *, rule_class: str, curate_mechanism,
-                      block_kind: str | None = None):
+    def _submit_teach(self, *, rule_class, curate_mechanism,
+                      block_kind: str | None = None, direction: str = "spam"):
         """Validate scope + API key (Claude paths only) and dispatch the teach
-        call on a worker thread. block_sender needs no API key (no Claude)."""
+        call on a worker thread. block_sender needs no API key (no Claude).
+
+        ``direction`` is "spam" for the Protect/Curate callers (unchanged) and
+        "legitimate" for the let-it-through caller (rule_class=None)."""
         if self._busy or not getattr(self, "_last_raw", None):
             return
         scope = self._picked_scope()
@@ -2351,12 +2400,12 @@ class CheckEmailTab(ttk.Frame):
         threading.Thread(
             target=self._do_teach,
             args=(self._last_raw, reason, scope, api_key, model,
-                  rule_class, curate_mechanism, block_kind),
+                  rule_class, curate_mechanism, block_kind, direction),
             daemon=True).start()
 
     def _set_teach_buttons(self, state: str):
-        for name in ("_btn_protect", "_btn_curate", "_btn_teach_confirm",
-                     "_btn_block_sender", "_btn_block_like"):
+        for name in ("_btn_legit", "_btn_protect", "_btn_curate",
+                     "_btn_teach_confirm", "_btn_block_sender", "_btn_block_like"):
             btn = getattr(self, name, None)
             if btn is not None:
                 try:
@@ -2365,7 +2414,7 @@ class CheckEmailTab(ttk.Frame):
                     pass
 
     def _do_teach(self, raw, reason, scope, api_key, model,
-                  rule_class, curate_mechanism, block_kind):
+                  rule_class, curate_mechanism, block_kind, direction="spam"):
         try:
             import sys as _sys
             import logging as _logging
@@ -2377,7 +2426,7 @@ class CheckEmailTab(ttk.Frame):
             if not log.handlers:
                 log.addHandler(_logging.NullHandler())
             out = learn_signals.propose_from_teaching(
-                raw, direction="spam", user_explanation=reason, scope=scope,
+                raw, direction=direction, user_explanation=reason, scope=scope,
                 api_config={"api_key": api_key, "model": model}, logger=log,
                 rule_class=rule_class, curate_mechanism=curate_mechanism,
                 block_kind=block_kind, apply_scope=scope)
