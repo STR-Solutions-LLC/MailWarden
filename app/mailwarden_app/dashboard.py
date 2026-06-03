@@ -80,6 +80,40 @@ def accounts_on_for_scope(scope, account_usernames):
     return [u for u in all_lower if u in scope_lower]
 
 
+# Owner-facing labels for a pending spam_example_proposal, keyed by the
+# proposed refinement's intent. Block-sender proposals render their own
+# "Block sender …" headline and never use these.
+_PENDING_LABEL_LEGITIMATE = "Let it through (legitimate)"
+_PENDING_LABEL_PROTECT = "Protect — threat"
+_PENDING_LABEL_CURATE = "Curate — don't want it"
+_PENDING_LABEL_DEFAULT = "Learned rule"
+
+
+def pending_proposal_label(refinement):
+    """Owner-facing type label for a pending spam_example_proposal.
+
+    Reads the proposed refinement's intent (already stored on the proposal):
+      * verdict == "legitimate"  -> "Let it through (legitimate)"
+      * rule_class == "protect"  -> "Protect — threat"
+      * rule_class == "curate"   -> "Curate — don't want it"
+      * anything else / legacy   -> "Learned rule" (neutral; replaces the old
+        misleading "AI refinement (soft)" wording)
+
+    A legitimate rule is neither protect nor curate, so verdict is checked
+    first. Pure (no tk, no IO) so the type->label mapping is unit-tested
+    headlessly; mirrors the intent rendering in spam_filter.build_classifier_prompt.
+    """
+    refinement = refinement or {}
+    if refinement.get("verdict") == "legitimate":
+        return _PENDING_LABEL_LEGITIMATE
+    rule_class = refinement.get("rule_class")
+    if rule_class == "protect":
+        return _PENDING_LABEL_PROTECT
+    if rule_class == "curate":
+        return _PENDING_LABEL_CURATE
+    return _PENDING_LABEL_DEFAULT
+
+
 # =============================================================================
 # Main window
 # =============================================================================
@@ -2722,7 +2756,7 @@ class SignalsTab(ttk.Frame):
                       "the exact address."),
                 foreground="#9a5b00", wraplength=720).pack(anchor=tk.W)
         elif kind == "spam_example_proposal":
-            ttk.Label(card, text="AI refinement (soft)",
+            ttk.Label(card, text=pending_proposal_label(refinement),
                       foreground="#555555",
                       wraplength=720).pack(anchor=tk.W)
 

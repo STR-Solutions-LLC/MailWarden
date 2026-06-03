@@ -1265,3 +1265,49 @@ def test_fpauth_default_prompt_unchanged_keeps_evasion_signal():
         _EVASION_SIGNALS, None, suppress_evasion_signals=False)
     assert p_default == p_explicit_off
     assert "used as filter evasion" in p_default
+
+
+# ---------------------------------------------------------------------------
+# Pending-card label by proposal type. The Signal History "waiting on you"
+# card used to hardcode "AI refinement (soft)" for every spam_example_proposal,
+# which mislabels intent-bearing proposals (e.g. a "let it through" legitimate
+# rule shown as soft AI). dashboard.pending_proposal_label maps the proposed
+# refinement's verdict/rule_class to the owner-facing label. Pure (no tk, no
+# IO) so the type->label mapping is unit-tested headlessly; block_sender
+# proposals keep their own "Block sender …" rendering and never use this.
+# ---------------------------------------------------------------------------
+
+def test_pending_label_legitimate_is_let_it_through():
+    # verdict legitimate (rule_class is None for legit rules) -> let-it-through.
+    assert dashboard.pending_proposal_label(
+        {"verdict": "legitimate", "rule_class": None}) == "Let it through (legitimate)"
+
+
+def test_pending_label_protect_is_threat():
+    assert dashboard.pending_proposal_label(
+        {"verdict": "spam", "rule_class": "protect"}) == "Protect — threat"
+
+
+def test_pending_label_curate_is_dont_want_it():
+    assert dashboard.pending_proposal_label(
+        {"verdict": "spam", "rule_class": "curate"}) == "Curate — don't want it"
+
+
+def test_pending_label_legacy_spam_no_rule_class_is_neutral():
+    # Legacy proposal: spam verdict, no rule_class -> neutral "Learned rule"
+    # (NOT the misleading old "AI refinement (soft)" wording).
+    assert dashboard.pending_proposal_label(
+        {"verdict": "spam"}) == "Learned rule"
+    assert dashboard.pending_proposal_label({}) == "Learned rule"
+
+
+def test_pending_label_legitimate_wins_over_stray_rule_class():
+    # A legitimate rule is neither protect nor curate; verdict is decisive.
+    assert dashboard.pending_proposal_label(
+        {"verdict": "legitimate", "rule_class": "curate"}) == "Let it through (legitimate)"
+
+
+def test_pending_label_garbage_rule_class_falls_back_to_neutral():
+    # Unknown/garbage rule_class on a spam rule must not crash or mislabel.
+    assert dashboard.pending_proposal_label(
+        {"verdict": "spam", "rule_class": "nonsense"}) == "Learned rule"
