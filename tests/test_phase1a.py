@@ -238,7 +238,7 @@ def test_classifier_prompt_spam_refinement_unchanged():
          "headline": "Countdown pressure from unknown retailer",
          "rationale": "Uses fake urgency."}]}
     out = spam_filter.build_classifier_prompt(signals, account_name=None)
-    assert "LEARNED REFINEMENT" in out
+    assert "LEARNED THREAT PATTERN" in out  # relabeled from "LEARNED REFINEMENT"
     assert "Countdown pressure from unknown retailer" in out
     assert "LEARNED LEGITIMATE PATTERN" not in out
 
@@ -338,6 +338,119 @@ def test_teaching_refinement_spam_default():
         verdict="spam", scope="all", refinement_id="R1", evidence_name="e")
     assert r["verdict"] == "spam"
     assert r["scope"] == "all"
+
+
+# ---------------------------------------------------------------------------
+# 3b. protect vs. curate classification (rule_class) — schema, prompt, and the
+#     refinement record produced by the Check-an-Email teaching path.
+# ---------------------------------------------------------------------------
+
+def test_teach_prompt_spam_offers_rule_class_and_apply_scope():
+    # The SPAM-direction prompt must ask the model to classify protect vs. curate
+    # and to parse the owner's scope words; the LEGITIMATE prompt must not (a
+    # legitimate rule is neither protect nor curate).
+    spam = learn_signals.build_teach_prompt(_teach_ex(), direction="spam",
+                                            active_refinements=[])
+    assert "rule_class" in spam
+    assert "protect" in spam and "curate" in spam
+    assert "apply_scope" in spam
+    legit = learn_signals.build_teach_prompt(_teach_ex(), direction="legitimate",
+                                             active_refinements=[])
+    assert "rule_class" not in legit
+    assert "apply_scope" not in legit
+
+
+def test_teach_system_defines_protect_and_curate():
+    sysp = learn_signals.TEACH_SYSTEM
+    assert "protect" in sysp and "curate" in sysp
+    # protect = bad-actor threat; curate = owner preference about legitimate mail.
+    assert "bad-actor" in sysp.lower() or "bad actor" in sysp.lower()
+    assert "preference" in sysp.lower()
+
+
+def test_teaching_refinement_records_rule_class_curate():
+    r = learn_signals.teaching_refinement_from_classification(
+        {"kind": "new_pattern", "headline": "H", "rationale": "R",
+         "rule_class": "curate"},
+        verdict="spam", scope=["m@e.com"], refinement_id="R1", evidence_name="e")
+    assert r["rule_class"] == "curate"
+
+
+def test_teaching_refinement_records_rule_class_protect():
+    r = learn_signals.teaching_refinement_from_classification(
+        {"kind": "new_pattern", "headline": "H", "rationale": "R",
+         "rule_class": "protect"},
+        verdict="spam", scope="all", refinement_id="R1", evidence_name="e")
+    assert r["rule_class"] == "protect"
+
+
+def test_teaching_refinement_malformed_rule_class_defaults_protect():
+    # A missing or garbage rule_class on a spam rule must never crash and must
+    # behave like today's threat rule (protect).
+    r = learn_signals.teaching_refinement_from_classification(
+        {"kind": "new_pattern", "headline": "H", "rationale": "R",
+         "rule_class": "nonsense"},
+        verdict="spam", scope="all", refinement_id="R1", evidence_name="e")
+    assert r["rule_class"] == "protect"
+    r2 = learn_signals.teaching_refinement_from_classification(
+        {"kind": "new_pattern", "headline": "H", "rationale": "R"},  # absent
+        verdict="spam", scope="all", refinement_id="R2", evidence_name="e")
+    assert r2["rule_class"] == "protect"
+
+
+def test_teaching_refinement_legitimate_has_null_rule_class():
+    # A legitimate rule is NEITHER protect nor curate.
+    r = learn_signals.teaching_refinement_from_classification(
+        {"kind": "new_pattern", "headline": "H", "rationale": "R"},
+        verdict="legitimate", scope="all", refinement_id="R1", evidence_name="e")
+    assert r["rule_class"] is None
+
+
+def test_resolve_scope_protect_is_global():
+    assert learn_signals._resolve_scope("protect", None, "x@e.com") == "all"
+
+
+def test_resolve_scope_curate_binds_to_account():
+    assert learn_signals._resolve_scope("curate", None, "m@e.com") == ["m@e.com"]
+
+
+def test_resolve_scope_curate_apply_all_is_global():
+    assert learn_signals._resolve_scope("curate", "all", "m@e.com") == "all"
+
+
+def test_resolve_scope_curate_no_account_needs_explicit():
+    assert (learn_signals._resolve_scope("curate", None, None)
+            is learn_signals._SCOPE_NEEDS_EXPLICIT)
+
+
+def test_classifier_renders_curate_as_user_preference():
+    signals = {"signals": {}, "ai_refinements": [
+        {"id": "C", "status": "active", "verdict": "spam", "rule_class": "curate",
+         "headline": "Republican fundraising solicitations",
+         "rationale": "User is done with these."}]}
+    out = spam_filter.build_classifier_prompt(signals, account_name=None)
+    assert "USER PREFERENCE (curate): Republican fundraising solicitations" in out
+    assert "not bad-actor spam" in out
+    assert "LEARNED THREAT PATTERN" not in out
+
+
+def test_classifier_renders_protect_as_threat_pattern():
+    signals = {"signals": {}, "ai_refinements": [
+        {"id": "P", "status": "active", "verdict": "spam", "rule_class": "protect",
+         "headline": "PayPal credential phish", "rationale": "Fake login link."}]}
+    out = spam_filter.build_classifier_prompt(signals, account_name=None)
+    assert "LEARNED THREAT PATTERN: PayPal credential phish" in out
+    assert "USER PREFERENCE" not in out
+
+
+def test_base_prompt_has_whole_context_directive():
+    out = spam_filter.build_classifier_prompt({"signals": {}, "ai_refinements": []})
+    assert "RULE 4 — JUDGE THE WHOLE EMAIL IN CONTEXT" in out
+    flat = out.lower().replace("\n", " ")
+    assert "never move an authenticated" in flat
+    # The directive must STRENGTHEN, not contradict: hard signals + blacklist
+    # still block, and RULE 2 phishing is still caught.
+    assert "still block" in flat and "rule 2 phishing" in flat
 
 
 def test_call_claude_accepts_system_override():

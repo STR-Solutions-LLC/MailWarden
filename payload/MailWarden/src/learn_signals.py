@@ -455,6 +455,22 @@ WHEN the direction is SPAM:
   state the FULL rule here, INCLUDING any "unless/except" condition and how to tell
   the target apart from look-alikes), what_this_doesnt_cover (most likely false
   positive and why it's avoided), confidence (high|medium|low).
+- rule_class — classify the rule as one of:
+    "protect" = a BAD-ACTOR THREAT: phishing, scams, fraud, malware, or brand
+      impersonation — the subtle tells a vulnerable person would miss. The mail is
+      from someone acting in bad faith and is dangerous to anyone, not just this owner.
+    "curate" = the owner personally no longer wants this LEGITIMATE mail (e.g.
+      political fundraising they are sick of, marketing from a real company that
+      ignores unsubscribe). This is NOT bad-actor spam — it is a personal preference
+      of THIS owner; the same mail is perfectly fine for someone who wants it.
+  Decide protect vs. curate from BOTH the email itself AND the owner's reason: a
+  genuine threat is "protect" even if the owner's words are mild; a sick-of-it
+  preference about legitimate senders is "curate" even if the owner calls it "spam".
+  When genuinely unsure, choose "protect" (it is the safer, threat-style rule).
+- apply_scope — parse ONLY from the owner's own words how widely they want the rule
+  applied: "all" if they say all/every account/everywhere/all inboxes; "this_account"
+  if they say only this account/just here/this inbox only; otherwise null (they did
+  not say). Do NOT infer scope from the email's content — only from the owner's words.
 - hard_rule is OPTIONAL and rare: {"type":"subject_keyword"|"sender_domain",
   "value":"..."} ONLY for a distinctive identifier that essentially never appears
   in legitimate mail. Never for common words, major providers, or any domain a
@@ -467,7 +483,8 @@ WHEN the direction is LEGITIMATE:
   are welcome ("legitimate EXCEPT when ..."). State the full rule, including any
   condition, in the rationale. NEVER mark a domain or sender legitimate when
   authentication indicates it is impersonating a brand. Do not propose a hard_rule
-  for a legitimate verdict.
+  for a legitimate verdict. A legitimate verdict is NEITHER protect NOR curate —
+  omit rule_class (or set it null) for legitimate rules.
 
 Output exactly the single JSON object specified in the user message. No markdown."""
 
@@ -555,10 +572,62 @@ def build_teach_prompt(example: dict, direction: str,
     lines.append('  "what_this_doesnt_cover": "the most likely false positive and why it is avoided",')
     lines.append('  "confidence": "high" | "medium" | "low",')
     if not legit:
+        lines.append('  "rule_class": "protect" | "curate"  (protect = bad-actor threat: phishing/scam/fraud/malware/impersonation; curate = owner no longer wants this LEGITIMATE mail; when unsure choose protect),')
+        lines.append('  "apply_scope": "all" | "this_account" | null  (parse ONLY from the owner words: all/every account/everywhere -> "all"; only this account/just here -> "this_account"; else null),')
         lines.append('  "hard_rule": {"type":"subject_keyword"|"sender_domain","value":"..."}  (optional, rare; omit when unsure),')
     lines.append('  "reason": "<if no_rule: one sentence on why nothing reliable could be derived>"')
     lines.append("}")
     return "\n".join(lines)
+
+
+# Sentinel returned by _resolve_scope when a curate rule has no originating
+# account to bind to and the owner gave no "all" instruction: the caller must
+# decide (the email-forward path defaults to "all" per migration safety; the
+# Check-an-Email path keeps its explicit-scope requirement and does not invent
+# a global rule). Distinct object so it can never collide with a real scope.
+_SCOPE_NEEDS_EXPLICIT = object()
+
+# Default for propose_from_teaching's ``scope`` so the function can tell whether
+# the caller passed an explicit scope (the dashboard always does) versus left it
+# to be derived from rule_class/apply_scope/originating_account (R1). None is a
+# real, meaningful scope value ("all" downstream), so it can't serve as "unset".
+_SCOPE_UNSET = object()
+
+
+def _resolve_scope(rule_class, apply_scope, originating_account):
+    """Derive a learned-rule ``scope`` from the rule's class, the owner's parsed
+    scope words, and the account the rule originated from. PURE — no IO.
+
+    Returns "all", a single-account list, or the _SCOPE_NEEDS_EXPLICIT sentinel.
+
+      protect (bad-actor threat) defends every inbox -> "all", UNLESS the owner
+        explicitly said "this account" AND we know which account that is.
+      curate (owner preference about legitimate mail) binds to the originating
+        inbox by default; "all" only when the owner explicitly said so. A curate
+        rule with no originating account cannot be account-scoped, so it returns
+        the sentinel (caller decides) — never silently global.
+
+    A missing/unknown rule_class is treated as "protect" (today's spam-rule
+    behavior; never crash)."""
+    rc = (str(rule_class).strip().lower() if rule_class is not None else "")
+    if rc not in ("protect", "curate"):
+        rc = "protect"  # robustness: behave like today's threat rule
+    apply_scope = (str(apply_scope).strip().lower()
+                   if apply_scope is not None else "")
+    account = (str(originating_account).strip().lower()
+               if originating_account else "")
+
+    if rc == "protect":
+        if apply_scope == "this_account" and account:
+            return [account]
+        return "all"
+
+    # rc == "curate"
+    if apply_scope == "all":
+        return "all"
+    if account:
+        return [account]
+    return _SCOPE_NEEDS_EXPLICIT
 
 
 def teaching_refinement_from_classification(cls: dict, *, verdict: str, scope,
@@ -580,11 +649,20 @@ def teaching_refinement_from_classification(cls: dict, *, verdict: str, scope,
     verdict = (verdict or "spam").strip().lower()
     if verdict not in ("spam", "legitimate"):
         verdict = "spam"
+    # rule_class: only meaningful for a SPAM verdict (protect vs. curate). A
+    # legitimate rule is NEITHER -> None. A missing/malformed class on a spam
+    # rule defaults to "protect" so it behaves like today's threat rule.
+    if verdict == "spam":
+        rc = (cls.get("rule_class") or "").strip().lower()
+        rule_class = rc if rc in ("protect", "curate") else "protect"
+    else:
+        rule_class = None
     now = datetime.now().isoformat()
     refinement = {
         "id": refinement_id,
         "kind": kind if kind in ("new_pattern", "add_infrastructure") else "new_pattern",
         "verdict": verdict,
+        "rule_class": rule_class,
         "headline": headline,
         "rationale": (cls.get("rationale") or "").strip(),
         "what_this_doesnt_cover": (cls.get("what_this_doesnt_cover") or "").strip(),
@@ -611,14 +689,23 @@ def teaching_refinement_from_classification(cls: dict, *, verdict: str, scope,
 
 
 def propose_from_teaching(eml_bytes: bytes, *, direction: str,
-                          user_explanation: str, scope,
-                          api_config: dict, logger: logging.Logger) -> dict:
+                          user_explanation: str, scope=_SCOPE_UNSET,
+                          api_config: dict, logger: logging.Logger,
+                          originating_account=None) -> dict:
     """Analyze ONE user-taught email and, if a generalizable rule results, create
     a PENDING proposal (NO email — in-app approval) that the owner approves in
     Dashboard -> Signal History. Returns a status dict for the screen:
       {"status":"proposed","sfid","refinement"} |
       {"status":"declined","reason"} |
       {"status":"error","reason"}
+
+    Scope (R1): the caller's EXPLICIT scope wins. The dashboard always passes an
+    explicit ``scope`` (its per-account picker, or "all") — that value is used
+    unchanged, so dashboard behavior does not change. ONLY when no explicit scope
+    is supplied (``scope`` left at _SCOPE_UNSET) is the scope derived from the
+    rule's class + the owner's parsed apply_scope words + ``originating_account``
+    via _resolve_scope. A curate rule that cannot be resolved (no account, no
+    "all" instruction) is DECLINED here rather than silently made global.
     """
     direction = (direction or "spam").strip().lower()
     try:
@@ -649,6 +736,30 @@ def propose_from_teaching(eml_bytes: bytes, *, direction: str,
         return {"status": "declined",
                 "reason": (cls.get("reason")
                            or "no reliable, general rule could be derived")}
+
+    # R1 scope resolution. Explicit caller scope (dashboard) wins unchanged.
+    # Only when no explicit scope was supplied do we derive it from the rule's
+    # class + the owner's parsed apply_scope + the originating account.
+    if scope is _SCOPE_UNSET:
+        if direction == "spam":
+            resolved = _resolve_scope(cls.get("rule_class"),
+                                      cls.get("apply_scope"),
+                                      originating_account)
+        else:
+            # A legitimate rule is neither protect nor curate. With no explicit
+            # scope, bind it to the originating account when known, else "all".
+            acct = (str(originating_account).strip().lower()
+                    if originating_account else "")
+            resolved = [acct] if acct else "all"
+        if resolved is _SCOPE_NEEDS_EXPLICIT:
+            # curate rule, no account to bind to, owner did not say "all":
+            # preserve the explicit-scope requirement — do NOT default to "all".
+            logger.info("  [TEACH] Declining curate rule with no scope: "
+                        "no originating account and owner gave no scope")
+            return {"status": "declined",
+                    "reason": ("this is a personal-preference rule, but no "
+                               "account was given to apply it to")}
+        scope = resolved
 
     refinement_id = next_refinement_id(signals_data)
     refinement = teaching_refinement_from_classification(
@@ -1013,11 +1124,31 @@ def handle_new_pattern(classification: dict, example: dict,
     # P1 scope capture: bind this learned rule to the inbox that taught it.
     # The forwarder is the account username stamped on the example via the
     # X-MailWarden-Forwarder header (both the training-folder drop and the
-    # forward-with-explanation paths set it). A forwarder-less example cannot
-    # be account-scoped, so it becomes an explicit global ("all"). The owner
-    # can re-scope later from Dashboard -> Signal History.
+    # forward-with-explanation paths set it). originating_account = forwarder.
+    #
+    # rule_class: the email-forward learner does not yet classify protect vs.
+    # curate, so a forwarded example normally carries no rule_class. In that
+    # case we PRESERVE the pre-existing P1 capture (scope to the forwarder, or
+    # "all" when there is none) and record the rule as "protect" (its effective,
+    # threat-style behavior). When a rule_class IS present we resolve scope via
+    # the shared _resolve_scope: a curate rule with no forwarder cannot be
+    # account-scoped, so per R2 it becomes "all" (migration-safe) and we log it.
     forwarder = (example.get("forwarder", "") or "").strip().lower()
-    refinement["scope"] = [forwarder] if forwarder else "all"
+    raw_rule_class = (classification.get("rule_class") or "").strip().lower()
+    if raw_rule_class in ("protect", "curate"):
+        resolved = _resolve_scope(raw_rule_class, classification.get("apply_scope"),
+                                  forwarder)
+        if resolved is _SCOPE_NEEDS_EXPLICIT:
+            logger.info("  [LEARNER] curate rule with no forwarder — scoping to "
+                        "'all' (migration-safe; owner can re-scope)")
+            resolved = "all"
+        refinement["scope"] = resolved
+        refinement["rule_class"] = raw_rule_class
+    else:
+        # Pre-existing behavior preserved verbatim for the un-classified forward
+        # path; record the effective threat class for downstream rendering.
+        refinement["scope"] = [forwarder] if forwarder else "all"
+        refinement["rule_class"] = "protect"
     if hard_rule is not None:
         refinement["hard_rule"] = hard_rule
 

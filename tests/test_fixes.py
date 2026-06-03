@@ -435,6 +435,125 @@ def test_p1_handle_new_pattern_missing_forwarder_is_all(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# protect / curate scope resolution at creation time (the forward-path learner
+# + the _resolve_scope helper). A forward-path rule with no rule_class keeps the
+# pre-existing forwarder-scoping; a classified rule resolves via _resolve_scope.
+# ---------------------------------------------------------------------------
+
+def _run_handle_new_pattern_cls(monkeypatch, classification, example):
+    """Drive handle_new_pattern with arbitrary classification + example dicts,
+    all IO stubbed, returning the proposed_refinement that was written."""
+    captured = {}
+    monkeypatch.setattr(learn_signals, "load_pending_signals",
+                        lambda: {"version": "1.0", "conversations": []})
+    monkeypatch.setattr(learn_signals, "save_pending_signals",
+                        lambda data: captured.update(pending=data))
+    monkeypatch.setattr(learn_signals, "append_refinement_log", lambda event: None)
+    monkeypatch.setattr(learn_signals, "_send", lambda *a, **k: True)
+    ok = learn_signals.handle_new_pattern(
+        classification, example, {"signals": {}, "ai_refinements": []},
+        {"accounts": [{"username": "owner@example.com"}],
+         "smtp": {"host": "h", "username": "owner@example.com"}},
+        _QUIET_LOGGER)
+    assert ok is True
+    return captured["pending"]["conversations"][-1]["proposed_refinement"]
+
+
+def test_handle_new_pattern_curate_with_forwarder_scopes_to_forwarder(monkeypatch):
+    cls = {"kind": "new_pattern", "headline": "fundraising", "rationale": "r",
+           "rule_class": "curate"}
+    ex = {"filename": "x.eml", "from": "a@pac.org", "subject": "Donate",
+          "forwarder": "Owner@Example.com"}
+    ref = _run_handle_new_pattern_cls(monkeypatch, cls, ex)
+    assert ref["scope"] == ["owner@example.com"]
+    assert ref["rule_class"] == "curate"
+
+
+def test_handle_new_pattern_curate_no_forwarder_is_all_per_r2(monkeypatch):
+    # R2: a curate rule with no forwarder cannot be account-scoped -> "all".
+    cls = {"kind": "new_pattern", "headline": "fundraising", "rationale": "r",
+           "rule_class": "curate"}
+    ex = {"filename": "x.eml", "from": "a@pac.org", "subject": "Donate"}  # no forwarder
+    ref = _run_handle_new_pattern_cls(monkeypatch, cls, ex)
+    assert ref["scope"] == "all"
+    assert ref["rule_class"] == "curate"
+
+
+def test_handle_new_pattern_unclassified_forward_records_protect(monkeypatch):
+    # No rule_class on the classification (today's learner) -> pre-existing
+    # forwarder scoping preserved, rule recorded as the effective threat class.
+    ref = _run_handle_new_pattern(monkeypatch, "owner@example.com")
+    assert ref["scope"] == ["owner@example.com"]
+    assert ref["rule_class"] == "protect"
+
+
+# ---------------------------------------------------------------------------
+# R1 — the caller's EXPLICIT scope wins in propose_from_teaching. When the
+# dashboard passes a scope, it must be stored unchanged regardless of what the
+# model classifies the rule as (curate would otherwise re-bind to an account).
+# ---------------------------------------------------------------------------
+
+def _run_propose_from_teaching(monkeypatch, model_cls, **kwargs):
+    """Drive propose_from_teaching with call_claude + all IO stubbed; return the
+    proposed_refinement that was written to pending_signals (or the status dict
+    when nothing was proposed)."""
+    captured = {}
+    monkeypatch.setattr(learn_signals, "call_claude",
+                        lambda *a, **k: dict(model_cls))
+    monkeypatch.setattr(learn_signals, "load_signals",
+                        lambda: {"signals": {}, "ai_refinements": []})
+    monkeypatch.setattr(learn_signals, "load_pending_signals",
+                        lambda: {"version": "1.0", "conversations": []})
+    monkeypatch.setattr(learn_signals, "save_pending_signals",
+                        lambda data: captured.update(pending=data))
+    monkeypatch.setattr(learn_signals, "append_refinement_log", lambda event: None)
+    raw = (b"From: PAC <give@pac.org>\r\nSubject: Donate now\r\n\r\nPlease give.\r\n")
+    out = learn_signals.propose_from_teaching(
+        raw, direction="spam", user_explanation="done with these",
+        api_config={"api_key": "x", "model": "m"}, logger=_QUIET_LOGGER, **kwargs)
+    if out.get("status") == "proposed":
+        return captured["pending"]["conversations"][-1]["proposed_refinement"]
+    return out
+
+
+def test_propose_explicit_scope_is_preserved_unchanged(monkeypatch):
+    # Dashboard passes an explicit scope; even though the model says curate (which
+    # would normally re-bind to the originating account), the explicit scope wins.
+    model_cls = {"kind": "new_pattern", "headline": "fundraising", "rationale": "r",
+                 "rule_class": "curate", "apply_scope": "all", "confidence": "medium"}
+    ref = _run_propose_from_teaching(
+        monkeypatch, model_cls, scope=["picked@example.com"],
+        originating_account="other@example.com")
+    assert ref["scope"] == ["picked@example.com"]   # explicit caller scope unchanged
+    assert ref["rule_class"] == "curate"
+
+
+def test_propose_no_scope_curate_resolves_to_originating(monkeypatch):
+    # R1 inverse: no explicit scope -> derive from rule_class + originating account.
+    model_cls = {"kind": "new_pattern", "headline": "fundraising", "rationale": "r",
+                 "rule_class": "curate", "confidence": "medium"}  # apply_scope absent
+    ref = _run_propose_from_teaching(
+        monkeypatch, model_cls, originating_account="matt@example.com")
+    assert ref["scope"] == ["matt@example.com"]
+
+
+def test_propose_no_scope_protect_resolves_to_all(monkeypatch):
+    model_cls = {"kind": "new_pattern", "headline": "phish", "rationale": "r",
+                 "rule_class": "protect", "confidence": "high"}
+    ref = _run_propose_from_teaching(
+        monkeypatch, model_cls, originating_account="matt@example.com")
+    assert ref["scope"] == "all"
+
+
+def test_propose_no_scope_curate_no_account_declines(monkeypatch):
+    # curate, no account, no "all" word -> must NOT silently default to "all".
+    model_cls = {"kind": "new_pattern", "headline": "fundraising", "rationale": "r",
+                 "rule_class": "curate", "confidence": "medium"}
+    out = _run_propose_from_teaching(monkeypatch, model_cls)  # no scope, no account
+    assert out["status"] == "declined"
+
+
+# ---------------------------------------------------------------------------
 # P1 (continued) — scope must SURVIVE persistence. apply_ai_refinement copies
 # the proposed refinement into signals.json[ai_refinements]; that copy must keep
 # the scope it was created with (apply_ai_refinement does record = dict(...)).
