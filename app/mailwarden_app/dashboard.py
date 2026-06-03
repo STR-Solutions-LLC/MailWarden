@@ -1990,12 +1990,16 @@ class CheckEmailTab(ttk.Frame):
         else:
             do = {"JUNK": "move this to Junk",
                   "PASS": "let this through to the inbox"}.get(final, str(final))
-            by = {"lists": "your allow/block list",
-                  "pre-classifier": "the built-in checks",
-                  "ai": "Claude"}.get(decided_by, decided_by or "—")
-            self._result_line(
-                body, f"What MailWarden would do: {do}  (decided by {by}).",
-                style="Subheading.TLabel", pady=(10, 0))
+            if decided_by in ("lists", "pre-classifier"):
+                by = {"lists": "your allow/block list",
+                      "pre-classifier": "the built-in checks"}[decided_by]
+                line = f"What MailWarden would do: {do}  (decided by {by})."
+            else:
+                # AI path — lead with Claude; never imply it's a last resort.
+                line = (f"What MailWarden would do: {do}  "
+                        f"(Claude read the full message and made the call).")
+            self._result_line(body, line, style="Subheading.TLabel",
+                              pady=(10, 0))
 
         # Teach controls (operate on the email just checked).
         self._render_teach(body)
@@ -2015,25 +2019,272 @@ class CheckEmailTab(ttk.Frame):
     # ---- Teach ----
 
     def _render_teach(self, parent):
-        """Render the Teach controls under a result: optional 'why' box, the
-        per-account scope picker (no silent default — pick at least one), and the
-        two direction buttons. Routes through learn_signals.propose_from_teaching,
-        which derives a generalized, scoped rule (or declines and adds nothing)
-        and lands it in Signal History -> Pending for approval."""
+        """Render the Teach controls under a result. Two JOBS, chosen by the user
+        and authoritative for the engine (no re-classification):
+
+          * PROTECT — a threat (scam / phish / impersonation). Global by default
+            (applies to all accounts). Optional 'why' note, then Claude turns the
+            example into a generalized protect rule.
+          * CURATE — legitimate mail the owner simply doesn't want. This-account
+            by default. An umbrella with two mechanisms the user picks:
+              - "Block this sender"   -> a scoped block-list entry (no Claude);
+                warns + offers exact-address when the sender's domain is shared.
+              - "Block emails like this" -> a Claude-applied content pattern.
+
+        Every path produces a PENDING proposal requiring one-click approval in
+        Signal History; nothing changes until the owner approves it."""
         ttk.Separator(parent, orient="horizontal").pack(fill=tk.X, pady=(12, 6))
         self._result_line(parent, "Teach MailWarden", style="Subheading.TLabel")
 
+        # Per-account scope picker. Built once; its checkboxes are pre-filled to
+        # the chosen category's default (Protect -> all; Curate -> this account)
+        # and stay editable. An account-less screen has no checkboxes and scopes
+        # to "all" (single-account installs behave identically either way).
+        accounts = config_io.load_config().get("accounts", []) or []
+        usernames = [a.get("username", "") for a in accounts if a.get("username")]
+        self._teach_usernames = usernames
+        self._teach_vars = []
+        # The "primary" account is the first configured one — the Curate default
+        # ("this account") on a screen where the pasted email isn't tied to any
+        # account. Single-account installs make Protect and Curate identical.
+        self._teach_primary = usernames[0] if usernames else ""
+
+        # Two category buttons (the two jobs).
+        crow = ttk.Frame(parent)
+        crow.pack(anchor=tk.W, pady=(4, 0))
+        self._btn_protect = ttk.Button(
+            crow, text="Protect — this is a threat",
+            command=self._on_choose_protect)
+        self._btn_protect.pack(side=tk.LEFT, padx=(0, 8))
+        self._btn_curate = ttk.Button(
+            crow, text="Curate — legit, I just don't want it",
+            command=self._on_choose_curate)
+        self._btn_curate.pack(side=tk.LEFT)
         self._result_line(
-            parent, "Optionally, tell MailWarden what gave it away (in your own "
-                    "words):", style="Muted.TLabel")
+            parent, "Protect: a scam, phish, or impersonation. Applies to all "
+                    "your accounts.", style="Muted.TLabel")
+        self._result_line(
+            parent, "Curate: honest sender, no harm — you're just done with it. "
+                    "Applies to this account.", style="Muted.TLabel")
+
+        # Scope picker (hidden until a category is chosen, then pre-filled).
+        self._teach_scope_box = ttk.Frame(parent)
+        self._teach_scope_box.pack(anchor=tk.W, fill=tk.X)
+
+        # Sub-options / reason box / confirm controls render here per category.
+        self._teach_sub = ttk.Frame(parent)
+        self._teach_sub.pack(anchor=tk.W, fill=tk.X)
+
+        self._teach_status = ttk.Label(parent, text="", style="Muted.TLabel",
+                                       wraplength=780)
+        self._teach_status.pack(anchor=tk.W, pady=(6, 0))
+
+    # ---- scope picker (shared by both categories) ----
+
+    def _build_scope_picker(self, default_on: list[str]):
+        """(Re)build the per-account scope checkboxes pre-filled to ``default_on``
+        (lowercased usernames that should start checked). No-op visual when there
+        are no configured accounts (scope is then always "all")."""
+        for w in self._teach_scope_box.winfo_children():
+            w.destroy()
+        self._teach_vars = []
+        usernames = getattr(self, "_teach_usernames", [])
+        if not usernames:
+            return
+        on_lower = {str(u).strip().lower() for u in default_on}
+        self._result_line(
+            self._teach_scope_box, "Apply what it learns to which account(s)?",
+            style="Muted.TLabel", pady=(6, 0))
+        srow = ttk.Frame(self._teach_scope_box)
+        srow.pack(anchor=tk.W)
+        for u in usernames:
+            var = tk.BooleanVar(value=(u.strip().lower() in on_lower))
+            ttk.Checkbutton(srow, text=u, variable=var,
+                            command=self._update_teach_state).pack(
+                                side=tk.LEFT, padx=(0, 12))
+            self._teach_vars.append((u, var))
+
+    def _picked_scope(self):
+        """Current scope-picker value, or None when accounts exist but none are
+        ticked (caller must prompt the user to pick at least one)."""
+        usernames = getattr(self, "_teach_usernames", [])
+        vars_ = getattr(self, "_teach_vars", [])
+        if not vars_:
+            return "all"  # no configured accounts -> applies everywhere
+        on = [u for (u, v) in vars_ if v.get()]
+        if not on:
+            return None
+        return scope_from_toggle_state(usernames, on)
+
+    def _update_teach_state(self):
+        """Grey the active confirm/sub-option buttons when accounts exist but
+        none are ticked (preserves the original 'pick at least one' safety)."""
+        ok = self._picked_scope() is not None
+        state = "normal" if ok else "disabled"
+        for name in ("_btn_teach_confirm", "_btn_block_sender",
+                     "_btn_block_like"):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                try:
+                    btn.config(state=state)
+                except Exception:
+                    pass
+        if not ok:
+            self._teach_status.config(text="Pick at least one account to teach.")
+        elif self._teach_status.cget("text") == "Pick at least one account to teach.":
+            self._teach_status.config(text="")
+
+    # ---- category: Protect ----
+
+    def _on_choose_protect(self):
+        if self._busy or not getattr(self, "_last_raw", None):
+            return
+        self._teach_choice = "protect"
+        # Protect is global: default the picker to ALL accounts.
+        self._build_scope_picker(getattr(self, "_teach_usernames", []))
+        self._render_protect_controls()
+        self._update_teach_state()
+
+    def _render_protect_controls(self):
+        for w in self._teach_sub.winfo_children():
+            w.destroy()
+        self._btn_block_sender = None
+        self._btn_block_like = None
+        self._result_line(
+            self._teach_sub, "Optionally, tell MailWarden what gave it away "
+                             "(in your own words):", style="Muted.TLabel",
+            pady=(8, 0))
+        self._make_reason_entry(self._teach_sub)
+        brow = ttk.Frame(self._teach_sub)
+        brow.pack(anchor=tk.W, pady=(8, 0))
+        self._btn_teach_confirm = ttk.Button(
+            brow, text="Teach this as a threat", style="Primary.TButton",
+            command=lambda: self._submit_teach(
+                rule_class="protect", curate_mechanism=None))
+        self._btn_teach_confirm.pack(side=tk.LEFT)
+
+    # ---- category: Curate (umbrella with two mechanisms) ----
+
+    def _on_choose_curate(self):
+        if self._busy or not getattr(self, "_last_raw", None):
+            return
+        self._teach_choice = "curate"
+        # Curate is this-account: default the picker to the primary account.
+        primary = getattr(self, "_teach_primary", "")
+        self._build_scope_picker([primary] if primary else [])
+        self._render_curate_controls()
+        self._update_teach_state()
+
+    def _render_curate_controls(self):
+        for w in self._teach_sub.winfo_children():
+            w.destroy()
+        self._btn_teach_confirm = None
+        srow = ttk.Frame(self._teach_sub)
+        srow.pack(anchor=tk.W, pady=(8, 0))
+        self._btn_block_sender = ttk.Button(
+            srow, text="Block this sender",
+            command=self._on_curate_block_sender)
+        self._btn_block_sender.pack(side=tk.LEFT, padx=(0, 8))
+        self._btn_block_like = ttk.Button(
+            srow, text="Block emails like this",
+            command=self._on_curate_block_like)
+        self._btn_block_like.pack(side=tk.LEFT)
+        self._result_line(
+            self._teach_sub, "Block this sender: stop all mail from this specific "
+                             "sender — instant, no Claude.", style="Muted.TLabel")
+        self._result_line(
+            self._teach_sub, "Block emails like this: teach a pattern Claude "
+                             "applies to similar mail.", style="Muted.TLabel")
+        # Where the block_like_this reason box / confirm renders on demand.
+        self._teach_curate_sub = ttk.Frame(self._teach_sub)
+        self._teach_curate_sub.pack(anchor=tk.W, fill=tk.X)
+
+    def _on_curate_block_like(self):
+        """Reveal the optional 'why' note + confirm for the Claude content path."""
+        if self._busy or not getattr(self, "_last_raw", None):
+            return
+        for w in self._teach_curate_sub.winfo_children():
+            w.destroy()
+        self._result_line(
+            self._teach_curate_sub, "Optionally, tell MailWarden what makes mail "
+                                    "like this unwanted (in your own words):",
+            style="Muted.TLabel", pady=(8, 0))
+        self._make_reason_entry(self._teach_curate_sub)
+        brow = ttk.Frame(self._teach_curate_sub)
+        brow.pack(anchor=tk.W, pady=(8, 0))
+        self._btn_teach_confirm = ttk.Button(
+            brow, text="Teach this pattern", style="Primary.TButton",
+            command=lambda: self._submit_teach(
+                rule_class="curate", curate_mechanism="block_like_this"))
+        self._btn_teach_confirm.pack(side=tk.LEFT)
+        self._update_teach_state()
+
+    def _on_curate_block_sender(self):
+        """Block a specific sender (no Claude). When the sender's domain is a
+        shared mail service, warn and let the owner block just the exact address,
+        the whole domain anyway, or cancel — then submit the chosen block_kind."""
+        if self._busy or not getattr(self, "_last_raw", None):
+            return
+        if self._picked_scope() is None:
+            self._teach_status.config(text="Pick at least one account to teach.")
+            return
+        domain = self._sender_domain(getattr(self, "_last_raw", b""))
+        block_kind = "domain"
+        if domain and self._is_shared_domain(domain):
+            choice = self._ask_over_broad(domain)
+            if choice == "cancel":
+                return
+            block_kind = "address" if choice == "address" else "domain"
+        self._submit_teach(rule_class="curate",
+                           curate_mechanism="block_sender", block_kind=block_kind)
+
+    def _ask_over_broad(self, domain: str) -> str:
+        """Modal over-broad warning for a shared-service domain. Returns
+        'address', 'domain', or 'cancel'."""
+        dlg = tk.Toplevel(self.app)
+        dlg.title("Block a shared mail service?")
+        dlg.transient(self.app)
+        dlg.resizable(False, False)
+        frm = ttk.Frame(dlg, padding=(16, 14))
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            frm, wraplength=460, justify="left",
+            text=(f"Heads up — {domain} is a shared mail service used by millions "
+                  f"of people. Blocking the whole domain would junk mail from "
+                  f"everyone who uses it, not just this sender. Block just this "
+                  f"exact address instead?")).pack(anchor=tk.W)
+        result = {"v": "cancel"}
+
+        def _choose(v):
+            result["v"] = v
+            dlg.destroy()
+
+        btns = ttk.Frame(frm)
+        btns.pack(anchor=tk.E, pady=(14, 0))
+        ttk.Button(btns, text="Block just this address", style="Primary.TButton",
+                   command=lambda: _choose("address")).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Block whole domain anyway",
+                   command=lambda: _choose("domain")).pack(side=tk.LEFT,
+                                                            padx=(6, 0))
+        ttk.Button(btns, text="Cancel",
+                   command=lambda: _choose("cancel")).pack(side=tk.LEFT,
+                                                           padx=(6, 0))
+        dlg.protocol("WM_DELETE_WINDOW", lambda: _choose("cancel"))
+        dlg.grab_set()
+        self.app.wait_window(dlg)
+        return result["v"]
+
+    # ---- helpers shared across categories ----
+
+    def _make_reason_entry(self, parent):
+        """The editable 'why' note. The Teach section sits in a Canvas (via
+        _ScrollableTab); on this Tk/macOS build a click inside an embedded Entry
+        doesn't always grab keyboard focus, so force focus on click. Read via
+        self._reason_var.get()."""
         self._reason_var = tk.StringVar()
         self._reason_entry = ttk.Entry(
             parent, textvariable=self._reason_var, width=92, state="normal")
         self._reason_entry.pack(anchor=tk.W, pady=(2, 0))
-        # The Teach section is embedded in a Canvas (via _ScrollableTab); on this
-        # Tk/macOS build a click inside an embedded Entry does not always grab
-        # keyboard focus, so typing went nowhere. Force focus on click so the
-        # box is freely editable. Reading stays via self._reason_var.get().
         self._reason_entry.bind(
             "<Button-1>", lambda _e: self._reason_entry.focus_set(), add="+")
         self._result_line(
@@ -2041,98 +2292,80 @@ class CheckEmailTab(ttk.Frame):
                     "reliable, general rule — vague hunches are ignored.",
             style="Muted.TLabel")
 
-        accounts = config_io.load_config().get("accounts", []) or []
-        usernames = [a.get("username", "") for a in accounts if a.get("username")]
-        self._teach_usernames = usernames
-        self._teach_vars = []
-        if usernames:
-            self._result_line(
-                parent, "Apply what it learns to which account(s)?",
-                style="Muted.TLabel", pady=(6, 0))
-            self._result_line(
-                parent, "This email isn't tied to an account, so pick at least "
-                        "one — the rule only affects the accounts you choose.",
-                style="Muted.TLabel")
-            srow = ttk.Frame(parent)
-            srow.pack(anchor=tk.W)
-            for u in usernames:
-                var = tk.BooleanVar(value=False)
-                ttk.Checkbutton(srow, text=u, variable=var,
-                                command=self._update_teach_state).pack(
-                                    side=tk.LEFT, padx=(0, 12))
-                self._teach_vars.append((u, var))
-
-        brow = ttk.Frame(parent)
-        brow.pack(anchor=tk.W, pady=(8, 0))
-        self._btn_spam = ttk.Button(
-            brow, text="This should be blocked (it's spam)",
-            command=lambda: self._on_teach("spam"))
-        self._btn_spam.pack(side=tk.LEFT, padx=(0, 8))
-        self._btn_legit = ttk.Button(
-            brow, text="This is safe — MailWarden was wrong",
-            command=lambda: self._on_teach("legitimate"))
-        self._btn_legit.pack(side=tk.LEFT)
-
-        self._teach_status = ttk.Label(parent, text="", style="Muted.TLabel",
-                                       wraplength=780)
-        self._teach_status.pack(anchor=tk.W, pady=(6, 0))
-        self._update_teach_state()
-
-    def _update_teach_state(self):
-        has_accounts = bool(getattr(self, "_teach_vars", []))
-        any_on = any(v.get() for (_u, v) in getattr(self, "_teach_vars", []))
-        ok = any_on or not has_accounts
-        state = "normal" if ok else "disabled"
+    def _sender_domain(self, raw: bytes) -> str:
+        """Sender domain of the checked email (bare, no '@'), or '' if unreadable.
+        Used only for the over-broad shared-service check; the engine re-parses
+        the address itself when it builds the proposal."""
         try:
-            self._btn_spam.config(state=state)
-            self._btn_legit.config(state=state)
+            import email as _email
+            from email.utils import parseaddr
+            msg = _email.message_from_bytes(raw or b"")
+            addr = parseaddr(msg.get("From", "") or "")[1]
+            return addr.split("@", 1)[1].strip().lower() if "@" in addr else ""
         except Exception:
-            pass
-        if not ok:
-            self._teach_status.config(text="Pick at least one account to teach.")
-        elif self._teach_status.cget("text") == "Pick at least one account to teach.":
-            self._teach_status.config(text="")
+            return ""
 
-    def _on_teach(self, direction: str):
+    def _is_shared_domain(self, domain: str) -> bool:
+        """Engine guardrail check (learn_signals.is_shared_mail_domain). On any
+        import/lookup failure, fall back to False so a block is never silently
+        blocked from proceeding."""
+        try:
+            import sys as _sys
+            if (paths.SRC_DIR / "learn_signals.py").exists() \
+                    and str(paths.SRC_DIR) not in _sys.path:
+                _sys.path.insert(0, str(paths.SRC_DIR))
+            import learn_signals
+            return bool(learn_signals.is_shared_mail_domain(domain))
+        except Exception:
+            return False
+
+    def _submit_teach(self, *, rule_class: str, curate_mechanism,
+                      block_kind: str | None = None):
+        """Validate scope + API key (Claude paths only) and dispatch the teach
+        call on a worker thread. block_sender needs no API key (no Claude)."""
         if self._busy or not getattr(self, "_last_raw", None):
             return
-        usernames = getattr(self, "_teach_usernames", [])
-        vars_ = getattr(self, "_teach_vars", [])
-        if vars_:
-            on = [u for (u, v) in vars_ if v.get()]
-            if not on:
-                self._teach_status.config(text="Pick at least one account to teach.")
-                return
-            scope = scope_from_toggle_state(usernames, on)
-        else:
-            scope = "all"
-        reason = self._reason_var.get().strip() if hasattr(self, "_reason_var") else ""
-
+        scope = self._picked_scope()
+        if scope is None:
+            self._teach_status.config(text="Pick at least one account to teach.")
+            return
+        reason = (self._reason_var.get().strip()
+                  if hasattr(self, "_reason_var") else "")
         cfg = config_io.load_config()
         anthro = cfg.get("anthropic", {}) or {}
         api_key = os.environ.get("ANTHROPIC_API_KEY", "") \
             or anthro.get("api_key", "") or ""
-        if not api_key:
+        model = anthro.get("model") or "claude-haiku-4-5-20251001"
+        # Only the Claude paths (protect, block_like_this) need a key.
+        needs_claude = curate_mechanism != "block_sender"
+        if needs_claude and not api_key:
             self._teach_status.config(
                 text="MailWarden needs your Claude API key (Settings) to learn "
                      "from an email.")
             return
-        model = anthro.get("model") or "claude-haiku-4-5-20251001"
 
         self._busy = True
-        try:
-            self._btn_spam.config(state="disabled")
-            self._btn_legit.config(state="disabled")
-        except Exception:
-            pass
+        self._set_teach_buttons("disabled")
         self._teach_status.config(text="Thinking…")
         import threading
         threading.Thread(
             target=self._do_teach,
-            args=(self._last_raw, direction, reason, scope, api_key, model),
+            args=(self._last_raw, reason, scope, api_key, model,
+                  rule_class, curate_mechanism, block_kind),
             daemon=True).start()
 
-    def _do_teach(self, raw, direction, reason, scope, api_key, model):
+    def _set_teach_buttons(self, state: str):
+        for name in ("_btn_protect", "_btn_curate", "_btn_teach_confirm",
+                     "_btn_block_sender", "_btn_block_like"):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                try:
+                    btn.config(state=state)
+                except Exception:
+                    pass
+
+    def _do_teach(self, raw, reason, scope, api_key, model,
+                  rule_class, curate_mechanism, block_kind):
         try:
             import sys as _sys
             import logging as _logging
@@ -2144,8 +2377,10 @@ class CheckEmailTab(ttk.Frame):
             if not log.handlers:
                 log.addHandler(_logging.NullHandler())
             out = learn_signals.propose_from_teaching(
-                raw, direction=direction, user_explanation=reason, scope=scope,
-                api_config={"api_key": api_key, "model": model}, logger=log)
+                raw, direction="spam", user_explanation=reason, scope=scope,
+                api_config={"api_key": api_key, "model": model}, logger=log,
+                rule_class=rule_class, curate_mechanism=curate_mechanism,
+                block_kind=block_kind, apply_scope=scope)
             self.app.after(0, self._render_teach_outcome, out)
         except Exception as e:  # noqa: BLE001
             self.app.after(0, self._render_teach_outcome,
@@ -2153,18 +2388,29 @@ class CheckEmailTab(ttk.Frame):
 
     def _render_teach_outcome(self, out: dict):
         self._busy = False
+        self._set_teach_buttons("normal")
         try:
-            self._update_teach_state()  # re-enable per current selection
+            self._update_teach_state()  # re-grey if no account ticked
         except Exception:
             pass
         status = (out or {}).get("status")
         if status == "proposed":
-            ref = out.get("refinement", {}) or {}
-            hl = ref.get("headline", "a new rule")
-            self._teach_status.config(
-                text=f"MailWarden learned a rule: “{hl}”. It's waiting "
-                     f"for your OK in Signal History → Pending — nothing "
-                     f"changes until you approve it.")
+            # Block-sender proposals carry a blocklist_entry, not a refinement.
+            entry = out.get("blocklist_entry") or {}
+            if entry:
+                noun = "address" if entry.get("kind") == "address" else "domain"
+                self._teach_status.config(
+                    text=f"MailWarden will block this sender by {noun} "
+                         f"“{entry.get('value', '')}”. It's waiting for your OK in "
+                         f"Signal History → Pending — nothing changes until you "
+                         f"approve it.")
+            else:
+                ref = out.get("refinement", {}) or {}
+                hl = ref.get("headline", "a new rule")
+                self._teach_status.config(
+                    text=f"MailWarden learned a rule: “{hl}”. It's waiting "
+                         f"for your OK in Signal History → Pending — nothing "
+                         f"changes until you approve it.")
             try:
                 self.app.signals_tab.refresh()
             except Exception:
@@ -2276,6 +2522,17 @@ class SignalsTab(ttk.Frame):
         lbl = ttk.Label(card, text=text, **kw)
         lbl.pack(anchor=tk.W, **grid)
         return lbl
+
+    @staticmethod
+    def _scope_text(scope) -> str:
+        """Human-readable scope for a card: 'all accounts' for "all"/None, the
+        comma-joined usernames for a list, or 'no accounts' for an empty list."""
+        if scope is None or scope == "all":
+            return "all accounts"
+        if isinstance(scope, (list, tuple)):
+            names = [str(s) for s in scope if str(s).strip()]
+            return ", ".join(names) if names else "no accounts"
+        return str(scope)
 
     # ---- Active refinements ----
 
@@ -2392,14 +2649,14 @@ class SignalsTab(ttk.Frame):
         kind = conv.get("kind", "false_positive")
         refinement = conv.get("proposed_refinement") or {}
         # "Block this sender" proposals (PB2) carry a blocklist_entry, not an
-        # ai_refinement. Minimal rendering here so the card is correct and
-        # approvable; the full Block-this-sender UI is the next task.
+        # ai_refinement: show what's blocked (value + domain/address), and which
+        # accounts it applies to. Approval writes the scoped block-list entry.
         block_entry = conv.get("blocklist_entry") or {}
         if kind == "block_sender_proposal":
-            _bk = block_entry.get("kind", "domain")
+            _bk = "address" if block_entry.get("kind") == "address" else "domain"
             _bv = block_entry.get("value", "")
-            headline = (f"Block this sender — {'address' if _bk == 'address' else 'domain'} "
-                        f"{_bv}")
+            _bs = self._scope_text(block_entry.get("scope", "all"))
+            headline = f"Block sender — {_bv} ({_bk}); applies to: {_bs}"
         elif kind == "spam_example_proposal":
             headline = (refinement.get("headline")
                         or f"Proposed refinement {refinement.get('id', '')}")

@@ -1,16 +1,16 @@
 # MailWarden
 
-AI-powered anti-phishing & spam filter for macOS. Claude reads each questionable email the way a careful person would — catching the lookalike-domain, fake-urgency phishing that slips past generic filters — and learns *your* spam over time.
+AI-powered anti-phishing & spam filter for macOS. Claude reads every incoming email the way a careful person would — catching the lookalike-domain, fake-urgency phishing that slips past generic filters — and learns *your* spam over time.
 
 ## Why it exists
 Phishing has gotten good enough that even careful people get fooled, and the people most at risk are often the ones least able to tell a real email from a fake — older parents, relatives, anyone who can't easily spot a lookalike domain or a bogus "your account is suspended" notice. MailWarden puts a careful reader in front of their inbox, so the dangerous stuff is gone before they ever see it.
 
 ## What it does, and how
-MailWarden connects to your email accounts (using your own Anthropic API key) and has Claude read each questionable message — understanding context, not just matching keywords. Two things set it apart:
+MailWarden connects to your email accounts (using your own Anthropic API key) and has Claude read each incoming message — understanding context, not just matching keywords. It does two jobs:
 
-- **You can teach it with your own reasoning.** Forward it a spam example and add a sentence about *why* it's spam, and it learns from your explanation — not just the email.
-- **You decide what counts as unwanted.** Train it to treat *your* definition of junk as spam: mailing lists you can't escape, political or marketing mail that rotates sender addresses to dodge unsubscribes. If you don't want it, MailWarden learns to catch it.
-- **See why — and fix it when it's wrong.** A built-in "Check an Email" screen shows, in plain English, exactly why any message would be blocked or let through. If it got one wrong, you teach it right there — and it turns your example into a *general* rule, or tells you honestly when it can't.
+- **Protect — catch the threats.** Claude reads each message in context to catch the phishing, scams, and impersonation a vulnerable person misses — the lookalike domain, the fake "your account is suspended," the urgent ask from someone pretending to be your bank.
+- **Curate — remove mail you don't want.** Quietly remove legitimate mail you simply don't want anymore — political fundraising, a company that won't stop. This isn't calling it spam. It's your preference, applied precisely. Block a specific sender outright, or teach a pattern Claude removes wherever it appears.
+- **Teach it by example.** Forward a spam example with a sentence about *why*, or use the built-in "Check an Email" screen to see exactly why any message would be blocked or let through — and teach it right there. It turns your example into a *general* rule (or tells you honestly when it can't), and every rule waits for your one-click approval before it does anything.
 
 After a few weeks you don't have a generic filter — you have one that knows *your* spammers.
 
