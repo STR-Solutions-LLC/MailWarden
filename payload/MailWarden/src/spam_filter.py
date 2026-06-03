@@ -1632,7 +1632,7 @@ def build_classifier_prompt(signals: dict, account_name: str = None) -> str:
         else:
             line = f"- LEARNED REFINEMENT: {headline}"
         if rationale:
-            line += f" {rationale[:300]}" if verdict == "legitimate" else f" — {rationale[:300]}"
+            line += f" {rationale[:700]}" if verdict == "legitimate" else f" — {rationale[:700]}"
         learned_parts.append(line)
 
     learned_text = "\n".join(learned_parts) if learned_parts else "No additional learned signals yet."

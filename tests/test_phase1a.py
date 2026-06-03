@@ -268,20 +268,48 @@ def test_teach_prompt_spam_direction_offers_decline():
     assert "<untrusted_email>" in p      # email is wrapped as untrusted data
 
 
-def test_teach_prompt_legit_direction_hints_domain_and_declines():
+def test_teach_prompt_legit_direction_no_domain_default_steer():
+    # The learner must NO LONGER push "the sender's organizational DOMAIN" as the
+    # default legitimate generalization; it should ask for a content-based rule
+    # and still offer the decline path.
     p = learn_signals.build_teach_prompt(_teach_ex(), direction="legitimate",
                                          active_refinements=[])
     assert "legitimate" in p.lower()
     assert "no_rule" in p
-    assert "domain" in p.lower()         # the common valid generalization
+    # The removed steer phrasings must be absent from the rendered prompt.
+    assert "organizational domain" not in p.lower()
+    assert "most common valid generalization" not in p.lower()
+    # And the new content-based guidance must be present.
+    assert "content-based" in p.lower()
+
+
+def test_teach_prompt_invites_conditional_content_rules():
+    # Both directions should invite SUBTLE, conditional, content-based rules
+    # (not bare single-domain whitelists).
+    legit = learn_signals.build_teach_prompt(_teach_ex(), direction="legitimate",
+                                             active_refinements=[])
+    spam = learn_signals.build_teach_prompt(_teach_ex(), direction="spam",
+                                            active_refinements=[])
+    # Spam side explicitly invites conditional + fine distinctions (the political
+    # affiliation example is the canonical subtle case).
+    assert "conditional" in spam.lower() or "unless" in spam.lower()
+    assert "affiliation" in spam.lower() or "party" in spam.lower()
+    # Legit side invites a conditional carve-out and warns off bare whitelists.
+    assert "except when" in legit.lower()
+    assert "single-domain whitelist" in legit.lower()
 
 
 def test_teach_prompt_user_reason_is_guidance_and_critiqued():
+    # A vague, subjective reason must still be flagged as ignorable so the model
+    # takes the decline path rather than minting a junk rule from it.
     p = learn_signals.build_teach_prompt(_teach_ex("it looks creepy"),
                                          direction="spam", active_refinements=[])
     assert "it looks creepy" in p
     assert "<user_explanation>" in p
     assert "generaliz" in p.lower()      # instruction to judge generalizability
+    assert "no_rule" in p                # the decline path is still offered
+    # The vague example is still named as something to IGNORE.
+    assert "creepy" in p.lower() and "ignore" in p.lower()
 
 
 def test_teaching_refinement_builds_scoped_legit_rule():
