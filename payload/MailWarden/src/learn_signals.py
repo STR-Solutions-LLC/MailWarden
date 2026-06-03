@@ -108,7 +108,6 @@ def load_signals() -> dict:
             "signals": {
                 "hard_signals": [],
                 "soft_signals": [],
-                "known_impersonated_brands": [],
                 "known_sending_infrastructure": [],
                 "learner_notes": "",
             },

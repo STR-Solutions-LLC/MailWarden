@@ -6,8 +6,8 @@ Unit tests for the calibration + security build (run with the test venv):
   tests/.venv/bin/python -c "import pytest; raise SystemExit(pytest.main(['tests/test_fixes.py','-v']))"
 
 Covers the deterministic fixes:
-  F1 — X-Spam-Score ×10 misread (utils.check_spam_score)
-  F2 — soft-signal-only stacks must NOT auto-junk (utils.check_header_signals)
+  F1 — X-Spam-Score ×10 misread (utils.check_spam_score / utils.host_spam_verdict)
+  F2 — only HARD signals auto-junk; soft signals removed (utils.check_header_signals)
   F4 — whitelist subdomain matching (spam_filter.check_whitelist)
   C1 — confidence clamp
   S1 — command sender must equal account owner
@@ -76,23 +76,57 @@ def test_f1_no_spam_headers_no_signal():
     assert utils.check_spam_score({})["signal"] is None
 
 
+# host_spam_verdict — present-only summary built on the SAME ×10-safe parsing.
+
+def test_f1_host_verdict_absent_is_none():
+    # No X-Spam-* header at all -> None (caller omits the line entirely).
+    assert utils.host_spam_verdict({}) is None
+
+
+def test_f1_host_verdict_x10_uses_real_decimal_not_times_ten():
+    # Instagram: real 1.6, header X-Spam-Score=16. Must report score=1.6, flag no.
+    v = utils.host_spam_verdict(
+        {"X-Spam-Status": "No, score=1.6", "X-Spam-Score": "16", "X-Spam-Flag": "NO"})
+    assert v == {"score": 1.6, "flag": "no", "verdict": "no"}
+
+
+def test_f1_host_verdict_high_flag_is_yes():
+    assert utils.host_spam_verdict({"X-Spam-Flag": "YES"}) == \
+        {"score": None, "flag": "yes", "verdict": "yes"}
+
+
+def test_f1_host_verdict_present_low_flag_is_no():
+    # Present but clean -> a factual no/score line is still emitted by the caller.
+    assert utils.host_spam_verdict({"X-Spam-Flag": "NO"}) == \
+        {"score": None, "flag": "no", "verdict": "no"}
+
+
 # ---------------------------------------------------------------------------
-# F2 — only HARD signals may auto-junk. A stack of >=3 soft signals must route
-# to the AI (verdict None), never auto-junk.
+# F2 — only HARD signals may auto-junk. Soft signals were removed entirely:
+# check_header_signals now always returns soft_signals == [], and any message
+# without a HARD signal routes to the AI (verdict None), never auto-junked.
 # ---------------------------------------------------------------------------
 
-def _three_soft_headers():
+def _non_hard_headers():
+    # Reply-To / Message-ID domain mismatches + empty body used to manufacture
+    # 3 SOFT signals. None of those are signals anymore, so this message must
+    # produce NO signals at all and route to the AI.
     return {
         "From": "alice@example.com",
-        "Reply-To": "bob@unrelated.org",        # REPLY_TO_MISMATCH (soft)
-        "Message-ID": "<abc@other-domain.net>",  # MESSAGE_ID_MISMATCH (soft)
+        "Reply-To": "bob@unrelated.org",
+        "Message-ID": "<abc@other-domain.net>",
     }
 
 
-def test_f2_three_soft_does_not_autojunk():
-    # empty body -> DEGRADED_PLAIN_TEXT (the 3rd soft signal)
-    res = utils.check_header_signals(_three_soft_headers(), "")
-    assert len(res["soft_signals"]) >= 3
+def test_f2_soft_signals_always_empty():
+    # The former 3-soft inputs (incl. empty body) now yield zero signals.
+    res = utils.check_header_signals(_non_hard_headers(), "")
+    assert res["soft_signals"] == []
+    assert res["hard_signals"] == []
+
+
+def test_f2_non_hard_routes_to_ai_not_autojunk():
+    res = utils.check_header_signals(_non_hard_headers(), "")
     assert res["pre_classifier_verdict"] is None
 
 

@@ -1966,22 +1966,16 @@ class CheckEmailTab(ttk.Frame):
                 body, "Blocked instantly by the built-in checks — no Claude "
                       "request needed. Here's what it caught:",
                 style="Subheading.TLabel", pady=(6, 0))
-            ex = explain_text.explain_pre_signals(
-                pre.get("hard_signals"), pre.get("soft_signals"),
-                pre.get("signal_details"))
-            for s in ex["blocked"]:
-                self._result_line(body, "•  " + s)
-        else:
-            ex = explain_text.explain_pre_signals(
-                pre.get("hard_signals"), pre.get("soft_signals"),
-                pre.get("signal_details"))
-            if ex["noticed"]:
-                self._result_line(
-                    body, "MailWarden noticed a few things, but none was enough "
-                          "to block on its own, so it asked Claude:",
-                    style="Subheading.TLabel", pady=(6, 0))
-                for s in ex["noticed"]:
+            # All pre-classifier signals are HARD (instant block); render each
+            # hard signal's plain-English sentence, de-duplicated.
+            seen = set()
+            for n in (pre.get("hard_signals") or []):
+                s = explain_text.explain_pre_signal(
+                    n, (pre.get("signal_details") or {}).get(n, ""))
+                if s and s not in seen:
+                    seen.add(s)
                     self._result_line(body, "•  " + s)
+        else:
             out = explain_text.explain_ai_outcome(ai, final, threshold)
             self._result_line(body, out["headline"],
                               style="Subheading.TLabel", pady=(6, 0))
@@ -2758,9 +2752,6 @@ class SignalsTab(ttk.Frame):
         self._render_rule_group(
             body, "Known sending infrastructure",
             sig_data.get("known_sending_infrastructure", []))
-        self._render_rule_group(
-            body, "Known impersonated brands",
-            sig_data.get("known_impersonated_brands", []))
         notes = sig_data.get("learner_notes", "")
         if notes:
             ttk.Label(body, style="Muted.TLabel",

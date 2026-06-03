@@ -143,38 +143,13 @@ def get_plain_text_body_from_msg(msg) -> str:
 # (c) 2026 STR Solutions, LLC. All rights reserved.
 # ---------------------------------------------------------------------------
 
-# Legitimate ESPs where domain mismatches are expected and benign.
-# Used by reply-to and message-id signals.
-LEGITIMATE_ESPS = {
-    "mailchimp.com", "mcsv.net", "mcdlv.net",
-    "sendgrid.net", "sendgrid.com",
-    "amazonses.com", "ses-us-east-1.amazonses.com",
-    "constantcontact.com", "ccsend.com",
-    "campaignmonitor.com", "createsend.com", "cmail1.com", "cmail19.com",
-    "klaviyo.com", "klaviyomail.com",
-    "mailgun.org", "mailgun.net",
-    "postmarkapp.com", "pm-bounces.com",
-    "sparkpostmail.com",
-    "list-manage.com",
-    "sendinblue.com", "brevo.com",
-}
-
-
-def _domain_in_esp(domain: str) -> bool:
-    """Return True if domain matches or is a subdomain of a known ESP."""
-    if not domain:
-        return False
-    domain = domain.lower().lstrip("@")
-    for esp in LEGITIMATE_ESPS:
-        if domain == esp or domain.endswith("." + esp):
-            return True
-    return False
-
 
 def check_auth_results(headers: dict) -> dict:
-    """Signal 1: SPF/DKIM/DMARC failures.
-    Hard: both SPF and DKIM fail. Soft: single failure.
-    Returns {'signal': None | 'SPF_DKIM_BOTH_FAIL' | 'SPF_OR_DKIM_FAIL', 'detail': str}."""
+    """Signal 1: SPF/DKIM/DMARC failures (HARD only).
+    Hard: both SPF and DKIM fail. A single failure is NOT a signal — single
+    SPF/DKIM failures are common on forwarded/mailing-list mail and are left
+    for the AI to judge from the full authentication block.
+    Returns {'signal': None | 'SPF_DKIM_BOTH_FAIL', 'detail': str}."""
     auth_results = headers.get("Authentication-Results", "") or ""
     received_spf = headers.get("Received-SPF", "") or ""
     combined = (auth_results + " " + received_spf).lower()
@@ -187,10 +162,6 @@ def check_auth_results(headers: dict) -> dict:
 
     if spf_fail and dkim_fail:
         return {"signal": "SPF_DKIM_BOTH_FAIL", "detail": "Both SPF and DKIM failed"}
-    if spf_fail:
-        return {"signal": "SPF_OR_DKIM_FAIL", "detail": "SPF failed"}
-    if dkim_fail:
-        return {"signal": "SPF_OR_DKIM_FAIL", "detail": "DKIM failed"}
     return {"signal": None, "detail": ""}
 
 
@@ -292,7 +263,7 @@ def summarize_authentication(headers: dict, from_domain: str = "") -> dict:
 
 
 def check_spam_score(headers: dict) -> dict:
-    """Signal 2: SpamAssassin verdict (Bluehost / cPanel).
+    """SpamAssassin verdict parser (Bluehost / cPanel).
 
     IMPORTANT (F1): the ``X-Spam-Score`` header is the SpamAssassin score
     multiplied by TEN — a clean score of 1.6 is stamped as ``X-Spam-Score: 16``.
@@ -301,17 +272,16 @@ def check_spam_score(headers: dict) -> dict:
     read the REAL decimal from ``X-Spam-Status`` (``score=N.N``) plus the verdict
     from ``X-Spam-Flag`` / ``X-Spam-Status``.
 
-    SpamAssassin runs UPSTREAM of MailWarden, so genuinely spammy mail is
-    normally moved out before we ever see it — nearly everything we evaluate is
-    ``Flag: NO`` with a low score. Therefore only a genuinely HIGH verdict counts
-    as spam evidence (and even then it is a SOFT signal that routes to the AI; it
-    never auto-junks):
+    This helper no longer feeds a pre-classifier signal (soft signals were
+    removed); it is retained as the shared, regression-guarded parser for the
+    ×10 misread and is reused by ``host_spam_verdict``. A genuinely HIGH verdict
+    is reported as ``ELEVATED_SPAM_SCORE``:
       - ``X-Spam-Flag: YES``, or
       - ``X-Spam-Status`` verdict ``Yes``, or
       - real decimal score >= 5.0 (SpamAssassin's usual spam threshold; covers
         'tag-only' configs that still deliver flagged mail to the inbox).
-    The normal low range is treated as NO signal (mild evidence of legitimacy,
-    not spam). AOL/Yahoo do not stamp ``X-Spam-*`` at all → no signal there.
+    The normal low range is treated as NO signal. AOL/Yahoo do not stamp
+    ``X-Spam-*`` at all → no signal there.
     """
     flag_hdr = (headers.get("X-Spam-Flag", "") or "").strip().upper()
     status_hdr = headers.get("X-Spam-Status", "") or ""
@@ -337,127 +307,38 @@ def check_spam_score(headers: dict) -> dict:
     return {"signal": None, "detail": ""}
 
 
-def check_reply_to_mismatch(headers: dict) -> dict:
-    """Signal 3: Reply-To domain differs from From domain.
-    Skip if Reply-To absent. Skip if either is a known ESP."""
-    reply_to = headers.get("Reply-To", "") or ""
-    from_hdr = headers.get("From", "") or ""
+def host_spam_verdict(headers: dict) -> dict | None:
+    """Present-only summary of the sender's UPSTREAM provider spam verdict.
 
-    if not reply_to.strip():
-        return {"signal": None, "detail": ""}
+    Returns ``None`` when no ``X-Spam-*`` header is present at all (the common
+    case for AOL/Yahoo and many hosts) — callers MUST omit any spam-score line
+    entirely in that case rather than claim "no score"/"unknown". When at least
+    one ``X-Spam-Flag`` / ``X-Spam-Status`` header IS present, returns a factual
+    dict for the trusted context block::
 
-    rt_parsed = parse_from_address(reply_to)
-    from_parsed = parse_from_address(from_hdr)
-    rt_addr = rt_parsed.get("address")
-    from_addr = from_parsed.get("address")
+        {"score": float | None, "flag": "yes" | "no", "verdict": "yes" | "no"}
 
-    if not rt_addr or not from_addr:
-        return {"signal": None, "detail": ""}
+    ``flag``/``verdict`` are derived via the same parsing as ``check_spam_score``
+    (so the ×10 misread can never resurface): a HIGH verdict → "yes", otherwise
+    "no". ``score`` is the REAL decimal from ``X-Spam-Status`` (``score=N.N``)
+    when present, else None. ``X-Spam-Score`` is never read.
+    """
+    flag_hdr = (headers.get("X-Spam-Flag", "") or "").strip()
+    status_hdr = (headers.get("X-Spam-Status", "") or "").strip()
+    if not flag_hdr and not status_hdr:
+        return None
 
-    rt_domain = rt_addr.split("@", 1)[1] if "@" in rt_addr else ""
-    from_domain = from_addr.split("@", 1)[1] if "@" in from_addr else ""
+    high = check_spam_score(headers)["signal"] == "ELEVATED_SPAM_SCORE"
+    score = None
+    m = re.search(r'score=(-?\d+\.?\d*)', status_hdr, re.IGNORECASE)
+    if m:
+        try:
+            score = float(m.group(1))
+        except ValueError:
+            score = None
 
-    if rt_domain == from_domain:
-        return {"signal": None, "detail": ""}
-    if _domain_in_esp(rt_domain) or _domain_in_esp(from_domain):
-        return {"signal": None, "detail": ""}
-
-    return {"signal": "REPLY_TO_MISMATCH",
-            "detail": f"Reply-To domain '{rt_domain}' differs from From domain '{from_domain}'"}
-
-
-def check_list_unsubscribe(headers: dict, plain_text_body: str = "") -> dict:
-    """Signal 4: List-Unsubscribe on transactional email.
-    Fires if List-Unsubscribe present AND subject/from contains transactional language."""
-    list_unsub = headers.get("List-Unsubscribe", "") or ""
-    if not list_unsub.strip():
-        return {"signal": None, "detail": ""}
-
-    subject = (headers.get("Subject", "") or "").lower()
-    from_hdr = (headers.get("From", "") or "").lower()
-    combined = subject + " " + from_hdr
-
-    transactional_terms = [
-        "delivery", "shipment", "shipped", "package", "parcel",
-        "tracking", "arriving",
-        "account", "membership", "plan",
-        "points", "rewards", "claim", "prize",
-        "generator", "kit", "giveaway",
-        "invoice", "receipt", "order confirmation",
-    ]
-    hits = [t for t in transactional_terms if t in combined]
-    if hits:
-        return {"signal": "LIST_UNSUB_TRANSACT",
-                "detail": f"List-Unsubscribe on transactional email (terms: {', '.join(hits[:3])})"}
-    return {"signal": None, "detail": ""}
-
-
-def check_message_id_domain(headers: dict) -> dict:
-    """Signal 5: Message-ID domain differs from From domain.
-    Skip if either is a known ESP."""
-    msg_id = headers.get("Message-ID", "") or ""
-    from_hdr = headers.get("From", "") or ""
-
-    if not msg_id.strip() or not from_hdr.strip():
-        return {"signal": None, "detail": ""}
-
-    # Extract domain from Message-ID: <stuff@domain>
-    mid_match = re.search(r'<[^@>]+@([^>]+)>', msg_id)
-    if not mid_match:
-        return {"signal": None, "detail": ""}
-    mid_domain = mid_match.group(1).strip().lower()
-
-    from_parsed = parse_from_address(from_hdr)
-    from_addr = from_parsed.get("address")
-    if not from_addr:
-        return {"signal": None, "detail": ""}
-    from_domain = from_addr.split("@", 1)[1] if "@" in from_addr else ""
-
-    if mid_domain == from_domain:
-        return {"signal": None, "detail": ""}
-
-    # Allow subdomain relationships
-    if mid_domain.endswith("." + from_domain) or from_domain.endswith("." + mid_domain):
-        return {"signal": None, "detail": ""}
-
-    if _domain_in_esp(mid_domain) or _domain_in_esp(from_domain):
-        return {"signal": None, "detail": ""}
-
-    return {"signal": "MESSAGE_ID_MISMATCH",
-            "detail": f"Message-ID domain '{mid_domain}' differs from From domain '{from_domain}'"}
-
-
-def check_plain_text_quality(plain_text_body: str) -> dict:
-    """Signal 6: Plain text body is absent, empty, very short, CSS-only, or obfuscated."""
-    if plain_text_body is None:
-        return {"signal": "DEGRADED_PLAIN_TEXT", "detail": "Plain text part absent"}
-
-    body = str(plain_text_body).strip()
-    if not body:
-        return {"signal": "DEGRADED_PLAIN_TEXT", "detail": "Plain text empty"}
-
-    # Strip whitespace for length check
-    stripped = re.sub(r'\s+', '', body)
-    if len(stripped) < 50:
-        return {"signal": "DEGRADED_PLAIN_TEXT",
-                "detail": f"Plain text very short ({len(stripped)} chars)"}
-
-    # CSS detection: count class-like patterns and CSS punctuation
-    css_chars = len(re.findall(r'[{};:]', body))
-    dot_class = len(re.findall(r'\.[a-zA-Z_][\w-]*\s*\{', body))
-    if len(body) > 0:
-        css_ratio = (css_chars + dot_class * 3) / len(body)
-        if css_ratio > 0.3 and dot_class >= 2:
-            return {"signal": "DEGRADED_PLAIN_TEXT",
-                    "detail": f"Plain text appears to be CSS only (ratio {css_ratio:.2f})"}
-
-    # Obfuscation: >50% non-alphanumeric/whitespace
-    non_word = len(re.findall(r'[^\w\s]', body))
-    if len(body) > 0 and (non_word / len(body)) > 0.5:
-        return {"signal": "DEGRADED_PLAIN_TEXT",
-                "detail": f"Plain text appears obfuscated ({non_word}/{len(body)} non-word chars)"}
-
-    return {"signal": None, "detail": ""}
+    verdict = "yes" if high else "no"
+    return {"score": score, "flag": verdict, "verdict": verdict}
 
 
 def _extract_sending_ip(received_headers) -> str:
@@ -495,8 +376,9 @@ def _extract_sending_ip(received_headers) -> str:
 
 
 def check_ip_reputation(sending_ip: str, timeout: float = 3.0) -> dict:
-    """Signal 7: DNSBL lookup on sending IP.
-    Hard: listed on 2+ blocklists. Soft: listed on 1."""
+    """Signal 7: DNSBL lookup on sending IP (HARD only).
+    Hard: listed on 2+ blocklists. A single listing is NOT a signal — single
+    DNSBL hits are noisy/often stale and are left for the AI to weigh."""
     if not sending_ip:
         return {"signal": None, "detail": "", "hits": []}
 
@@ -543,90 +425,7 @@ def check_ip_reputation(sending_ip: str, timeout: float = 3.0) -> dict:
         return {"signal": "IP_DNSBL_MULTIPLE",
                 "detail": f"IP {sending_ip} listed on: {', '.join(hits)}",
                 "hits": hits}
-    if len(hits) == 1:
-        return {"signal": "IP_DNSBL_SINGLE",
-                "detail": f"IP {sending_ip} listed on: {hits[0]}",
-                "hits": hits}
     return {"signal": None, "detail": "", "hits": []}
-
-
-# ---------------------------------------------------------------------------
-# Pre-classifier signal: prompt-injection attempt detector
-# (c) 2026 STR Solutions, LLC. All rights reserved.
-# ---------------------------------------------------------------------------
-
-# High-precision patterns for prompt-injection attempts in email content.
-# All patterns are case-insensitive. Kept narrow to minimise false positives
-# on legitimate AI-related newsletters or discussion email.
-#
-# Calibration intent:
-#   Soft-signal threshold is 3. Injection fires TWO soft signals
-#   (PROMPT_INJECTION_ATTEMPT + PROMPT_INJECTION_ATTEMPT_BOOST) so that:
-#     injection alone        = 2 signals  <  3  (no verdict — passes through)
-#     injection + 1 other    = 3 signals  >= 3  (SPAM verdict)
-#   A legitimate email that merely mentions AI topics uses none of these
-#   precise imperative/role-switching phrases and will score 0 from this check.
-_INJECTION_PATTERNS = [
-    # Classic "ignore previous instructions" family
-    re.compile(
-        r'ignore\s+(all\s+|the\s+)?(previous|prior|above)\s+instructions?',
-        re.IGNORECASE),
-    re.compile(
-        r'disregard\s+(your|all|previous|prior|above)\s+instructions?',
-        re.IGNORECASE),
-    re.compile(
-        r'forget\s+(all\s+)?(previous|prior|above|your)\s+instructions?',
-        re.IGNORECASE),
-    # Role/persona override
-    re.compile(r'\byou\s+are\s+now\b', re.IGNORECASE),
-    re.compile(r'\bact\s+as\b', re.IGNORECASE),
-    re.compile(r'\bpretend\s+(you\s+are|to\s+be)\b', re.IGNORECASE),
-    # System-layer references — high-signal in untrusted email
-    re.compile(r'\bsystem\s+prompt\b', re.IGNORECASE),
-    re.compile(r'\bdeveloper\s+message\b', re.IGNORECASE),
-    re.compile(r'\bsystem\s+message\b', re.IGNORECASE),
-    # Conversation-role injections: lines that start with Human:/Assistant:/System:
-    re.compile(r'(?:^|\n)\s*(?:human|assistant|system)\s*:', re.IGNORECASE),
-    # Attempts to reveal or override the prompt
-    re.compile(r'\breveal\s+(your|the)\s+(system\s+)?prompt\b', re.IGNORECASE),
-    re.compile(r'\boverride\s+(your\s+)?(instructions?|directives?|rules?)\b',
-               re.IGNORECASE),
-    re.compile(r'\bnew\s+instructions?\s*:', re.IGNORECASE),
-    # Literal injected delimiter tags (closing the untrusted_email wrapper)
-    re.compile(r'</?\s*untrusted_email\s*>', re.IGNORECASE),
-]
-
-
-def check_prompt_injection(subject: str, plain_text_body: str) -> dict:
-    """Signal 8: Prompt-injection attempt in subject or body.
-
-    Scans the decoded subject line and plain-text body for high-precision
-    prompt-injection patterns. Returns two parallel soft signals when a
-    match is found so that the pair counts as 2 of the 3 soft signals
-    required for a SPAM verdict — satisfying the calibration constraint
-    that injection alone cannot decide spam but injection + one other
-    signal can.
-
-    Returns:
-        {
-          'signals': list of 0 or 2 signal name strings,
-          'detail': str,
-        }
-    """
-    text = f"{subject or ''}\n{plain_text_body or ''}"
-    for pat in _INJECTION_PATTERNS:
-        m = pat.search(text)
-        if m:
-            snippet = m.group(0).replace('\n', ' ').strip()[:80]
-            detail = f"Prompt-injection pattern matched: {snippet!r}"
-            return {
-                "signals": [
-                    "PROMPT_INJECTION_ATTEMPT",
-                    "PROMPT_INJECTION_ATTEMPT_BOOST",
-                ],
-                "detail": detail,
-            }
-    return {"signals": [], "detail": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -641,8 +440,7 @@ def check_prompt_injection(subject: str, plain_text_body: str) -> dict:
 # Calibration:
 #   >= 2 distinct markers in subject+body → HARD signal LEAKED_AI_PROMPT
 #      (deterministic spam, no API call)
-#   exactly 1 marker → ONE soft signal (contributes toward the 3-soft
-#      threshold but is not decisive alone)
+#   fewer than 2 markers → NO signal (left for the AI to judge)
 _LEAKED_AI_PROMPT_MARKERS = [
     "=== assignment ===",
     "=== output format ===",
@@ -660,15 +458,15 @@ _LEAKED_AI_PROMPT_MARKERS = [
 
 
 def check_leaked_ai_prompt(subject: str, plain_text_body: str) -> dict:
-    """Signal 9: Leaked AI generation-prompt content in subject or body.
+    """Signal 9: Leaked AI generation-prompt content in subject or body (HARD only).
 
     Counts how many DISTINCT markers from _LEAKED_AI_PROMPT_MARKERS appear
-    (case-insensitive) in the combined subject + body text.
+    (case-insensitive) in the combined subject + body text. Only the >= 2
+    marker case is a (hard) signal; a single marker is NOT a signal.
 
     Returns:
         {
           'hard_signal': str or None,   # 'LEAKED_AI_PROMPT' if >= 2 markers
-          'soft_signals': list[str],    # ['LEAKED_AI_PROMPT'] if exactly 1 marker
           'detail': str,
           'marker_count': int,
         }
@@ -680,21 +478,13 @@ def check_leaked_ai_prompt(subject: str, plain_text_body: str) -> dict:
     if count >= 2:
         return {
             "hard_signal": "LEAKED_AI_PROMPT",
-            "soft_signals": [],
             "detail": (
                 f"Leaked AI generation prompt detected: {count} distinct markers "
                 f"({', '.join(repr(f) for f in found[:4])}{'...' if count > 4 else ''})"
             ),
             "marker_count": count,
         }
-    if count == 1:
-        return {
-            "hard_signal": None,
-            "soft_signals": ["LEAKED_AI_PROMPT"],
-            "detail": f"Possible leaked AI prompt: marker {found[0]!r} found",
-            "marker_count": count,
-        }
-    return {"hard_signal": None, "soft_signals": [], "detail": "", "marker_count": 0}
+    return {"hard_signal": None, "detail": "", "marker_count": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -703,7 +493,8 @@ def check_leaked_ai_prompt(subject: str, plain_text_body: str) -> dict:
 # ---------------------------------------------------------------------------
 #
 # Only patterns with essentially zero legitimate occurrence are placed here.
-# Broader/ambiguous patterns stay as the existing soft PROMPT_INJECTION_ATTEMPT.
+# Broader/ambiguous prompt-injection phrasing is no longer a pre-classifier
+# signal; it is left for the AI to judge from the message content.
 #
 # (a) Our own delimiter tag appearing in received content:
 #     <untrusted_email> or </untrusted_email>
@@ -733,8 +524,7 @@ def check_hard_prompt_injection(subject: str, plain_text_body: str) -> dict:
     """Signal 10: Unambiguous prompt-injection HARD tells.
 
     Any match → HARD signal PROMPT_INJECTION_HARD (deterministic SPAM,
-    no API call). Keeps the existing soft check_prompt_injection() intact
-    for the broader/ambiguous patterns.
+    no API call). Broader/ambiguous injection phrasing is left for the AI.
 
     Returns:
         {
@@ -767,100 +557,52 @@ def check_hard_prompt_injection(subject: str, plain_text_body: str) -> dict:
 def check_header_signals(headers: dict, plain_text_body: str,
                          sending_ip: str = None,
                          dnsbl_timeout: float = 3.0) -> dict:
-    """Orchestrate all pre-classifier signal checks.
-    Returns a summary dict with hard_signals, soft_signals, signal_details,
-    pre_classifier_verdict (None or 'SPAM'), and pre_classifier_confidence."""
+    """Orchestrate the pre-classifier HARD signal checks.
+
+    Only HARD signals exist now — each one auto-blocks deterministically (no AI
+    call). Soft signals were removed: a non-hard, non-listed message is routed
+    to the AI to judge from the full SERVER-VERIFIED authentication block and
+    content, so there is no longer any soft pre-classifier context to assemble.
+    ``soft_signals`` is always ``[]`` (kept for backward compatibility with
+    consumers that read the key) and ``signal_details`` carries only hard-signal
+    detail. ``pre_classifier_verdict`` / hard-block logic is unchanged.
+
+    Hard signals: SPF_DKIM_BOTH_FAIL, LEAKED_AI_PROMPT (>= 2 markers),
+    PROMPT_INJECTION_HARD, IP_DNSBL_MULTIPLE.
+    """
 
     hard_signals = []
-    soft_signals = []
     signal_details = {}
 
-    # Signal 1: Authentication
+    # Signal 1: Authentication — both SPF and DKIM fail (hard).
     s1 = check_auth_results(headers)
     if s1["signal"] == "SPF_DKIM_BOTH_FAIL":
         hard_signals.append(s1["signal"])
         signal_details[s1["signal"]] = s1["detail"]
-    elif s1["signal"] == "SPF_OR_DKIM_FAIL":
-        soft_signals.append(s1["signal"])
-        signal_details[s1["signal"]] = s1["detail"]
 
-    # Signal 2: Spam score
-    s2 = check_spam_score(headers)
-    if s2["signal"]:
-        soft_signals.append(s2["signal"])
-        signal_details[s2["signal"]] = s2["detail"]
-
-    # Signal 3: Reply-To mismatch
-    s3 = check_reply_to_mismatch(headers)
-    if s3["signal"]:
-        soft_signals.append(s3["signal"])
-        signal_details[s3["signal"]] = s3["detail"]
-
-    # Signal 4: List-Unsubscribe on transactional
-    s4 = check_list_unsubscribe(headers, plain_text_body)
-    if s4["signal"]:
-        soft_signals.append(s4["signal"])
-        signal_details[s4["signal"]] = s4["detail"]
-
-    # Signal 5: Message-ID mismatch
-    s5 = check_message_id_domain(headers)
-    if s5["signal"]:
-        soft_signals.append(s5["signal"])
-        signal_details[s5["signal"]] = s5["detail"]
-
-    # Signal 6: Plain text quality
-    s6 = check_plain_text_quality(plain_text_body)
-    if s6["signal"]:
-        soft_signals.append(s6["signal"])
-        signal_details[s6["signal"]] = s6["detail"]
-
-    # Signal 8: Prompt-injection attempt in subject or body.
-    # Fires two soft signals together so that injection alone < threshold
-    # (2 < 3) but injection + one other soft signal reaches the verdict
-    # threshold (3 >= 3). See check_prompt_injection() for calibration notes.
-    s8 = check_prompt_injection(headers.get("Subject", ""), plain_text_body)
-    if s8["signals"]:
-        for sig_name in s8["signals"]:
-            soft_signals.append(sig_name)
-            signal_details[sig_name] = s8["detail"]
-
-    # Signal 9: Leaked AI generation-prompt content.
-    # >= 2 distinct markers → HARD signal LEAKED_AI_PROMPT (no API).
-    # exactly 1 marker → one soft signal (contributes toward threshold).
+    # Signal 9: Leaked AI generation-prompt content — >= 2 distinct markers (hard).
     s9 = check_leaked_ai_prompt(headers.get("Subject", ""), plain_text_body)
     if s9["hard_signal"]:
         hard_signals.append(s9["hard_signal"])
         signal_details[s9["hard_signal"]] = s9["detail"]
-    elif s9["soft_signals"]:
-        for sig_name in s9["soft_signals"]:
-            soft_signals.append(sig_name)
-            signal_details[sig_name] = s9["detail"]
 
-    # Signal 10: Unambiguous TRUE prompt-injection hard tells.
-    # Any match → HARD signal PROMPT_INJECTION_HARD (no API).
-    # Leaves existing soft check_prompt_injection() for broader patterns.
+    # Signal 10: Unambiguous TRUE prompt-injection hard tells (hard).
     s10 = check_hard_prompt_injection(headers.get("Subject", ""), plain_text_body)
     if s10["hard_signal"]:
         hard_signals.append(s10["hard_signal"])
         signal_details[s10["hard_signal"]] = s10["detail"]
 
-    # Signal 7: IP reputation (requires sending_ip; may be slow)
+    # Signal 7: IP reputation — listed on 2+ DNSBLs (hard; requires sending_ip,
+    # may be slow).
     if sending_ip:
         s7 = check_ip_reputation(sending_ip, timeout=dnsbl_timeout)
         if s7["signal"] == "IP_DNSBL_MULTIPLE":
             hard_signals.append(s7["signal"])
             signal_details[s7["signal"]] = s7["detail"]
-        elif s7["signal"] == "IP_DNSBL_SINGLE":
-            soft_signals.append(s7["signal"])
-            signal_details[s7["signal"]] = s7["detail"]
 
     # Compute verdict.
-    # F2 (Matt-locked): ONLY hard signals may auto-junk. A stack of soft signals
-    # — no matter how many — is NEVER auto-junked; it is routed to the AI as
-    # context for a real decision. Previously >=3 soft auto-junked at 0.88, which
-    # silently junked legitimate bulk/transactional mail (e.g. Dashlane) with no
-    # AI call. The soft_signals list is still returned so the caller can pass it
-    # to the classifier as non-dispositive context.
+    # F2 (Matt-locked): ONLY hard signals may auto-junk. Everything else is
+    # routed to the AI for a real decision (no soft auto-junk ever).
     verdict = None
     confidence = 0.0
     if hard_signals:
@@ -869,7 +611,7 @@ def check_header_signals(headers: dict, plain_text_body: str,
 
     return {
         "hard_signals": hard_signals,
-        "soft_signals": soft_signals,
+        "soft_signals": [],
         "signal_details": signal_details,
         "pre_classifier_verdict": verdict,
         "pre_classifier_confidence": confidence,

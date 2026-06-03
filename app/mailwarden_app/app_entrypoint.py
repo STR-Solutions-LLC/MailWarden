@@ -436,7 +436,6 @@ def _run_classify_eml() -> int:
     print("-" * 64)
     print("PRE-CLASSIFIER (header checks — free, no AI):")
     print(f"  hard signals: {pre.get('hard_signals') or '(none)'}")
-    print(f"  soft signals: {pre.get('soft_signals') or '(none)'}")
     if pre.get("verdict") == "SPAM":
         print(f"  -> BLOCKED HERE at {pre.get('confidence'):.2f} — no Claude call made ($0)")
     else:

@@ -34,9 +34,8 @@ from mailwarden_app import explain_text  # noqa: E402
 SIGNALS = {"signals": {}, "ai_refinements": []}
 
 # A normal-looking email: From/Message-ID share a domain, no auth headers,
-# no Reply-To, no List-Unsubscribe, body long enough to avoid DEGRADED_PLAIN_TEXT.
-# => check_header_signals fires NOTHING, so the only thing that can decide it
-# is the list gate (or, with a key, the AI).
+# no hard-signal tells. => check_header_signals fires NOTHING, so the only thing
+# that can decide it is the list gate (or, with a key, the AI).
 RAW_NORMAL = (
     b"From: Promo <promo@evil.com>\r\n"
     b"To: me@example.org\r\n"
@@ -44,7 +43,7 @@ RAW_NORMAL = (
     b"Message-ID: <abc123@evil.com>\r\n"
     b"\r\n"
     b"Hello friend, this is a perfectly normal length body with plenty of real "
-    b"words in it so the plain-text quality check stays quiet. Thanks for reading.\r\n"
+    b"words in it. Thanks for reading.\r\n"
 )
 
 
@@ -159,50 +158,17 @@ def test_hard_signal_sentences_present_and_plain():
 
 
 def test_pre_signal_is_hard_classification():
+    # Every remaining pre-filter signal is HARD; non-signals are not hard.
     assert explain_text.pre_signal_is_hard("LEAKED_AI_PROMPT") is True
     assert explain_text.pre_signal_is_hard("PROMPT_INJECTION_HARD") is True
     assert explain_text.pre_signal_is_hard("IP_DNSBL_MULTIPLE") is True
     assert explain_text.pre_signal_is_hard("SPF_DKIM_BOTH_FAIL") is True
-    assert explain_text.pre_signal_is_hard("REPLY_TO_MISMATCH") is False
-    assert explain_text.pre_signal_is_hard("IP_DNSBL_SINGLE") is False
-
-
-def test_reply_to_mismatch_fills_real_domains():
-    detail = "Reply-To domain 'scammer.com' differs from From domain 'realbank.com'"
-    s = explain_text.explain_pre_signal("REPLY_TO_MISMATCH", detail)
-    assert "scammer.com" in s and "realbank.com" in s
-
-
-def test_message_id_mismatch_fills_real_domains():
-    detail = "Message-ID domain 'tracking.net' differs from From domain 'sender.com'"
-    s = explain_text.explain_pre_signal("MESSAGE_ID_MISMATCH", detail)
-    assert "tracking.net" in s and "sender.com" in s
+    assert explain_text.pre_signal_is_hard("SOME_FUTURE_SIGNAL") is False
 
 
 def test_unknown_signal_is_graceful():
     s = explain_text.explain_pre_signal("SOME_FUTURE_SIGNAL", "raw detail")
     assert isinstance(s, str) and s  # non-empty, never crashes
-
-
-def test_injection_pair_collapses_to_one_line():
-    out = explain_text.explain_pre_signals(
-        hard_signals=[],
-        soft_signals=["PROMPT_INJECTION_ATTEMPT", "PROMPT_INJECTION_ATTEMPT_BOOST"],
-        signal_details={"PROMPT_INJECTION_ATTEMPT": "x", "PROMPT_INJECTION_ATTEMPT_BOOST": "x"},
-    )
-    assert out["blocked"] == []
-    assert len(out["noticed"]) == 1
-
-
-def test_explain_pre_signals_splits_blocked_vs_noticed():
-    out = explain_text.explain_pre_signals(
-        hard_signals=["SPF_DKIM_BOTH_FAIL"],
-        soft_signals=["REPLY_TO_MISMATCH"],
-        signal_details={"REPLY_TO_MISMATCH": "Reply-To domain 'a.com' differs from From domain 'b.com'"},
-    )
-    assert len(out["blocked"]) == 1
-    assert len(out["noticed"]) == 1
-    assert "a.com" in out["noticed"][0]
 
 
 def test_list_match_sentences():
@@ -349,3 +315,61 @@ def test_teaching_refinement_spam_default():
 def test_call_claude_accepts_system_override():
     import inspect
     assert "system" in inspect.signature(learn_signals.call_claude).parameters
+
+
+# ---------------------------------------------------------------------------
+# 4. Upstream-provider spam assessment is PRESENT-ONLY and lives in the TRUSTED
+#    region of the classifier user message (outside <untrusted_email>). Built
+#    end-to-end through extract_email_data + build_user_message — no live API.
+# ---------------------------------------------------------------------------
+
+# The real opening delimiter is on its own line ("\n<untrusted_email>\n"); the
+# word also appears in the leading instruction sentence, so split on the line.
+_UNTRUSTED_OPEN = "\n<untrusted_email>\n"
+
+_RAW_WITH_SPAM_STATUS = (
+    b"From: Sender <s@example.com>\r\n"
+    b"To: me@example.org\r\n"
+    b"Subject: Quarterly update\r\n"
+    b"Message-ID: <m1@example.com>\r\n"
+    b"X-Spam-Status: No, score=1.4 required=5.0\r\n"
+    b"X-Spam-Score: 14\r\n"            # the ×10 integer — must be ignored
+    b"X-Spam-Flag: NO\r\n"
+    b"\r\n"
+    b"A normal body with plenty of real words for context here. Thanks.\r\n"
+)
+
+_RAW_WITHOUT_SPAM_HEADERS = (
+    b"From: Sender <s@example.com>\r\n"
+    b"To: me@example.org\r\n"
+    b"Subject: Quarterly update\r\n"
+    b"Message-ID: <m2@example.com>\r\n"
+    b"\r\n"
+    b"A normal body with plenty of real words for context here. Thanks.\r\n"
+)
+
+
+def test_upstream_spam_line_present_when_header_present():
+    md = spam_filter.extract_email_data(_RAW_WITH_SPAM_STATUS)
+    um = spam_filter.build_user_message(md)
+    # Factual line, REAL decimal (1.4) not the ×10 integer (14), flag no.
+    assert "Upstream provider spam assessment: score=1.4, flag=no" in um
+    assert "score=14" not in um  # the ×10 misread must never resurface
+
+
+def test_upstream_spam_line_in_trusted_region_not_untrusted_block():
+    md = spam_filter.extract_email_data(_RAW_WITH_SPAM_STATUS)
+    um = spam_filter.build_user_message(md)
+    trusted, _, untrusted = um.partition(_UNTRUSTED_OPEN)
+    assert "Upstream provider spam assessment" in trusted
+    assert "Upstream provider spam assessment" not in untrusted
+
+
+def test_no_upstream_spam_line_when_headers_absent():
+    md = spam_filter.extract_email_data(_RAW_WITHOUT_SPAM_HEADERS)
+    um = spam_filter.build_user_message(md)
+    assert "Upstream provider spam assessment" not in um
+    assert "spam assessment" not in um.lower()
+    # Must NOT invent a "no score"/"unknown" claim when the header is absent.
+    assert "no score" not in um.lower()
+    assert "score=" not in um.lower()

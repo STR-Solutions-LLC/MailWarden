@@ -12,10 +12,9 @@ Pure module: standard library only, NO tkinter and NO engine import, so it is
 fully unit-testable headless. The dashboard screen composes these helpers.
 """
 import email
-import re
 
-# Pre-filter signals that BLOCK on their own (no AI, $0). Everything else is a
-# "soft" signal that is merely noticed and routed to Claude for the real call.
+# Pre-filter signals that BLOCK on their own (no AI, $0). These are the ONLY
+# pre-filter signals; any other message is routed to Claude for the real call.
 _HARD_SIGNALS = {
     "SPF_DKIM_BOTH_FAIL",
     "LEAKED_AI_PROMPT",
@@ -23,10 +22,10 @@ _HARD_SIGNALS = {
     "IP_DNSBL_MULTIPLE",
 }
 
-# Static plain-English sentences, keyed by signal name. The two domain-mismatch
-# signals and the prompt-injection pair are handled specially below.
+# Static plain-English sentences, keyed by signal name. All pre-filter signals
+# are HARD (instant block) now — soft signals were removed. Non-hard, non-listed
+# mail is routed to Claude, whose own reasoning is shown verbatim.
 _SIGNAL_TEXT = {
-    # --- hard (instant block) ---
     "SPF_DKIM_BOTH_FAIL":
         "This email failed both of the automatic checks that confirm a message "
         "really came from the address it claims. Failing both is a strong sign "
@@ -42,36 +41,7 @@ _SIGNAL_TEXT = {
     "IP_DNSBL_MULTIPLE":
         "The computer that sent this email is on several public lists of known "
         "spam-sending machines.",
-    # --- soft (noticed, not enough alone -> sent to Claude) ---
-    "SPF_OR_DKIM_FAIL":
-        "One of the two checks that confirm a sender's identity failed. That can "
-        "happen with forwarded or mailing-list mail, so on its own it's a yellow "
-        "flag, not proof.",
-    "ELEVATED_SPAM_SCORE":
-        "The sender's own mail provider had already marked this message as likely "
-        "spam.",
-    "LIST_UNSUB_TRANSACT":
-        "This is a bulk mailing (it has an unsubscribe link) dressed up as a "
-        "personal notice like a delivery, invoice, or prize — a pattern scammers "
-        "favor.",
-    "DEGRADED_PLAIN_TEXT":
-        "The email had almost no readable text — it was empty, extremely short, "
-        "or made of code/gibberish instead of normal writing, a trick spam uses "
-        "to slip past filters.",
-    "IP_DNSBL_SINGLE":
-        "The computer that sent this email appears on one public list of "
-        "suspected spam machines.",
-    # Prompt-injection soft pair: ATTEMPT carries the sentence; BOOST is the
-    # internal counting twin and produces no separate line (collapsed).
-    "PROMPT_INJECTION_ATTEMPT":
-        "The email contained phrasing that looks like an attempt to manipulate an "
-        "AI assistant. On its own it won't block the message, but it counts as a "
-        "warning sign.",
-    "PROMPT_INJECTION_ATTEMPT_BOOST": "",
 }
-
-_TWO_DOMAIN_RE = re.compile(
-    r"domain '([^']+)' differs from From domain '([^']+)'", re.IGNORECASE)
 
 
 def pre_signal_is_hard(name: str) -> bool:
@@ -82,59 +52,15 @@ def pre_signal_is_hard(name: str) -> bool:
 def explain_pre_signal(name: str, detail: str = "") -> str:
     """Return the plain-English sentence for one pre-filter signal name.
 
-    ``detail`` is the engine's signal_details string; for the two domain-
-    mismatch signals the real domains are pulled out of it and filled in.
-    Unknown signals get a safe generic sentence (never crashes).
+    ``detail`` is the engine's signal_details string (currently unused — all
+    remaining signals have static wording). Unknown signals get a safe generic
+    sentence (never crashes).
     """
-    if name == "REPLY_TO_MISMATCH":
-        m = _TWO_DOMAIN_RE.search(detail or "")
-        if m:
-            return (f"If you replied, your answer would go to a different domain "
-                    f"({m.group(1)}) than the address it appears to come from "
-                    f"({m.group(2)}) — a common scam setup, though some mailing "
-                    f"lists do it too.")
-        return ("If you replied, your answer would go to a different domain than "
-                "the address this email appears to come from — a common scam "
-                "setup, though some mailing lists do it too.")
-    if name == "MESSAGE_ID_MISMATCH":
-        m = _TWO_DOMAIN_RE.search(detail or "")
-        if m:
-            return (f"The hidden tracking ID on this email comes from a different "
-                    f"domain ({m.group(1)}) than the sender's ({m.group(2)}), "
-                    f"which can mean the 'from' address was faked (but is normal "
-                    f"for some senders).")
-        return ("The hidden tracking ID on this email comes from a different "
-                "domain than the sender's, which can mean the 'from' address was "
-                "faked (but is normal for some senders).")
     if name in _SIGNAL_TEXT:
         return _SIGNAL_TEXT[name]
     # Unknown / future signal — stay graceful and honest.
     return ("MailWarden flagged a technical warning sign on this email "
             f"({name.replace('_', ' ').lower()}).")
-
-
-def explain_pre_signals(hard_signals, soft_signals, signal_details) -> dict:
-    """Turn the engine's hard/soft signal lists into two lists of sentences.
-
-    Returns {"blocked": [...], "noticed": [...]}. The prompt-injection pair and
-    any duplicate sentences are collapsed to a single line.
-    """
-    signal_details = signal_details or {}
-
-    def _render(names):
-        out, seen = [], set()
-        for n in names:
-            s = explain_pre_signal(n, signal_details.get(n, ""))
-            if not s or s in seen:
-                continue
-            seen.add(s)
-            out.append(s)
-        return out
-
-    return {
-        "blocked": _render(hard_signals or []),
-        "noticed": _render(soft_signals or []),
-    }
 
 
 def explain_list_match(list_match: dict) -> str:
