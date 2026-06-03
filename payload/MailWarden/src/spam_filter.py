@@ -1733,20 +1733,113 @@ def _refinement_in_scope(refinement: dict, account_name) -> bool:
     return True  # malformed scope -> fail open (apply), preserves old behavior
 
 
-def build_classifier_prompt(signals: dict, account_name: str = None) -> str:
+def _domain_is_brand_match(authenticated_domain: str, from_domain: str) -> bool:
+    """True if a cryptographically authenticated domain aligns with the From
+    domain — exact, a subdomain, or the parent organizational domain.
+
+    This is the deterministic, code-checkable half of BASE_SYSTEM_PROMPT RULE 1
+    ("the authenticated domain matches the From/brand"). We align against the
+    From domain (not a brand-name guess, which only the model can judge) so the
+    check is fully deterministic. ``bounce.hakeemjeffries.com`` authenticated for
+    a From of ``hakeemjeffries.com`` matches; an UNRELATED authenticated domain
+    (McAfee phish authenticating ``eponanfc.com`` while the From also reads
+    eponanfc.com is its OWN throwaway domain — still RULE 2 in the prompt) is
+    handled by the prompt, not here.
+    """
+    a = (authenticated_domain or "").lower().lstrip("@").rstrip(".")
+    f = (from_domain or "").lower().lstrip("@").rstrip(".")
+    if not a or not f:
+        return False
+    return a == f or f.endswith("." + a) or a.endswith("." + f)
+
+
+def is_authenticated_brand_matched(auth: dict) -> bool:
+    """Deterministic 'true RULE 1' test: the message is cryptographically
+    authenticated (DKIM=pass OR DMARC=pass) AND at least one authenticated
+    domain aligns with the From domain (same domain, a subdomain, or the parent).
+
+    ``auth`` is the dict returned by ``utils.summarize_authentication``. This is
+    the gate for auth-gated suppression of over-broad learned "evasion" signals
+    — it changes NO prompt wording and does NOT force a verdict; it only decides
+    whether the legacy filter-evasion learned signals are injected for THIS
+    email. Unauthenticated mail (Instagram/Dashlane in the corpus) returns False,
+    so its prompt is byte-for-byte unchanged.
+    """
+    if not isinstance(auth, dict):
+        return False
+    if not (auth.get("dkim") == "pass" or auth.get("dmarc") == "pass"):
+        return False
+    from_domain = auth.get("from_domain", "")
+    for d in auth.get("authenticated_domains", []) or []:
+        if _domain_is_brand_match(d, from_domain):
+            return True
+    return False
+
+
+# Substring markers that identify the over-broad legacy learned signals about
+# "benign text prepended / preview manipulation / filter evasion". These are the
+# signals that wrongly junk authenticated, brand-matched bulk mail (which very
+# commonly uses padded/personal-sounding preview text). Matched case-insensitively
+# against each learned hard/soft signal string; ALL markers are about preheader/
+# preview/evasion framing, never about a concrete scam mechanic, so suppressing
+# them for a RULE-1 sender cannot let real spam through (unauthenticated spam
+# never reaches the suppression path, and concrete scam signals are not matched).
+_EVASION_SIGNAL_MARKERS = (
+    "filter evasion",
+    "evade filter",
+    "evade bayesian",
+    "fool bayesian",
+    "preview manipulation",
+    "preview text",
+    "preheader",
+    "prepended before promotional",
+    "prepended before scam",
+    "benign conversational text block",
+    "personal opening paragraphs",
+    "casual/personal opening",
+    "conversational text",
+)
+
+
+def _is_overbroad_evasion_signal(signal_text: str) -> bool:
+    """True if a learned hard/soft signal is one of the over-broad
+    'benign-text-prepended / preview-manipulation / filter-evasion' signals
+    that must be suppressed for genuinely authenticated, brand-matched senders.
+    """
+    s = (signal_text or "").lower()
+    return any(marker in s for marker in _EVASION_SIGNAL_MARKERS)
+
+
+def build_classifier_prompt(signals: dict, account_name: str = None,
+                            suppress_evasion_signals: bool = False) -> str:
     """Build the full system prompt by injecting learned signals.
 
     When ``account_name`` (the account username/email) is given, only learned
     refinements whose scope includes that account — or "all", or that have no
     scope (treated as "all" for backward compatibility) — are included. This is
     what stops a rule taught for one inbox (P1) from leaking onto the others.
+
+    When ``suppress_evasion_signals`` is True (set by callers for a genuinely
+    authenticated AND brand-matched sender — true RULE 1, see
+    ``is_authenticated_brand_matched``), the legacy over-broad learned signals
+    about "benign text prepended / preview manipulation / filter evasion" are NOT
+    injected. This is a deterministic, code-level guard: it removes only those
+    specific over-broad signals for RULE-1 senders, changes no prompt wording,
+    and leaves the unauthenticated boundary untouched (so Instagram/Dashlane,
+    which are unauthenticated, are unaffected). It also protects existing installs
+    whose signals.json already learned the bad signal — the guard lives in code,
+    not data.
     """
     learned_parts = []
     sig = signals.get("signals", {})
 
     for s in sig.get("hard_signals", []):
+        if suppress_evasion_signals and _is_overbroad_evasion_signal(s):
+            continue
         learned_parts.append(f"- LEARNED HARD SIGNAL: {s}")
     for s in sig.get("soft_signals", []):
+        if suppress_evasion_signals and _is_overbroad_evasion_signal(s):
+            continue
         learned_parts.append(f"- LEARNED SOFT SIGNAL: {s}")
 
     infra = sig.get("known_sending_infrastructure", [])
@@ -1813,6 +1906,37 @@ def build_classifier_prompt(signals: dict, account_name: str = None) -> str:
     return BASE_SYSTEM_PROMPT.replace("{learned_signals}", learned_text)
 
 
+# Zero-width / invisible characters used as leading preheader padding. These are
+# benign preview-pane spacers (U+200B zero-width space, U+200C zero-width
+# non-joiner, U+200D zero-width joiner, U+FEFF BOM/zero-width no-break space).
+_ZERO_WIDTH_CHARS = "​‌‍﻿"
+
+
+def _normalize_leading_padding(text: str) -> str:
+    """Strip leading zero-width characters and collapse a long leading
+    whitespace run from a message body BEFORE classification (fix a).
+
+    Bulk senders pad the start of the plain-text part with hundreds of invisible
+    zero-width characters (and spaces) so the email-client preview pane shows the
+    next, more enticing line instead of the real preheader. The Jeffries fixture,
+    for example, opens with 232×U+200C interleaved with spaces (463 leading
+    chars) — which consumed the entire first-500-character classification window
+    with invisible padding. Removing it is SAFE universally: padding is never
+    spam-evidence, and stripping it can only reveal MORE real content to the
+    classifier (it never hides content), so it cannot help spam evade. We strip
+    leading zero-width chars entirely and collapse the leading whitespace run to a
+    single newline; interior content is untouched.
+    """
+    if not text:
+        return text
+    # Remove every leading char that is zero-width OR ASCII/Unicode whitespace.
+    i = 0
+    n = len(text)
+    while i < n and (text[i] in _ZERO_WIDTH_CHARS or text[i].isspace()):
+        i += 1
+    return text[i:]
+
+
 def _sanitize_for_delimiter(text: str) -> str:
     """Neutralize any literal delimiter tags in untrusted email content so an
     attacker cannot close the <untrusted_email> block early."""
@@ -1873,7 +1997,11 @@ def build_user_message(msg_data: dict) -> str:
     authentication summary (F3) is placed OUTSIDE the tags as trustworthy data.
     """
     received = "\n".join(msg_data.get("received_headers_first_3") or msg_data.get("received_headers", [])[:3])
-    body = _sanitize_for_delimiter(msg_data.get("plain_text_body", "")[:500])
+    # Strip leading zero-width / whitespace padding BEFORE the 500-char window so
+    # the classifier sees real content, not hundreds of invisible preheader
+    # spacers (fix a — safe for all mail; see _normalize_leading_padding).
+    body = _sanitize_for_delimiter(
+        _normalize_leading_padding(msg_data.get("plain_text_body", ""))[:500])
     from_display = _sanitize_for_delimiter(msg_data.get('from_display_name', ''))
     from_email = _sanitize_for_delimiter(msg_data.get('from_email', ''))
     reply_to = _sanitize_for_delimiter(msg_data.get('reply_to', ''))
@@ -2294,7 +2422,20 @@ def classify_eml_offline(raw_email: bytes, signals: dict, *,
     # No soft pre-classifier context exists anymore: a non-hard, non-listed
     # message is routed to the AI to judge from the SERVER-VERIFIED authentication
     # block and content (production parity with run_filter).
-    system_prompt = build_classifier_prompt(signals, account_name)
+    # Auth-gated suppression (fix b): for a genuinely authenticated AND
+    # brand-matched sender (true RULE 1), do NOT inject the over-broad legacy
+    # "filter-evasion" learned signals into the prompt — deterministic, per-email.
+    _from_domain = (msg_data.get("from_email", "") or "").split("@", 1)[1] \
+        if "@" in (msg_data.get("from_email", "") or "") else ""
+    _auth = summarize_authentication({
+        "Authentication-Results": msg_data.get("auth_results", ""),
+        "ARC-Authentication-Results": msg_data.get("arc_auth_results", ""),
+        "Received-SPF": msg_data.get("received_spf", ""),
+        "DKIM-Signature": msg_data.get("dkim_signature", ""),
+    }, from_domain=_from_domain)
+    system_prompt = build_classifier_prompt(
+        signals, account_name,
+        suppress_evasion_signals=is_authenticated_brand_matched(_auth))
 
     if not api_key:
         out["ai"] = {"error": "no_api_key"}
@@ -4450,9 +4591,27 @@ USER'S FOLLOW-UP:
                     # No soft pre-classifier context exists anymore: non-hard,
                     # non-listed mail is judged by the AI from the SERVER-VERIFIED
                     # authentication block and content.
+                    # Auth-gated suppression (fix b): for a genuinely authenticated
+                    # AND brand-matched sender (true RULE 1), rebuild the prompt for
+                    # THIS message WITHOUT the over-broad legacy "filter-evasion"
+                    # learned signals. Otherwise reuse the per-account prompt built
+                    # above unchanged (no behavior/perf change for non-RULE-1 mail).
+                    _msg_from_domain = (msg_data.get("from_email", "") or "").split("@", 1)[1] \
+                        if "@" in (msg_data.get("from_email", "") or "") else ""
+                    _msg_auth = summarize_authentication({
+                        "Authentication-Results": msg_data.get("auth_results", ""),
+                        "ARC-Authentication-Results": msg_data.get("arc_auth_results", ""),
+                        "Received-SPF": msg_data.get("received_spf", ""),
+                        "DKIM-Signature": msg_data.get("dkim_signature", ""),
+                    }, from_domain=_msg_from_domain)
+                    msg_system_prompt = system_prompt
+                    if is_authenticated_brand_matched(_msg_auth):
+                        msg_system_prompt = build_classifier_prompt(
+                            signals, account.get("username", ""),
+                            suppress_evasion_signals=True)
                     # Classify via Claude API
                     result, api_response = classify_email(
-                        client, system_prompt, msg_data, model, max_tokens, logger,
+                        client, msg_system_prompt, msg_data, model, max_tokens, logger,
                     )
 
                     # Record token usage

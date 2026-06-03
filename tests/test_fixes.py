@@ -1145,3 +1145,123 @@ def test_pb6_prompt_schemas_no_longer_mention_hard_rule():
         [{"filename": "x.eml", "from": "a@b.com", "subject": "s",
           "plain_text_body": "b", "received_headers": []}], [])
     assert "hard_rule" not in learner_p
+
+
+# ---------------------------------------------------------------------------
+# FP-AUTH — deterministic, auth-gated fix for the authenticated-sender false
+# positive (Jeffries). Two parts:
+#   (a) leading zero-width / whitespace preheader padding is normalized before
+#       classification, and
+#   (b) the over-broad legacy "filter-evasion" learned signals are suppressed
+#       ONLY for genuinely authenticated, brand-matched (true RULE 1) senders.
+# These are pure/deterministic — no API — so they belong in the unit suite.
+# ---------------------------------------------------------------------------
+
+# A legacy learned signal set that contains the over-broad evasion signal plus
+# two legitimate, concrete signals that must NEVER be suppressed.
+_EVASION_SIGNALS = {
+    "signals": {
+        "hard_signals": [
+            "Benign conversational text block (meeting scheduling, personal "
+            "reflection) prepended before promotional/scam content - used as "
+            "filter evasion",
+            "CSS class names using random nature/object word combinations "
+            "(e.g., 'nebula-quartz') in HTML emails",
+            "Homoglyph substitution in subject lines: 'I' replaced with 'l'",
+        ],
+        "soft_signals": [
+            "Mismatch between casual/personal opening paragraphs and "
+            "promotional closing content",
+            "Points/rewards expiration urgency with specific dollar amounts",
+        ],
+    }
+}
+
+
+def test_fpauth_padding_strips_leading_zero_width_and_whitespace():
+    # 232 zero-width non-joiners interleaved with spaces, then real content.
+    padded = ("‌ " * 232) + "Janet, I hate to interrupt your Saturday."
+    out = spam_filter._normalize_leading_padding(padded)
+    assert out.startswith("Janet, I hate to interrupt")
+    assert "‌" not in out[:1]            # no leading zero-width left
+    # all four zero-width variants + BOM are stripped when leading
+    assert spam_filter._normalize_leading_padding(
+        "​‌‍﻿\n\t  hello") == "hello"
+
+
+def test_fpauth_padding_preserves_interior_and_empty():
+    # Interior zero-width / whitespace is NOT touched (only the leading run).
+    assert spam_filter._normalize_leading_padding(
+        "real‌ text") == "real‌ text"
+    assert spam_filter._normalize_leading_padding("") == ""
+    assert spam_filter._normalize_leading_padding("no padding") == "no padding"
+
+
+def test_fpauth_padding_normalized_in_user_message():
+    # End-to-end: build_user_message must place real content (not padding) in
+    # the first-500-char window the classifier sees.
+    md = {
+        "from_email": "info@example.org",
+        "from_display_name": "Sender",
+        "plain_text_body": ("‌ " * 232) + "REAL CONTENT STARTS HERE.",
+        "subject": "s",
+    }
+    um = spam_filter.build_user_message(md)
+    assert "REAL CONTENT STARTS HERE." in um
+    # The padding must not survive into the prompt body window.
+    assert "‌‌" not in um
+
+
+def test_fpauth_authenticated_brand_matched_true_rule1():
+    # DKIM/DMARC pass AND an authenticated domain aligns with the From domain.
+    auth = {"dkim": "pass", "dmarc": "pass",
+            "authenticated_domains": ["bounce.hakeemjeffries.com",
+                                      "hakeemjeffries.com"],
+            "from_domain": "hakeemjeffries.com"}
+    assert spam_filter.is_authenticated_brand_matched(auth) is True
+
+
+def test_fpauth_unauthenticated_is_not_brand_matched():
+    # No DKIM/DMARC pass -> gate is False (Instagram/Dashlane case): the prompt
+    # is left untouched for these so their boundary behavior never shifts.
+    auth = {"dkim": "none", "dmarc": "none",
+            "authenticated_domains": [], "from_domain": "mail.instagram.com"}
+    assert spam_filter.is_authenticated_brand_matched(auth) is False
+
+
+def test_fpauth_authenticated_to_unrelated_domain_is_not_brand_matched():
+    # Authenticates a domain UNRELATED to the From domain -> not RULE 1.
+    auth = {"dkim": "pass", "dmarc": "pass",
+            "authenticated_domains": ["randomthrowaway.test"],
+            "from_domain": "paypal.com"}
+    assert spam_filter.is_authenticated_brand_matched(auth) is False
+
+
+def test_fpauth_subdomain_and_parent_alignment():
+    assert spam_filter._domain_is_brand_match("hakeemjeffries.com",
+                                              "bounce.hakeemjeffries.com")
+    assert spam_filter._domain_is_brand_match("mail.example.com", "example.com")
+    assert not spam_filter._domain_is_brand_match("evil.com", "example.com")
+    assert not spam_filter._domain_is_brand_match("", "example.com")
+
+
+def test_fpauth_suppression_removes_only_evasion_signal():
+    # With suppression ON, the over-broad evasion hard/soft signals are gone,
+    # but the concrete CSS / homoglyph / rewards signals REMAIN.
+    p_on = spam_filter.build_classifier_prompt(
+        _EVASION_SIGNALS, None, suppress_evasion_signals=True)
+    assert "used as filter evasion" not in p_on
+    assert "casual/personal opening paragraphs" not in p_on
+    assert "CSS class names using random" in p_on
+    assert "Homoglyph substitution" in p_on
+    assert "Points/rewards expiration urgency" in p_on
+
+
+def test_fpauth_default_prompt_unchanged_keeps_evasion_signal():
+    # Default (no suppression) is byte-identical to the historical behavior and
+    # still contains the evasion signal — so unauthenticated mail is unaffected.
+    p_default = spam_filter.build_classifier_prompt(_EVASION_SIGNALS, None)
+    p_explicit_off = spam_filter.build_classifier_prompt(
+        _EVASION_SIGNALS, None, suppress_evasion_signals=False)
+    assert p_default == p_explicit_off
+    assert "used as filter evasion" in p_default
