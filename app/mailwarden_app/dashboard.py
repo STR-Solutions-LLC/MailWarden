@@ -31,9 +31,9 @@ from . import validators
 
 
 MODEL_CHOICES = [
-    ("Haiku 4.5 (cheapest, default)", "claude-haiku-4-5-20251001"),
-    ("Sonnet 4.6", "claude-sonnet-4-6"),
-    ("Opus 4.7 (most capable)", "claude-opus-4-7"),
+    ("Claude Haiku — fastest & cheapest (recommended)", "claude-haiku-4-5-20251001"),
+    ("Claude Sonnet — more accurate, more expensive", "claude-sonnet-4-6"),
+    ("Claude Opus — most accurate, most expensive", "claude-opus-4-7"),
 ]
 
 
