@@ -2391,7 +2391,16 @@ class SignalsTab(ttk.Frame):
         card = self._make_card(body)
         kind = conv.get("kind", "false_positive")
         refinement = conv.get("proposed_refinement") or {}
-        if kind == "spam_example_proposal":
+        # "Block this sender" proposals (PB2) carry a blocklist_entry, not an
+        # ai_refinement. Minimal rendering here so the card is correct and
+        # approvable; the full Block-this-sender UI is the next task.
+        block_entry = conv.get("blocklist_entry") or {}
+        if kind == "block_sender_proposal":
+            _bk = block_entry.get("kind", "domain")
+            _bv = block_entry.get("value", "")
+            headline = (f"Block this sender — {'address' if _bk == 'address' else 'domain'} "
+                        f"{_bv}")
+        elif kind == "spam_example_proposal":
             headline = (refinement.get("headline")
                         or f"Proposed refinement {refinement.get('id', '')}")
         else:
@@ -2399,26 +2408,17 @@ class SignalsTab(ttk.Frame):
                         f"{conv.get('original_from', 'unknown sender')}")
         self._card_label(card, headline, style="Subheading.TLabel")
 
-        # Show hard/soft type badge for spam_example_proposals
-        if kind == "spam_example_proposal":
-            signal_type = refinement.get("signal_type", "soft")
-            hard_rule = refinement.get("hard_rule") or {}
-            if signal_type == "hard" and hard_rule:
-                hr_type = hard_rule.get("type", "")
-                hr_value = hard_rule.get("value", "")
-                if hr_type == "subject_keyword":
-                    type_text = (f"Hard rule — no AI cost  "
-                                 f"(blocks subject containing \"{hr_value}\")")
-                else:
-                    type_text = (f"Hard rule — no AI cost  "
-                                 f"(blocks sender domain {hr_value})")
-                ttk.Label(card, text=type_text,
-                          foreground="#1a5fa8",
-                          wraplength=720).pack(anchor=tk.W)
-            else:
-                ttk.Label(card, text="AI refinement (soft)",
-                          foreground="#555555",
-                          wraplength=720).pack(anchor=tk.W)
+        if kind == "block_sender_proposal" and block_entry.get("over_broad"):
+            ttk.Label(
+                card,
+                text=("Heads up: this is a shared email provider — blocking the "
+                      "whole domain blocks everyone there. Consider blocking just "
+                      "the exact address."),
+                foreground="#9a5b00", wraplength=720).pack(anchor=tk.W)
+        elif kind == "spam_example_proposal":
+            ttk.Label(card, text="AI refinement (soft)",
+                      foreground="#555555",
+                      wraplength=720).pack(anchor=tk.W)
 
         meta_parts = [f"SFID {conv.get('id', '')}",
                        f"kind: {kind}",
@@ -2456,16 +2456,10 @@ class SignalsTab(ttk.Frame):
         btns = ttk.Frame(card)
         btns.pack(anchor=tk.W, pady=(8, 0))
         sfid = conv.get("id", "")
-        if kind == "spam_example_proposal":
-            signal_type = refinement.get("signal_type", "soft")
+        if kind in ("spam_example_proposal", "block_sender_proposal"):
             ttk.Button(btns, text="Approve", style="Primary.TButton",
                        command=lambda s=sfid: self._on_approve_pending(s)).pack(
                            side=tk.LEFT)
-            # Downgrade button: for hard proposals, offer "Apply as soft instead"
-            if signal_type == "hard":
-                ttk.Button(btns, text="Apply as soft instead",
-                           command=lambda s=sfid: self._on_approve_as_soft(s)).pack(
-                               side=tk.LEFT, padx=(6, 0))
             ttk.Button(btns, text="Reject",
                        command=lambda s=sfid: self._on_reject_pending(s)).pack(
                            side=tk.LEFT, padx=(6, 0))
@@ -2477,147 +2471,46 @@ class SignalsTab(ttk.Frame):
                    command=lambda s=sfid: self._on_withdraw_pending(s)).pack(
                        side=tk.LEFT, padx=(6, 0))
 
-    @staticmethod
-    def _apply_hard_rule_to_blacklist(hard_rule: dict) -> str | None:
-        """Write a hard_rule into blacklist.json atomically.
-
-        Returns a human-readable description of what was added, or None if
-        the rule was already present (de-duped) or if the shape was invalid.
-        Raises on unexpected IO errors so the caller can surface them.
-        """
-        hr_type = (hard_rule.get("type") or "").strip().lower()
-        value = (hard_rule.get("value") or "").strip()
-        if not value or hr_type not in ("subject_keyword", "sender_domain"):
-            return None
-
-        bl = config_io.load_blacklist()
-
-        if hr_type == "subject_keyword":
-            existing = {k.lower() for k in bl.get("subject_keywords", [])}
-            if value.lower() in existing:
-                return None  # already present
-            bl.setdefault("subject_keywords", []).append(value)
-            config_io.save_blacklist(bl)
-            return f"subject keyword \"{value}\""
-
-        # sender_domain: normalise (strip @) then de-dupe
-        domain = value.lstrip("@").lower()
-        existing = {d.lower().lstrip("@") for d in bl.get("domains", [])}
-        if domain in existing:
-            return None  # already present
-        bl.setdefault("domains", []).append(domain)
-        config_io.save_blacklist(bl)
-        return f"sender domain {domain}"
-
     def _on_approve_pending(self, sfid: str):
         """Approve a pending proposal.
 
-        For HARD proposals: write the hard_rule to blacklist.json, then mark
-        the conversation approved (same as soft, so history is consistent).
-        For SOFT proposals: existing behaviour — activate the ai_refinement.
+        block_sender_proposal -> write the scoped block-list entry (PB2).
+        spam_example_proposal -> activate the ai_refinement (existing behaviour).
+        Both route through config_io so Dashboard- and email-initiated approvals
+        end up in an identical state.
         """
         pending = config_io.load_pending_signals()
         conv = next((c for c in pending.get("conversations", [])
                      if c.get("id") == sfid), None)
-        if conv is None:
+        kind = (conv or {}).get("kind", "")
+
+        if kind == "block_sender_proposal":
+            entry = config_io.apply_blocklist_proposal_from_pending(
+                sfid, source="dashboard")
+            if entry:
+                noun = ("address" if entry.get("kind") == "address" else "domain")
+                messagebox.showinfo(
+                    "Sender blocked",
+                    f"Added {noun} {entry.get('value', '')} to your block list. "
+                    f"Matching mail will be moved to Junk on the next check.")
+            else:
+                messagebox.showerror(
+                    "Could not apply",
+                    f"SFID {sfid} not found or not approvable from the Dashboard.")
+            self.refresh()
+            return
+
+        # Content ai_refinement (spam_example_proposal).
+        applied = config_io.apply_refinement_from_pending(sfid, source="dashboard")
+        if applied:
+            messagebox.showinfo(
+                "Applied",
+                f"Refinement {applied.get('id', '')} is now active.")
+        else:
             messagebox.showerror(
                 "Could not apply",
                 f"SFID {sfid} not found or not approvable from the Dashboard "
                 f"(false-positive narrowings must be approved by email reply).")
-            self.refresh()
-            return
-
-        refinement = conv.get("proposed_refinement") or {}
-        signal_type = refinement.get("signal_type", "soft")
-        hard_rule = refinement.get("hard_rule") if signal_type == "hard" else None
-
-        if hard_rule:
-            # Hard path: apply to blacklist, then mark approved in pending
-            try:
-                added = self._apply_hard_rule_to_blacklist(hard_rule)
-            except Exception as e:
-                messagebox.showerror("Could not apply hard rule",
-                                     f"Failed to update blacklist: {e}")
-                self.refresh()
-                return
-
-            # Mark the conversation resolved in pending_signals
-            conv["status"] = "approved"
-            conv["resolution"] = "approved"
-            conv.setdefault("conversation_history", []).append({
-                "role": "system",
-                "timestamp": config_io.now_iso(),
-                "content": "Approved (hard rule) via dashboard",
-            })
-            config_io.save_pending_signals(pending)
-            config_io.append_refinement_log({
-                "ts": config_io.now_iso(),
-                "event": "applied",
-                "id": refinement.get("id", ""),
-                "sfid": sfid,
-                "headline": refinement.get("headline", ""),
-                "signal_type": "hard",
-                "hard_rule": hard_rule,
-                "source": "dashboard",
-            })
-
-            if added:
-                messagebox.showinfo(
-                    "Hard rule applied",
-                    f"Blacklist updated — added {added}.\n"
-                    f"Mail matching this rule will be blocked instantly, "
-                    f"with no AI call.")
-            else:
-                messagebox.showinfo(
-                    "Already blocked",
-                    f"The rule was already in the blacklist. No change needed.")
-        else:
-            # Soft path: existing behaviour
-            applied = config_io.apply_refinement_from_pending(
-                sfid, source="dashboard")
-            if applied:
-                messagebox.showinfo(
-                    "Applied",
-                    f"Refinement {applied.get('id', '')} is now active.")
-            else:
-                messagebox.showerror(
-                    "Could not apply",
-                    f"SFID {sfid} not found or not approvable from the Dashboard "
-                    f"(false-positive narrowings must be approved by email reply).")
-        self.refresh()
-
-    def _on_approve_as_soft(self, sfid: str):
-        """Downgrade a hard proposal and apply it as a soft AI refinement."""
-        pending = config_io.load_pending_signals()
-        conv = next((c for c in pending.get("conversations", [])
-                     if c.get("id") == sfid), None)
-        if conv is None:
-            messagebox.showerror("Not found", f"SFID {sfid} not found.")
-            self.refresh()
-            return
-
-        refinement = conv.get("proposed_refinement") or {}
-        if refinement.get("signal_type") != "hard":
-            # Nothing to downgrade — just do a normal approve
-            self._on_approve_pending(sfid)
-            return
-
-        # Strip the hard_rule fields so apply_refinement_from_pending treats
-        # this as a plain soft refinement
-        refinement["signal_type"] = "soft"
-        refinement.pop("hard_rule", None)
-        config_io.save_pending_signals(pending)
-
-        applied = config_io.apply_refinement_from_pending(sfid, source="dashboard")
-        if applied:
-            messagebox.showinfo(
-                "Applied as soft",
-                f"Refinement {applied.get('id', '')} is now active as an "
-                f"AI refinement (soft).")
-        else:
-            messagebox.showerror(
-                "Could not apply",
-                f"SFID {sfid} could not be applied.")
         self.refresh()
 
     def _on_reject_pending(self, sfid: str):

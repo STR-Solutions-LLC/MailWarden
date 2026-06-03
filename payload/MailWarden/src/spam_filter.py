@@ -233,11 +233,83 @@ def check_whitelist_address_only(from_header: str, whitelist: dict) -> str:
     return None
 
 
-def check_blacklist(from_header: str, blacklist: dict) -> tuple:
+def _blacklist_entry_in_scope(scope, account_name) -> bool:
+    """PB1: does a scoped block-list entry apply to the given account?
+
+    Mirrors ``_refinement_in_scope`` exactly so block-list scoping and learned-
+    refinement scoping behave identically. ``scope`` is "all" or a list of
+    account usernames (emails); a MISSING scope (legacy plain-string entry,
+    normalized to "all" below) blocks everywhere. ``account_name=None`` means
+    'no per-account filtering' (include every entry) — for callers that do not
+    scope by account (the offline harness / dashboard Check screen run without
+    an account)."""
+    if account_name is None:
+        return True
+    if scope is None or scope == "all":
+        return True
+    target = str(account_name).strip().lower()
+    if isinstance(scope, str):
+        return scope.strip().lower() in ("all", target)
+    if isinstance(scope, (list, tuple, set)):
+        scope_l = {str(s).strip().lower() for s in scope}
+        return "all" in scope_l or target in scope_l
+    return True  # malformed scope -> fail open (block), preserves old behavior
+
+
+def _normalize_block_entries(raw_list, *, strip_at: bool):
+    """Normalize one raw block-list field into (value_list, scope_map).
+
+    Each item in ``raw_list`` is EITHER a plain string (legacy entry => global
+    scope) OR an object {"value": <str>, "scope": "all"|[usernames]} (PB1
+    per-account scoping). This is the migration-safe representation: existing
+    flat blacklist.json string entries keep working as global blocks, and new
+    scoped entries are written as objects, so the two shapes coexist in one
+    file and old files are never rewritten.
+
+    Returns:
+      value_list : order-preserving list of unique lowercased values (leading
+                   '@' stripped when strip_at=True, for domains). Subject-keyword
+                   matching iterates this in order, so order is preserved exactly
+                   as before. Callers needing membership wrap it in set().
+      scope_map  : {value_lower: scope} parallel map the check_* helpers consult
+                   to honor per-account scoping. A string entry maps to "all".
+                   If the same value appears twice, the FIRST occurrence's scope
+                   wins (matches list-iteration / dedupe order).
+    Malformed entries (no usable value) are skipped silently.
+    """
+    value_list = []
+    scope_map = {}
+    for item in (raw_list or []):
+        if isinstance(item, dict):
+            value = item.get("value")
+            scope = item.get("scope", "all")
+        else:
+            value = item
+            scope = "all"
+        if not isinstance(value, str):
+            continue
+        v = value.strip().lower()
+        if strip_at:
+            v = v.lstrip("@")
+        if not v or v in scope_map:
+            continue
+        value_list.append(v)
+        scope_map[v] = scope
+    return value_list, scope_map
+
+
+def check_blacklist(from_header: str, blacklist: dict, account_name=None) -> tuple:
     """Check if the sender is blacklisted.
 
     Returns (match_type, match_value) where match_type is 'address', 'domain',
     or 'display_name', or (None, None) if not blacklisted.
+
+    ``account_name`` (PB1): when given, only entries whose scope includes that
+    account — or "all", or that have no scope (legacy => "all") — can match.
+    ``account_name=None`` (default) disables per-account filtering, so existing
+    callers (offline path / tests) keep today's behavior. ``run_filter`` threads
+    the current account's username so a block taught for one inbox does not
+    block on the others.
     """
     parsed = parse_from_address(from_header)
     addr = parsed.get("address")
@@ -245,33 +317,48 @@ def check_blacklist(from_header: str, blacklist: dict) -> tuple:
 
     # Check address match (compare lowercase since _addresses_set is lowercased)
     if addr and addr.lower() in blacklist.get("_addresses_set", set()):
-        return ("address", addr)
+        if _blacklist_entry_in_scope(
+                blacklist.get("_addresses_scope", {}).get(addr.lower()),
+                account_name):
+            return ("address", addr)
 
     # Check domain match (added with Direct Blacklist support)
     if addr:
         domain = extract_domain(addr)
         if domain:
             domain_normalized = domain.lower().lstrip("@")
-            if domain_normalized in blacklist.get("_domains_set", set()):
+            if domain_normalized in blacklist.get("_domains_set", set()) and \
+                    _blacklist_entry_in_scope(
+                        blacklist.get("_domains_scope", {}).get(domain_normalized),
+                        account_name):
                 return ("domain", domain)
 
     # Check display name match (case-insensitive)
     if display_name:
         name_lower = display_name.strip().lower()
-        if name_lower in blacklist.get("_display_names_set", set()):
+        if name_lower in blacklist.get("_display_names_set", set()) and \
+                _blacklist_entry_in_scope(
+                    blacklist.get("_display_names_scope", {}).get(name_lower),
+                    account_name):
             return ("display_name", display_name)
 
     return (None, None)
 
 
-def check_subject_keywords(subject: str, blacklist: dict) -> str | None:
+def check_subject_keywords(subject: str, blacklist: dict,
+                           account_name=None) -> str | None:
     """Return the first blocked subject keyword found as a case-insensitive
-    substring of `subject`, or None. Deterministic — no API call needed."""
+    substring of `subject`, or None. Deterministic — no API call needed.
+
+    ``account_name`` (PB1): a keyword whose scope excludes the current account
+    is skipped. ``None`` (default) disables filtering (unchanged behavior)."""
     if not subject:
         return None
     subj_lower = subject.lower()
+    scope_map = blacklist.get("_subject_keywords_scope", {})
     for kw in blacklist.get("_subject_keywords_lower", []):
-        if kw and kw in subj_lower:
+        if kw and kw in subj_lower and \
+                _blacklist_entry_in_scope(scope_map.get(kw), account_name):
             return kw
     return None
 
@@ -281,14 +368,24 @@ def load_blacklist(logger: logging.Logger) -> dict:
     try:
         with open(BLACKLIST_PATH, "r") as f:
             data = json.load(f)
-        data["_addresses_set"] = {a.lower() for a in data.get("addresses", [])}
-        data["_display_names_set"] = {n.strip().lower() for n in data.get("display_names", [])}
-        data["_domains_set"] = {d.lower().lstrip("@") for d in data.get("domains", [])}
+        # PB1: each list may hold legacy plain strings (global) OR scoped
+        # objects {"value","scope"}. _normalize_block_entries builds both the
+        # flat membership list (unchanged behavior) and a parallel scope map the
+        # check_* helpers consult for per-account scoping.
+        addr_list, data["_addresses_scope"] = \
+            _normalize_block_entries(data.get("addresses", []), strip_at=False)
+        data["_addresses_set"] = set(addr_list)
+        name_list, data["_display_names_scope"] = \
+            _normalize_block_entries(data.get("display_names", []), strip_at=False)
+        data["_display_names_set"] = set(name_list)
+        domain_list, data["_domains_scope"] = \
+            _normalize_block_entries(data.get("domains", []), strip_at=True)
+        data["_domains_set"] = set(domain_list)
         # Subject-line keywords are matched as case-insensitive substrings, so
-        # keep an order-preserving lowercased list (not a set) for the loop.
-        data["_subject_keywords_lower"] = [
-            k.strip().lower() for k in data.get("subject_keywords", []) if k.strip()
-        ]
+        # keep the order-preserving lowercased list for the loop; the scope map
+        # is keyed by the same lowercased value.
+        data["_subject_keywords_lower"], data["_subject_keywords_scope"] = \
+            _normalize_block_entries(data.get("subject_keywords", []), strip_at=False)
         return data
     except FileNotFoundError:
         logger.warning("blacklist.json not found — continuing with empty blacklist")
@@ -316,6 +413,52 @@ def save_blacklist(data: dict):
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
         raise
+
+
+# Map a "Block this sender" entry kind to the blacklist.json field it lives in.
+# Mirrors config_io._BLOCK_KIND_TO_FIELD; the filter runs as a separate process
+# (its own sys.path) and cannot import the app's config_io, so the same scoped-
+# object write is implemented here against the filter's own load/save_blacklist.
+_BLOCK_KIND_TO_FIELD = {
+    "address": "addresses",
+    "domain": "domains",
+    "display_name": "display_names",
+    "subject_keyword": "subject_keywords",
+}
+
+
+def add_blocklist_entry_local(value: str, kind: str, scope, logger) -> bool:
+    """Write ONE scoped block-list entry into blacklist.json (PB2 email-approval
+    path). Same migration-safe object shape and de-dupe semantics as
+    config_io.add_blocklist_entry, using the filter's own atomic IO. Returns
+    True on a write, False on a bad kind / empty value."""
+    field = _BLOCK_KIND_TO_FIELD.get((kind or "").strip().lower())
+    if field is None:
+        return False
+    v = (value or "").strip().lower()
+    if field == "domains":
+        v = v.lstrip("@")
+    if not v:
+        return False
+
+    bl = load_blacklist(logger)
+
+    def _entry_value(item) -> str:
+        raw = item.get("value") if isinstance(item, dict) else item
+        if not isinstance(raw, str):
+            return ""
+        s = raw.strip().lower()
+        return s.lstrip("@") if field == "domains" else s
+
+    items = bl.setdefault(field, [])
+    for i, item in enumerate(items):
+        if _entry_value(item) == v:
+            items[i] = {"value": v, "scope": scope}
+            save_blacklist(bl)
+            return True
+    items.append({"value": v, "scope": scope})
+    save_blacklist(bl)
+    return True
 
 
 def save_whitelist(data: dict):
@@ -1985,17 +2128,29 @@ def _ensure_list_sets(d: dict) -> dict:
 
     The live filter loads lists via load_whitelist/load_blacklist (which build
     the ``_*_set`` keys). The offline screen may pass raw config dicts instead,
-    so build the sets here when missing. Accepts None (treated as empty)."""
+    so build the sets here when missing. Accepts None (treated as empty).
+
+    PB1: routes through the SAME _normalize_block_entries used by load_blacklist,
+    so an offline caller passing scoped objects {"value","scope"} gets identical
+    membership sets AND scope maps as the live filter. Whitelist dicts are passed
+    through here too; the whitelist check helpers ignore the scope maps, so
+    whitelist behavior is unchanged (only block-list scoping is honored)."""
     d = dict(d or {})
     if "_addresses_set" not in d:
-        d["_addresses_set"] = {a.lower() for a in d.get("addresses", [])}
+        addr_list, d["_addresses_scope"] = _normalize_block_entries(
+            d.get("addresses", []), strip_at=False)
+        d["_addresses_set"] = set(addr_list)
     if "_domains_set" not in d:
-        d["_domains_set"] = {x.lower().lstrip("@") for x in d.get("domains", [])}
+        domain_list, d["_domains_scope"] = _normalize_block_entries(
+            d.get("domains", []), strip_at=True)
+        d["_domains_set"] = set(domain_list)
     if "_display_names_set" not in d:
-        d["_display_names_set"] = {n.strip().lower() for n in d.get("display_names", [])}
+        name_list, d["_display_names_scope"] = _normalize_block_entries(
+            d.get("display_names", []), strip_at=False)
+        d["_display_names_set"] = set(name_list)
     if "_subject_keywords_lower" not in d:
-        d["_subject_keywords_lower"] = [k.strip().lower()
-                                        for k in d.get("subject_keywords", []) if k.strip()]
+        d["_subject_keywords_lower"], d["_subject_keywords_scope"] = \
+            _normalize_block_entries(d.get("subject_keywords", []), strip_at=False)
     return d
 
 
@@ -2061,11 +2216,13 @@ def classify_eml_offline(raw_email: bytes, signals: dict, *,
         if wl_addr:
             list_match, list_decision = {"kind": "whitelist_address", "value": wl_addr}, "PASS"
         else:
-            bt, bv = check_blacklist(from_header, bl)
+            # PB1: honor block-list scope for this account (None when the caller
+            # didn't pass account_name -> every entry applies, unchanged behavior).
+            bt, bv = check_blacklist(from_header, bl, account_name=account_name)
             if bt:
                 list_match, list_decision = {"kind": "blacklist_%s" % bt, "value": bv}, "JUNK"
             else:
-                kw = check_subject_keywords(subject, bl)
+                kw = check_subject_keywords(subject, bl, account_name=account_name)
                 if kw:
                     list_match, list_decision = {"kind": "subject_keyword", "value": kw}, "JUNK"
                 else:
@@ -3953,7 +4110,44 @@ Conversation ID: {sfid}
                         conv_kind = conv.get("kind", "false_positive")
 
                         if classification == "affirmative":
-                            if conv_kind == "spam_example_proposal":
+                            if conv_kind == "block_sender_proposal":
+                                # PB2: approve a "Block this sender" proposal by
+                                # email — write the scoped block-list entry and
+                                # reload the in-memory blacklist for this run.
+                                entry = conv.get("blocklist_entry") or {}
+                                add_blocklist_entry_local(
+                                    entry.get("value", ""),
+                                    entry.get("kind", "domain"),
+                                    entry.get("scope", "all"),
+                                    logger)
+                                blacklist = load_blacklist(logger)
+                                conv["status"] = "approved"
+                                conv["resolution"] = "approved"
+                                save_pending_signals(pending)
+                                append_refinement_log({
+                                    "ts": datetime.now().isoformat(),
+                                    "event": "applied",
+                                    "id": conv.get("id", ""),
+                                    "sfid": sfid,
+                                    "headline": (f"Block sender {entry.get('kind','')}: "
+                                                 f"{entry.get('value','')}"),
+                                    "source": "email",
+                                })
+                                _bnoun = ("address"
+                                          if entry.get("kind") == "address"
+                                          else "domain")
+                                send_email(
+                                    config,
+                                    f"Sender blocked [{sfid}]",
+                                    f"Added {_bnoun} {entry.get('value','')} to your "
+                                    f"block list. Matching mail will be moved to "
+                                    f"Junk on the next check.\n\n"
+                                    f"To remove it later, forward any email from "
+                                    f"this sender with the subject "
+                                    f"\"Fwd: Remove from Blacklist\".\n",
+                                    logger,
+                                    to_addr=account.get("username", ""))
+                            elif conv_kind == "spam_example_proposal":
                                 refinement = conv.get("proposed_refinement") or {}
                                 # P1 approval backstop: a proposal created before
                                 # scope-capture existed has no scope. Carry the
@@ -4113,8 +4307,12 @@ USER'S FOLLOW-UP:
                         continue
 
                     # --- Precedence check 2 & 3: Blacklist address and display name ---
-                    # Blacklist beats whitelist domain
-                    bl_match_type, bl_match_value = check_blacklist(from_header_raw, blacklist)
+                    # Blacklist beats whitelist domain. PB1: pass this account's
+                    # username so a block scoped to one inbox doesn't block here
+                    # unless it includes this account (or is "all"/legacy global).
+                    bl_match_type, bl_match_value = check_blacklist(
+                        from_header_raw, blacklist,
+                        account_name=account.get("username", ""))
                     if bl_match_type:
                         total_spam += 1
                         logger.info(
@@ -4150,7 +4348,9 @@ USER'S FOLLOW-UP:
                     # from an otherwise whitelisted domain. Address-whitelist
                     # (precedence 1) still wins, matching the blacklist's own
                     # precedence relative to whitelisting.
-                    kw_match = check_subject_keywords(msg_data.get("subject", ""), blacklist)
+                    kw_match = check_subject_keywords(
+                        msg_data.get("subject", ""), blacklist,
+                        account_name=account.get("username", ""))
                     if kw_match:
                         total_spam += 1
                         logger.info(

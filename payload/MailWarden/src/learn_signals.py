@@ -280,28 +280,6 @@ Accuracy rules for refinement records:
 
 - If two candidate patterns overlap, return the MORE SPECIFIC one.
 
-- hard_rule (OPTIONAL): include this field ONLY when the identifier is
-  a specific, distinctive string that essentially never appears in
-  legitimate mail — meaning you would stake the user's inbox on it.
-  Acceptable forms:
-    {"type": "subject_keyword", "value": "<distinctive phrase>"}
-      — a rare, specific phrase that appears verbatim in spam subject
-        lines and would not match typical legitimate mail subjects.
-    {"type": "sender_domain", "value": "<domain.tld>"}
-      — a sending domain that only sends spam (no legitimate mail
-        originates from it). The value must be a bare domain without
-        any @ prefix (e.g. "spammers.biz", not "@spammers.biz").
-  DO NOT propose a hard_rule for:
-    - common words or short phrases that appear in legitimate email
-      subjects (e.g. "sale", "offer", "reminder", "update")
-    - major email providers (gmail.com, yahoo.com, outlook.com, etc.)
-    - domains used by any real company for transactional or marketing
-      mail that some users might have legitimately signed up for
-    - any pattern where a legitimate sender could plausibly match
-  When in doubt, OMIT the hard_rule field entirely. A false hard_rule
-  blocks legitimate mail silently; a false soft signal merely costs a
-  fraction of a cent. Err heavily toward soft (no hard_rule).
-
 When a USER'S DIRECTIVE is present in an example, treat it as a category-level
 instruction about what the user wants filtered, not just a description of this
 one email. A directive like "treat all timeshare/vacation-resort solicitations
@@ -392,11 +370,7 @@ is a list with ONE entry per new example in the same order:
       "headline": "...",
       "rationale": "...",
       "what_this_doesnt_cover": "...",
-      "confidence": "high" | "medium" | "low",
-      "hard_rule": {"type": "subject_keyword", "value": "..."}
-        OR {"type": "sender_domain", "value": "domain.tld"}
-        — OMIT this field entirely if the pattern is not a concrete,
-          distinctive, low-false-positive identifier. When in doubt, omit.
+      "confidence": "high" | "medium" | "low"
     }
   ]
 }
@@ -471,10 +445,6 @@ WHEN the direction is SPAM:
   applied: "all" if they say all/every account/everywhere/all inboxes; "this_account"
   if they say only this account/just here/this inbox only; otherwise null (they did
   not say). Do NOT infer scope from the email's content — only from the owner's words.
-- hard_rule is OPTIONAL and rare: {"type":"subject_keyword"|"sender_domain",
-  "value":"..."} ONLY for a distinctive identifier that essentially never appears
-  in legitimate mail. Never for common words, major providers, or any domain a
-  real company uses for mail a user might have signed up for. When in doubt, omit.
 
 WHEN the direction is LEGITIMATE:
 - Describe WHAT KIND of mail like this is legitimate for THIS user, as a content-based
@@ -482,9 +452,9 @@ WHEN the direction is LEGITIMATE:
   or a conditional carve-out), not merely "mail from this domain". Conditional rules
   are welcome ("legitimate EXCEPT when ..."). State the full rule, including any
   condition, in the rationale. NEVER mark a domain or sender legitimate when
-  authentication indicates it is impersonating a brand. Do not propose a hard_rule
-  for a legitimate verdict. A legitimate verdict is NEITHER protect NOR curate —
-  omit rule_class (or set it null) for legitimate rules.
+  authentication indicates it is impersonating a brand. A legitimate verdict is
+  NEITHER protect NOR curate — omit rule_class (or set it null) for legitimate
+  rules.
 
 Output exactly the single JSON object specified in the user message. No markdown."""
 
@@ -574,7 +544,6 @@ def build_teach_prompt(example: dict, direction: str,
     if not legit:
         lines.append('  "rule_class": "protect" | "curate"  (protect = bad-actor threat: phishing/scam/fraud/malware/impersonation; curate = owner no longer wants this LEGITIMATE mail; when unsure choose protect),')
         lines.append('  "apply_scope": "all" | "this_account" | null  (parse ONLY from the owner words: all/every account/everywhere -> "all"; only this account/just here -> "this_account"; else null),')
-        lines.append('  "hard_rule": {"type":"subject_keyword"|"sender_domain","value":"..."}  (optional, rare; omit when unsure),')
     lines.append('  "reason": "<if no_rule: one sentence on why nothing reliable could be derived>"')
     lines.append("}")
     return "\n".join(lines)
@@ -630,6 +599,41 @@ def _resolve_scope(rule_class, apply_scope, originating_account):
     return _SCOPE_NEEDS_EXPLICIT
 
 
+# Major shared/consumer mail providers. Blocking a whole one of these domains
+# would block every sender at it (millions of people), so the "Block this
+# sender" guardrail warns and offers an exact-address block instead. This is
+# the OVER-BROAD-BLOCK guardrail check the engine provides; the GUI (next task)
+# decides what to do with the flag.
+_SHARED_MAIL_DOMAINS = frozenset({
+    "gmail.com", "googlemail.com",
+    "yahoo.com", "ymail.com", "rocketmail.com",
+    "outlook.com", "hotmail.com", "live.com", "msn.com", "outlook.co.uk",
+    "hotmail.co.uk", "live.co.uk",
+    "icloud.com", "me.com", "mac.com",
+    "aol.com", "aim.com",
+    "proton.me", "protonmail.com", "pm.me",
+    "gmx.com", "gmx.net", "gmx.de",
+    "zoho.com",
+    "fastmail.com", "fastmail.fm",
+    "mail.com", "yandex.com", "yandex.ru",
+    "comcast.net", "verizon.net", "att.net", "sbcglobal.net", "cox.net",
+    "btinternet.com", "qq.com", "163.com", "126.com", "naver.com",
+})
+
+
+def is_shared_mail_domain(domain) -> bool:
+    """True if ``domain`` is a major shared/consumer email provider.
+
+    Accepts a bare domain ("gmail.com") or an @-prefixed one ("@gmail.com"),
+    any case. Returns False for None/empty and for any company/organization
+    domain (rnc.org, acme.com, …) that a single sender owns. The "Block this
+    sender" GUI calls this to warn before blocking a whole shared domain and to
+    offer an exact-address block instead; the engine only provides the check."""
+    if not domain or not isinstance(domain, str):
+        return False
+    return domain.strip().lstrip("@").lower() in _SHARED_MAIL_DOMAINS
+
+
 def teaching_refinement_from_classification(cls: dict, *, verdict: str, scope,
                                             refinement_id: str,
                                             evidence_name: str) -> dict | None:
@@ -675,29 +679,70 @@ def teaching_refinement_from_classification(cls: dict, *, verdict: str, scope,
         "scope": scope,
         "source": "check_screen",
     }
-    # A hard_rule (deterministic identifier) is only honored for a SPAM verdict.
-    if verdict == "spam":
-        hard_rule = _validate_hard_rule(cls.get("hard_rule"))
-        if hard_rule is not None:
-            refinement["signal_type"] = "hard"
-            refinement["hard_rule"] = hard_rule
-        else:
-            refinement["signal_type"] = "soft"
-    else:
-        refinement["signal_type"] = "soft"
     return refinement
+
+
+def _build_block_sender_proposal(msg, *, scope, block_kind=None) -> dict | None:
+    """Build the proposed scoped block-list ENTRY for a "Block this sender"
+    action. PURE (no IO).
+
+    Defaults to a sender-DOMAIN block (the common case); the GUI may request an
+    exact-address block by passing block_kind="address". Surfaces an
+    ``over_broad`` flag (via is_shared_mail_domain) so the GUI can warn before
+    blocking a whole shared provider and offer the exact address instead.
+
+    Returns {"value","kind","scope","over_broad"} or None when no sender address
+    could be parsed from the email."""
+    from utils import parse_from_address, extract_domain
+    addr = parse_from_address(str(msg.get("From", "") or "")).get("address")
+    if not addr:
+        return None
+    kind = (block_kind or "domain").strip().lower()
+    if kind == "address":
+        value = addr
+        # over_broad is about blocking a WHOLE shared domain; an exact-address
+        # block on a shared provider is precisely the safe alternative -> False.
+        over_broad = False
+    else:
+        kind = "domain"
+        domain = (extract_domain(addr) or "").lstrip("@")  # extract_domain -> "@d"
+        if not domain:
+            return None
+        value = domain
+        over_broad = is_shared_mail_domain(domain)
+    return {"value": value, "kind": kind, "scope": scope, "over_broad": over_broad}
 
 
 def propose_from_teaching(eml_bytes: bytes, *, direction: str,
                           user_explanation: str, scope=_SCOPE_UNSET,
                           api_config: dict, logger: logging.Logger,
-                          originating_account=None) -> dict:
+                          originating_account=None,
+                          rule_class=None, curate_mechanism=None,
+                          block_kind=None, apply_scope=None) -> dict:
     """Analyze ONE user-taught email and, if a generalizable rule results, create
     a PENDING proposal (NO email — in-app approval) that the owner approves in
     Dashboard -> Signal History. Returns a status dict for the screen:
-      {"status":"proposed","sfid","refinement"} |
+      {"status":"proposed","sfid","refinement"} |        (content refinement)
+      {"status":"proposed","sfid","blocklist_entry","over_broad"} | (block sender)
       {"status":"declined","reason"} |
+      {"status":"already_known","refinement_id"} |
       {"status":"error","reason"}
+
+    CURATE is an umbrella with TWO mechanisms, chosen explicitly by the user via
+    the GUI (authoritative — Claude need not re-classify rule_class when given):
+      * curate_mechanism="block_sender"  -> a specific sender becomes a real
+        scoped BLOCK-LIST entry (sender domain by default, or exact address via
+        block_kind="address"). NO Claude call. Goes through the same
+        pending->approval flow; on approval the scoped entry is written.
+      * curate_mechanism="block_like_this" (default) -> the existing curate
+        CONTENT ai_refinement (Claude-applied), unchanged.
+    rule_class="protect" -> the existing protect content refinement, unchanged.
+
+    Backward compatibility: rule_class / curate_mechanism are OPTIONAL. When the
+    caller passes no rule_class (older callers / tests), the learner classifies
+    rule_class itself, exactly as before. When rule_class IS given, the user's
+    explicit choice is authoritative and overrides the model's classification for
+    the content path.
 
     Scope (R1): the caller's EXPLICIT scope wins. The dashboard always passes an
     explicit ``scope`` (its per-account picker, or "all") — that value is used
@@ -708,10 +753,72 @@ def propose_from_teaching(eml_bytes: bytes, *, direction: str,
     "all" instruction) is DECLINED here rather than silently made global.
     """
     direction = (direction or "spam").strip().lower()
+    rule_class_explicit = (str(rule_class).strip().lower()
+                           if rule_class is not None else "")
+    mechanism = (str(curate_mechanism).strip().lower()
+                 if curate_mechanism is not None else "")
     try:
         msg = email.message_from_bytes(eml_bytes)
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "reason": f"could not read that email ({e})"}
+
+    # --- CURATE / "Block this sender" — instant, no Claude. ---
+    # The user explicitly chose to block this specific sender. Build a scoped
+    # block-list entry and route it through the same pending->approval flow as
+    # every other proposal (so the user still one-click approves); on approval
+    # config_io.apply_blocklist_proposal_from_pending writes the scoped entry.
+    if rule_class_explicit == "curate" and mechanism == "block_sender":
+        # Resolve scope the same way curate content rules do: explicit caller
+        # scope wins; else derive from the GUI's apply_scope ("all" when the user
+        # chose apply-to-all) + originating account; a curate block with no
+        # account and no "all" is DECLINED, never silently global.
+        if scope is _SCOPE_UNSET:
+            resolved = _resolve_scope("curate", apply_scope, originating_account)
+            if resolved is _SCOPE_NEEDS_EXPLICIT:
+                logger.info("  [TEACH] Declining block_sender with no scope: "
+                            "no originating account and owner gave no scope")
+                return {"status": "declined",
+                        "reason": ("no account was given to apply this "
+                                   "block to")}
+            scope = resolved
+        entry = _build_block_sender_proposal(msg, scope=scope, block_kind=block_kind)
+        if entry is None:
+            return {"status": "declined",
+                    "reason": "no sender address could be read from that email"}
+        pending = load_pending_signals()
+        sfid = next_sfid(pending)
+        now = datetime.now().isoformat()
+        expires = (datetime.now() + timedelta(days=7)).isoformat()
+        conv = {
+            "id": sfid,
+            "kind": "block_sender_proposal",
+            "status": "awaiting_reply",
+            "created": now,
+            "expires": expires,
+            "original_message_id": "",
+            "original_from": str(msg.get("From", "") or ""),
+            "original_subject": _decode(msg.get("Subject", "") or ""),
+            "forwarder": (str(originating_account).strip()
+                          if originating_account else ""),
+            "blocklist_entry": entry,
+            "resolution": None,
+            "conversation_history": [
+                {"role": "system", "timestamp": now,
+                 "content": "Block-this-sender proposed from the Check an Email "
+                            "screen"}],
+        }
+        pending.setdefault("conversations", []).append(conv)
+        save_pending_signals(pending)
+        append_refinement_log({
+            "ts": now, "event": "proposed", "id": sfid, "sfid": sfid,
+            "headline": f"Block sender {entry['kind']}: {entry['value']}",
+            "kind": "block_sender_proposal", "source": "check_screen",
+        })
+        logger.info(f"  [TEACH] Proposed block-sender ({sfid}): "
+                    f"{entry['kind']} {entry['value']} "
+                    f"(over_broad={entry['over_broad']})")
+        return {"status": "proposed", "sfid": sfid,
+                "blocklist_entry": entry, "over_broad": entry["over_broad"]}
 
     example = {
         "filename": "checked-email",
@@ -736,6 +843,17 @@ def propose_from_teaching(eml_bytes: bytes, *, direction: str,
         return {"status": "declined",
                 "reason": (cls.get("reason")
                            or "no reliable, general rule could be derived")}
+
+    # The user's explicit protect/curate choice is AUTHORITATIVE for the content
+    # path: override whatever the model classified so the stored rule_class (and
+    # the scope derived from it below) reflects what the user actually chose.
+    # Claude still drafted the headline/rationale. (Only meaningful for spam.)
+    if direction == "spam" and rule_class_explicit in ("protect", "curate"):
+        cls["rule_class"] = rule_class_explicit
+    # An explicitly-passed apply_scope (the GUI's apply-to-all choice) likewise
+    # overrides the model's parse for downstream _resolve_scope.
+    if apply_scope is not None:
+        cls["apply_scope"] = apply_scope
 
     # R1 scope resolution. Explicit caller scope (dashboard) wins unchanged.
     # Only when no explicit scope was supplied do we derive it from the rule's
@@ -794,7 +912,6 @@ def propose_from_teaching(eml_bytes: bytes, *, direction: str,
     append_refinement_log({
         "ts": now, "event": "proposed", "id": refinement_id, "sfid": sfid,
         "headline": refinement["headline"],
-        "signal_type": refinement.get("signal_type", "soft"),
         "evidence": ["checked-email"], "source": "check_screen",
     })
     logger.info(f"  [TEACH] Proposed {refinement_id} ({sfid}) [{direction}]: "
@@ -1060,32 +1177,6 @@ def handle_duplicate(classification: dict, example: dict,
     return True
 
 
-def _validate_hard_rule(hard_rule: object) -> dict | None:
-    """Return the hard_rule dict if it is well-formed, else None.
-
-    Accepted shapes:
-      {"type": "subject_keyword", "value": "<non-empty string>"}
-      {"type": "sender_domain",   "value": "<domain without @ prefix>"}
-    Rejects anything else silently so a malformed model response never
-    breaks the proposal flow.
-    """
-    if not isinstance(hard_rule, dict):
-        return None
-    rule_type = (hard_rule.get("type") or "").strip().lower()
-    value = (hard_rule.get("value") or "").strip()
-    if not value:
-        return None
-    if rule_type == "subject_keyword":
-        return {"type": "subject_keyword", "value": value}
-    if rule_type == "sender_domain":
-        # Normalise: strip leading @ if the model included one, lowercase
-        domain = value.lstrip("@").lower()
-        if "." not in domain:
-            return None  # not a plausible domain
-        return {"type": "sender_domain", "value": domain}
-    return None
-
-
 def handle_new_pattern(classification: dict, example: dict,
                        signals_data: dict, config: dict,
                        logger: logging.Logger,
@@ -1101,11 +1192,6 @@ def handle_new_pattern(classification: dict, example: dict,
         logger.warning(f"  [LEARNER] new_pattern without headline — skipping")
         return False
 
-    # Determine signal type: hard if the model returned a valid hard_rule,
-    # soft otherwise.
-    hard_rule = _validate_hard_rule(classification.get("hard_rule"))
-    signal_type = "hard" if hard_rule is not None else "soft"
-
     refinement_id = next_refinement_id(signals_data)
     refinement = {
         "id": refinement_id,
@@ -1119,7 +1205,6 @@ def handle_new_pattern(classification: dict, example: dict,
         "last_reinforced": datetime.now().isoformat(),
         "match_count": 1,
         "status": "proposed",
-        "signal_type": signal_type,
     }
     # P1 scope capture: bind this learned rule to the inbox that taught it.
     # The forwarder is the account username stamped on the example via the
@@ -1149,8 +1234,6 @@ def handle_new_pattern(classification: dict, example: dict,
         # path; record the effective threat class for downstream rendering.
         refinement["scope"] = [forwarder] if forwarder else "all"
         refinement["rule_class"] = "protect"
-    if hard_rule is not None:
-        refinement["hard_rule"] = hard_rule
 
     pending = load_pending_signals()
     sfid = next_sfid(pending)
@@ -1181,25 +1264,9 @@ def handle_new_pattern(classification: dict, example: dict,
         "id": refinement_id,
         "sfid": sfid,
         "headline": headline,
-        "signal_type": signal_type,
         "evidence": [example["filename"]],
         "source": "learner",
     })
-
-    # Build the signal-type line for the email body
-    if hard_rule is not None:
-        if hard_rule["type"] == "subject_keyword":
-            signal_type_line = (
-                f"Proposed as a HARD rule (instant, no AI cost): "
-                f"subject contains \"{hard_rule['value']}\""
-            )
-        else:
-            signal_type_line = (
-                f"Proposed as a HARD rule (instant, no AI cost): "
-                f"sender domain is {hard_rule['value']}"
-            )
-    else:
-        signal_type_line = "Proposed as an AI refinement (soft)."
 
     to_addr = _pick_recipient(example, config)
     subject = f"[{sfid}] Proposed refinement — {headline[:60]}"
@@ -1234,8 +1301,7 @@ def handle_new_pattern(classification: dict, example: dict,
         f"================ PROPOSED REFINEMENT ================\n\n"
         f"Headline:   {headline}\n"
         f"Confidence: {confidence}\n"
-        f"Kind:       {kind}\n"
-        f"Type:       {signal_type_line}\n\n"
+        f"Kind:       {kind}\n\n"
         f"Why this works:\n{rationale}\n\n"
         f"What this does NOT cover:\n{disclaimer}\n\n"
         f"Evidence: {example['filename']}\n"
@@ -1247,7 +1313,7 @@ def handle_new_pattern(classification: dict, example: dict,
     )
     sent = _send(config, to_addr, subject, body, logger, smtp_conn)
     logger.info(
-        f"  [LEARNER] Proposed {refinement_id} ({sfid}) [{signal_type}] to {to_addr} "
+        f"  [LEARNER] Proposed {refinement_id} ({sfid}) to {to_addr} "
         f"({'sent' if sent else 'send FAILED'}): {headline[:60]}"
     )
     return True

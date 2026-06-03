@@ -209,6 +209,66 @@ def save_blacklist(bl: dict) -> None:
     save_json_atomic(paths.BLACKLIST_PATH, bl)
 
 
+# Map a "Block this sender" entry kind to the blacklist.json list it lives in.
+# (display_name / subject_keyword are here for completeness; the block-sender
+# action only uses address/domain, but the writer is general.)
+_BLOCK_KIND_TO_FIELD = {
+    "address": "addresses",
+    "domain": "domains",
+    "display_name": "display_names",
+    "subject_keyword": "subject_keywords",
+}
+
+
+def add_blocklist_entry(value: str, kind: str, scope) -> bool:
+    """Write ONE scoped block-list entry into blacklist.json (PB2).
+
+    ``kind`` is "address" | "domain" | "display_name" | "subject_keyword".
+    ``scope`` is "all" or a list of account usernames — the SAME shape used by
+    ai_refinement scope and read by spam_filter._blacklist_entry_in_scope.
+
+    Representation (migration-safe): the entry is stored as an OBJECT
+    ``{"value": <normalized value>, "scope": <scope>}``. Legacy plain-string
+    entries already in the file are left untouched and keep working as global
+    blocks (spam_filter normalizes both shapes). Domains are normalized to a
+    bare lowercased domain (leading '@' stripped); addresses/keywords are
+    lowercased/trimmed.
+
+    Idempotent: if an entry with the same normalized value already exists (in
+    EITHER shape), its scope is updated in place rather than duplicating the
+    value. Returns True if the file was changed, False on a bad kind/empty value.
+    """
+    field = _BLOCK_KIND_TO_FIELD.get((kind or "").strip().lower())
+    if field is None:
+        return False
+    v = (value or "").strip().lower()
+    if field == "domains":
+        v = v.lstrip("@")
+    if not v:
+        return False
+
+    bl = load_blacklist()
+    items = bl.setdefault(field, [])
+
+    def _entry_value(item) -> str:
+        raw = item.get("value") if isinstance(item, dict) else item
+        if not isinstance(raw, str):
+            return ""
+        s = raw.strip().lower()
+        return s.lstrip("@") if field == "domains" else s
+
+    # Update existing row (either shape) to the new scope, de-duping by value.
+    for i, item in enumerate(items):
+        if _entry_value(item) == v:
+            items[i] = {"value": v, "scope": scope}
+            save_blacklist(bl)
+            return True
+
+    items.append({"value": v, "scope": scope})
+    save_blacklist(bl)
+    return True
+
+
 def load_token_usage() -> dict:
     return load_json(
         paths.TOKEN_USAGE_PATH,
@@ -402,6 +462,54 @@ def apply_refinement_from_pending(sfid: str, source: str = "dashboard") -> dict 
         "source": source,
     })
     return refinement
+
+
+def apply_blocklist_proposal_from_pending(sfid: str,
+                                          source: str = "dashboard") -> dict | None:
+    """Approve a pending "Block this sender" proposal (PB2).
+
+    Parallels apply_refinement_from_pending, but instead of activating an
+    ai_refinement it WRITES the scoped block-list entry to blacklist.json (via
+    add_blocklist_entry) so the block is enforced per-account on the next filter
+    tick. Returns the written entry dict, or None when the SFID wasn't found /
+    wasn't a block_sender_proposal / was already resolved.
+    """
+    pending = load_pending_signals()
+    conv = None
+    for c in pending.get("conversations", []):
+        if c.get("id") == sfid:
+            conv = c
+            break
+    if conv is None:
+        return None
+    if conv.get("status") not in ("awaiting_reply",):
+        return None
+    if conv.get("kind") != "block_sender_proposal":
+        return None
+    entry = conv.get("blocklist_entry")
+    if not isinstance(entry, dict) or not entry.get("value"):
+        return None
+
+    add_blocklist_entry(entry.get("value", ""), entry.get("kind", "domain"),
+                        entry.get("scope", "all"))
+
+    conv["status"] = "approved"
+    conv["resolution"] = "approved"
+    conv.setdefault("conversation_history", []).append({
+        "role": "system",
+        "timestamp": now_iso(),
+        "content": f"Block-sender approved via {source}",
+    })
+    save_pending_signals(pending)
+    append_refinement_log({
+        "ts": now_iso(),
+        "event": "applied",
+        "id": conv.get("id"),
+        "sfid": sfid,
+        "headline": f"Block sender {entry.get('kind', '')}: {entry.get('value', '')}",
+        "source": source,
+    })
+    return entry
 
 
 def reject_pending(sfid: str, source: str = "dashboard",

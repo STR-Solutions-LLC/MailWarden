@@ -736,3 +736,412 @@ def test_p1_set_refinement_scope_missing_id_returns_false(monkeypatch):
     monkeypatch.setattr(config_io, "save_signals",
                         lambda d: (_ for _ in ()).throw(AssertionError("should not save")))
     assert config_io.set_refinement_scope("nope", "all") is False
+
+
+# ---------------------------------------------------------------------------
+# PB1 — per-account BLOCK-LIST scoping. Block-list entries gain an optional
+# ``scope`` ("all" or a list of account usernames), mirroring ai_refinements.
+# A MISSING scope (plain legacy string entry) is treated as "all". The live
+# check_* helpers consult the scope for the CURRENT account; an entry scoped to
+# one inbox does not block on the others. spam_filter._blacklist_entry_in_scope
+# mirrors _refinement_in_scope.
+#
+# Representation chosen (migration-safe): each list in blacklist.json may hold
+# either a plain string (legacy => global) OR an object {"value":..,"scope":..}.
+# load_blacklist keeps the legacy flat lowercased sets for membership AND builds
+# parallel {value_lower: scope} maps the checks consult.
+# ---------------------------------------------------------------------------
+
+def test_pb1_entry_in_scope_missing_is_all():
+    # A legacy plain string carries no scope -> global -> blocks any account.
+    assert spam_filter._blacklist_entry_in_scope("all", "anyone@x.com") is True
+    assert spam_filter._blacklist_entry_in_scope(None, "anyone@x.com") is True
+
+
+def test_pb1_entry_in_scope_list_matches_only_its_account():
+    assert spam_filter._blacklist_entry_in_scope(["matt@x.com"], "matt@x.com") is True
+    assert spam_filter._blacklist_entry_in_scope(["matt@x.com"], "other@y.com") is False
+
+
+def test_pb1_entry_in_scope_case_insensitive():
+    assert spam_filter._blacklist_entry_in_scope(["Matt@X.com"], "matt@x.com") is True
+
+
+def test_pb1_entry_in_scope_none_account_includes_everything():
+    # account_name=None means "no per-account filtering" (offline harness/tests).
+    assert spam_filter._blacklist_entry_in_scope(["matt@x.com"], None) is True
+
+
+def _bl_loaded(data):
+    """Run a raw blacklist dict through the same normalization load_blacklist
+    performs (flat sets + scope maps), without touching disk."""
+    return spam_filter._ensure_list_sets(data)
+
+
+def test_pb1_load_supports_mixed_string_and_object_domains():
+    # Legacy string + new scoped object in the same list.
+    bl = _bl_loaded({"domains": ["legacy.com",
+                                 {"value": "scoped.com", "scope": ["matt@x.com"]}]})
+    # Both are members (flat set, lowercased, @-stripped) ...
+    assert "legacy.com" in bl["_domains_set"]
+    assert "scoped.com" in bl["_domains_set"]
+    # ... and the scope map records each entry's scope (string => "all").
+    assert bl["_domains_scope"]["legacy.com"] == "all"
+    assert bl["_domains_scope"]["scoped.com"] == ["matt@x.com"]
+
+
+def test_pb1_load_object_domain_strips_leading_at():
+    bl = _bl_loaded({"domains": [{"value": "@scoped.com", "scope": ["matt@x.com"]}]})
+    assert "scoped.com" in bl["_domains_set"]
+    assert bl["_domains_scope"]["scoped.com"] == ["matt@x.com"]
+
+
+def test_pb1_load_malformed_object_is_skipped():
+    # An object without a usable value must not crash and must not become a member.
+    bl = _bl_loaded({"addresses": [{"scope": ["matt@x.com"]}, "real@x.com"]})
+    assert "real@x.com" in bl["_addresses_set"]
+    assert len(bl["_addresses_set"]) == 1
+
+
+_FROM_SCOPED = 'Spammy <sales@spammyvendor.com>'
+
+
+def _bl_with_scoped_domain(scope):
+    return _bl_loaded({"domains": [{"value": "spammyvendor.com", "scope": scope}]})
+
+
+def test_pb1_check_blacklist_scoped_blocks_its_account():
+    bl = _bl_with_scoped_domain(["matt@example.com"])
+    mt, mv = spam_filter.check_blacklist(_FROM_SCOPED, bl,
+                                         account_name="matt@example.com")
+    assert mt == "domain" and mv  # blocked for the scoped account
+
+
+def test_pb1_check_blacklist_scoped_does_not_block_other_account():
+    bl = _bl_with_scoped_domain(["matt@example.com"])
+    mt, mv = spam_filter.check_blacklist(_FROM_SCOPED, bl,
+                                         account_name="dad@example.com")
+    assert (mt, mv) == (None, None)  # NOT blocked for a different account
+
+
+def test_pb1_check_blacklist_legacy_string_blocks_any_account():
+    bl = _bl_loaded({"domains": ["spammyvendor.com"]})  # plain string => global
+    for acct in ("matt@example.com", "dad@example.com"):
+        mt, _ = spam_filter.check_blacklist(_FROM_SCOPED, bl, account_name=acct)
+        assert mt == "domain"
+
+
+def test_pb1_check_blacklist_all_scope_blocks_everywhere():
+    bl = _bl_with_scoped_domain("all")
+    for acct in ("matt@example.com", "dad@example.com"):
+        mt, _ = spam_filter.check_blacklist(_FROM_SCOPED, bl, account_name=acct)
+        assert mt == "domain"
+
+
+def test_pb1_check_blacklist_no_account_is_unchanged_behavior():
+    # Back-compat: callers that don't pass account_name see every entry (today's
+    # behavior). The offline path / test_phase1a rely on this.
+    bl = _bl_with_scoped_domain(["matt@example.com"])
+    mt, _ = spam_filter.check_blacklist(_FROM_SCOPED, bl)  # no account_name
+    assert mt == "domain"
+
+
+def test_pb1_check_blacklist_scoped_address_and_display_name():
+    bl = _bl_loaded({
+        "addresses": [{"value": "sales@spammyvendor.com", "scope": ["matt@example.com"]}],
+        "display_names": [{"value": "Spammy", "scope": ["matt@example.com"]}],
+    })
+    # address match in scope
+    assert spam_filter.check_blacklist(_FROM_SCOPED, bl,
+                                       account_name="matt@example.com")[0] == "address"
+    # neither matches for a different account
+    assert spam_filter.check_blacklist(_FROM_SCOPED, bl,
+                                       account_name="dad@example.com") == (None, None)
+
+
+def test_pb1_check_subject_keywords_scoped():
+    bl = _bl_loaded({"subject_keywords": [
+        {"value": "winner", "scope": ["matt@example.com"]}]})
+    assert spam_filter.check_subject_keywords(
+        "You are a WINNER", bl, account_name="matt@example.com") == "winner"
+    assert spam_filter.check_subject_keywords(
+        "You are a WINNER", bl, account_name="dad@example.com") is None
+    # legacy string keyword blocks any account
+    bl2 = _bl_loaded({"subject_keywords": ["winner"]})
+    assert spam_filter.check_subject_keywords(
+        "You are a WINNER", bl2, account_name="dad@example.com") == "winner"
+
+
+# ---------------------------------------------------------------------------
+# PB2 — over-broad-block guardrail. is_shared_mail_domain(domain) returns True
+# for major shared consumer providers (so the GUI can warn before blocking a
+# whole domain and offer exact-address instead) and False for a company/org
+# domain that a single sender owns. Accepts bare or @-prefixed, any case.
+# ---------------------------------------------------------------------------
+
+def test_pb2_is_shared_mail_domain_true_for_major_providers():
+    for d in ("gmail.com", "googlemail.com", "yahoo.com", "ymail.com",
+              "outlook.com", "hotmail.com", "live.com", "msn.com",
+              "icloud.com", "me.com", "mac.com", "aol.com",
+              "proton.me", "protonmail.com", "gmx.com", "zoho.com",
+              "fastmail.com"):
+        assert learn_signals.is_shared_mail_domain(d) is True, d
+
+
+def test_pb2_is_shared_mail_domain_false_for_company_or_org():
+    for d in ("rnc.org", "spammyvendor.com", "acme.com", "firstchairmarketing.com"):
+        assert learn_signals.is_shared_mail_domain(d) is False, d
+
+
+def test_pb2_is_shared_mail_domain_normalizes_at_and_case():
+    assert learn_signals.is_shared_mail_domain("@Gmail.com") is True
+    assert learn_signals.is_shared_mail_domain("GMAIL.COM") is True
+    assert learn_signals.is_shared_mail_domain("") is False
+    assert learn_signals.is_shared_mail_domain(None) is False
+
+
+# ---------------------------------------------------------------------------
+# PB3 — "Block this sender" creation. propose_from_teaching with
+# rule_class="curate" + curate_mechanism="block_sender" must NOT call Claude.
+# It produces a PENDING block_sender proposal whose payload is a scoped
+# block-list entry (sender DOMAIN by default), scope defaulting to the
+# originating account (curate default) or "all" when apply_scope=="all".
+# The over-broad-domain flag is surfaced for the GUI to warn on.
+# ---------------------------------------------------------------------------
+
+_RAW_VENDOR = (b"From: Spammy Vendor <sales@spammyvendor.com>\r\n"
+               b"Subject: Buy now\r\n\r\nPlease buy.\r\n")
+_RAW_GMAIL = (b"From: A Person <somebody@gmail.com>\r\n"
+              b"Subject: hi\r\n\r\nhello.\r\n")
+
+
+def _run_block_sender(monkeypatch, raw=_RAW_VENDOR, **kwargs):
+    """Drive propose_from_teaching down the block_sender path with all IO
+    stubbed. call_claude must NEVER be invoked. Returns (out, captured_conv)."""
+    captured = {}
+
+    def _no_claude(*a, **k):
+        raise AssertionError("call_claude must NOT run for block_sender")
+
+    monkeypatch.setattr(learn_signals, "call_claude", _no_claude)
+    monkeypatch.setattr(learn_signals, "load_signals",
+                        lambda: {"signals": {}, "ai_refinements": []})
+    monkeypatch.setattr(learn_signals, "load_pending_signals",
+                        lambda: {"version": "1.0", "conversations": []})
+    monkeypatch.setattr(learn_signals, "save_pending_signals",
+                        lambda data: captured.update(pending=data))
+    monkeypatch.setattr(learn_signals, "append_refinement_log", lambda e: None)
+    out = learn_signals.propose_from_teaching(
+        raw, direction="spam", user_explanation="done with these",
+        rule_class="curate", curate_mechanism="block_sender",
+        api_config={"api_key": "x", "model": "m"}, logger=_QUIET_LOGGER, **kwargs)
+    conv = None
+    if out.get("status") == "proposed":
+        conv = captured["pending"]["conversations"][-1]
+    return out, conv
+
+
+def test_pb3_block_sender_proposes_domain_by_default(monkeypatch):
+    out, conv = _run_block_sender(
+        monkeypatch, originating_account="matt@example.com")
+    assert out["status"] == "proposed"
+    assert conv["kind"] == "block_sender_proposal"
+    entry = conv["blocklist_entry"]
+    assert entry["kind"] == "domain"
+    assert entry["value"] == "spammyvendor.com"          # bare, @-stripped
+    assert entry["scope"] == ["matt@example.com"]        # curate default = originating
+    assert out["over_broad"] is False                    # company domain
+
+
+def test_pb3_block_sender_scope_all_when_apply_scope_all(monkeypatch):
+    out, conv = _run_block_sender(
+        monkeypatch, apply_scope="all", originating_account="matt@example.com")
+    assert conv["blocklist_entry"]["scope"] == "all"
+
+
+def test_pb3_block_sender_explicit_scope_wins(monkeypatch):
+    # Dashboard passes an explicit scope (its account picker) — it wins unchanged.
+    out, conv = _run_block_sender(
+        monkeypatch, scope=["picked@example.com"],
+        originating_account="other@example.com")
+    assert conv["blocklist_entry"]["scope"] == ["picked@example.com"]
+
+
+def test_pb3_block_sender_flags_over_broad_shared_domain(monkeypatch):
+    out, conv = _run_block_sender(
+        monkeypatch, raw=_RAW_GMAIL, originating_account="matt@example.com")
+    assert out["over_broad"] is True
+    # Still defaults to domain (engine flags; the GUI offers exact-address next task).
+    assert conv["blocklist_entry"]["kind"] == "domain"
+    assert conv["blocklist_entry"]["value"] == "gmail.com"
+    assert conv["blocklist_entry"]["over_broad"] is True
+
+
+def test_pb3_block_sender_explicit_address_kind(monkeypatch):
+    # The GUI may request an exact-address block instead of the whole domain.
+    out, conv = _run_block_sender(
+        monkeypatch, raw=_RAW_GMAIL, block_kind="address",
+        originating_account="matt@example.com")
+    entry = conv["blocklist_entry"]
+    assert entry["kind"] == "address"
+    assert entry["value"] == "somebody@gmail.com"
+
+
+def test_pb3_block_sender_curate_no_account_declines(monkeypatch):
+    # curate block_sender, no explicit scope, no originating account, no "all"
+    # word -> must DECLINE (never silently global), mirroring content curate.
+    out, _ = _run_block_sender(monkeypatch)  # no scope, no account, no apply_scope
+    assert out["status"] == "declined"
+
+
+# ---------------------------------------------------------------------------
+# PB4 — block_sender APPROVAL writes the scoped block-list entry and is then
+# enforced per-account. config_io.add_blocklist_entry is the writer;
+# config_io.apply_blocklist_proposal_from_pending is the dashboard approval
+# path (parallels apply_refinement_from_pending).
+# ---------------------------------------------------------------------------
+
+def test_pb4_add_blocklist_entry_writes_scoped_object(monkeypatch):
+    saved = {}
+    monkeypatch.setattr(config_io, "load_blacklist",
+                        lambda: {"addresses": [], "domains": [],
+                                 "display_names": [], "subject_keywords": []})
+    monkeypatch.setattr(config_io, "save_blacklist", lambda bl: saved.update(bl=bl))
+    config_io.add_blocklist_entry("spammyvendor.com", "domain", ["matt@example.com"])
+    bl = saved["bl"]
+    assert {"value": "spammyvendor.com", "scope": ["matt@example.com"]} in bl["domains"]
+
+
+def test_pb4_add_blocklist_entry_address_and_global(monkeypatch):
+    saved = {}
+    monkeypatch.setattr(config_io, "load_blacklist",
+                        lambda: {"addresses": [], "domains": [],
+                                 "display_names": [], "subject_keywords": []})
+    monkeypatch.setattr(config_io, "save_blacklist", lambda bl: saved.update(bl=bl))
+    config_io.add_blocklist_entry("a@b.com", "address", "all")
+    assert {"value": "a@b.com", "scope": "all"} in saved["bl"]["addresses"]
+
+
+def test_pb4_add_blocklist_entry_dedupes_same_value(monkeypatch):
+    # Adding the same domain with a different scope must not create a duplicate
+    # value row; it updates the existing row's scope (idempotent re-block).
+    bl0 = {"addresses": [], "subject_keywords": [], "display_names": [],
+           "domains": [{"value": "spammyvendor.com", "scope": ["matt@example.com"]}]}
+    saved = {}
+    monkeypatch.setattr(config_io, "load_blacklist", lambda: bl0)
+    monkeypatch.setattr(config_io, "save_blacklist", lambda bl: saved.update(bl=bl))
+    config_io.add_blocklist_entry("spammyvendor.com", "domain", "all")
+    domains = saved["bl"]["domains"]
+    assert len(domains) == 1
+    assert domains[0]["value"] == "spammyvendor.com"
+    assert domains[0]["scope"] == "all"
+
+
+def _block_sender_conv(scope=("matt@example.com",), kind="domain",
+                       value="spammyvendor.com"):
+    return {
+        "id": "SFID-20260601-009",
+        "kind": "block_sender_proposal",
+        "status": "awaiting_reply",
+        "forwarder": "matt@example.com",
+        "blocklist_entry": {"value": value, "kind": kind,
+                            "scope": list(scope) if isinstance(scope, tuple) else scope},
+    }
+
+
+def test_pb4_apply_blocklist_proposal_writes_entry(monkeypatch):
+    conv = _block_sender_conv()
+    written = {}
+    monkeypatch.setattr(config_io, "load_pending_signals",
+                        lambda: {"version": "1.0", "conversations": [conv]})
+    monkeypatch.setattr(config_io, "save_pending_signals", lambda d: None)
+    monkeypatch.setattr(config_io, "append_refinement_log", lambda e: None)
+    monkeypatch.setattr(config_io, "load_blacklist",
+                        lambda: {"addresses": [], "domains": [],
+                                 "display_names": [], "subject_keywords": []})
+    monkeypatch.setattr(config_io, "save_blacklist", lambda bl: written.update(bl=bl))
+    res = config_io.apply_blocklist_proposal_from_pending(conv["id"], source="dashboard")
+    assert res is not None
+    assert {"value": "spammyvendor.com", "scope": ["matt@example.com"]} \
+        in written["bl"]["domains"]
+    assert conv["status"] == "approved"
+
+
+def test_pb4_written_entry_is_enforced_per_account():
+    # End-to-end through the SAME normalization the live filter uses: a written
+    # scoped domain entry blocks its account and not another.
+    bl = _bl_loaded({"domains": [{"value": "spammyvendor.com",
+                                  "scope": ["matt@example.com"]}]})
+    assert spam_filter.check_blacklist(
+        "x <a@spammyvendor.com>", bl, account_name="matt@example.com")[0] == "domain"
+    assert spam_filter.check_blacklist(
+        "x <a@spammyvendor.com>", bl, account_name="dad@example.com") == (None, None)
+
+
+# ---------------------------------------------------------------------------
+# PB5 — block_like_this and protect still produce CONTENT ai_refinements
+# (the existing curate/protect flow), unchanged. Only block_sender skips Claude.
+# ---------------------------------------------------------------------------
+
+def test_pb5_curate_block_like_this_still_calls_claude_and_makes_refinement(monkeypatch):
+    model_cls = {"kind": "new_pattern", "headline": "fundraising blasts",
+                 "rationale": "r", "rule_class": "curate", "confidence": "medium"}
+    ref = _run_propose_from_teaching(
+        monkeypatch, model_cls, rule_class="curate",
+        curate_mechanism="block_like_this", scope=["matt@example.com"])
+    # A normal content refinement (NOT a block_sender entry).
+    assert ref["headline"] == "fundraising blasts"
+    assert ref["rule_class"] == "curate"
+    assert ref["scope"] == ["matt@example.com"]
+
+
+def test_pb5_protect_still_calls_claude_and_makes_refinement(monkeypatch):
+    model_cls = {"kind": "new_pattern", "headline": "paypal phish",
+                 "rationale": "r", "rule_class": "protect", "confidence": "high"}
+    ref = _run_propose_from_teaching(
+        monkeypatch, model_cls, rule_class="protect", scope="all")
+    assert ref["headline"] == "paypal phish"
+    assert ref["rule_class"] == "protect"
+
+
+# ---------------------------------------------------------------------------
+# PB6 — the dead hard_rule machinery is GONE. The learner no longer exposes
+# _validate_hard_rule, no longer emits hard_rule on a produced refinement, and
+# the prompt schema no longer mentions hard_rule.
+# ---------------------------------------------------------------------------
+
+def test_pb6_validate_hard_rule_removed():
+    assert not hasattr(learn_signals, "_validate_hard_rule")
+
+
+def test_pb6_teaching_refinement_never_emits_hard_rule():
+    r = learn_signals.teaching_refinement_from_classification(
+        {"kind": "new_pattern", "headline": "H", "rationale": "R",
+         "rule_class": "protect",
+         "hard_rule": {"type": "sender_domain", "value": "spammers.biz"}},
+        verdict="spam", scope="all", refinement_id="R1", evidence_name="e")
+    assert "hard_rule" not in r
+    assert "signal_type" not in r  # vestigial hard/soft marker also gone
+
+
+def test_pb6_handle_new_pattern_never_emits_hard_rule(monkeypatch):
+    cls = {"kind": "new_pattern", "headline": "h", "rationale": "r",
+           "hard_rule": {"type": "subject_keyword", "value": "winner"}}
+    ex = {"filename": "x.eml", "from": "a@b.com", "subject": "s",
+          "forwarder": "owner@example.com"}
+    ref = _run_handle_new_pattern_cls(monkeypatch, cls, ex)
+    assert "hard_rule" not in ref
+    assert "signal_type" not in ref
+
+
+def test_pb6_prompt_schemas_no_longer_mention_hard_rule():
+    assert "hard_rule" not in learn_signals.TEACH_SYSTEM
+    assert "hard_rule" not in learn_signals.LEARNER_SYSTEM
+    spam = learn_signals.build_teach_prompt(
+        {"from": "a@b.com", "subject": "s", "plain_text_body": "b"},
+        direction="spam", active_refinements=[])
+    assert "hard_rule" not in spam
+    learner_p = learn_signals.build_learner_prompt(
+        [{"filename": "x.eml", "from": "a@b.com", "subject": "s",
+          "plain_text_body": "b", "received_headers": []}], [])
+    assert "hard_rule" not in learner_p
