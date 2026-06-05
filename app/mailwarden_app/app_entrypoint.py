@@ -35,7 +35,7 @@ def get_bundled_defaults_dir() -> Path:
         if candidate.is_dir():
             return candidate
     # Fallback: installer source tree
-    return Path.home() / "MailWarden-installer" / "resources" / "defaults"
+    return here.parents[2] / "resources" / "defaults"
 
 
 def _cli_status() -> int:

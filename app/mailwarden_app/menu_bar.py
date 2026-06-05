@@ -80,7 +80,7 @@ def _find_bundled_icon() -> tuple[Path | None, bool]:
         pass
 
     # Dev checkout
-    dev_resources = Path.home() / "MailWarden-installer" / "app" / "resources"
+    dev_resources = Path(__file__).resolve().parents[2] / "app" / "resources"
     png = dev_resources / "menubar_icon.png"
     if png.exists():
         return png, True

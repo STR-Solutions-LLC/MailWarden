@@ -14,14 +14,15 @@
 
 set -euo pipefail
 
-INSTALLER_ROOT="$HOME/MailWarden-installer"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALLER_ROOT="$SCRIPT_DIR"
 APP_DIR="$INSTALLER_ROOT/app"
 BUILD_VENV="$APP_DIR/build-venv"
 DIST_DIR="$INSTALLER_ROOT/dist"
 COMPONENT_PKG="$INSTALLER_ROOT/build/MailWarden-component.pkg"
 FINAL_PKG="$DIST_DIR/MailWarden.pkg"
 APP_BUNDLE_ID="com.strsolutions.mailwarden"
-APP_VERSION="1.6.0-beta.15"
+APP_VERSION="1.6.0-beta.16"
 
 mkdir -p "$DIST_DIR" "$(dirname "$COMPONENT_PKG")"
 

@@ -29,11 +29,12 @@ except ImportError:
     sys.exit(1)
 
 
-OUT = Path.home() / "MailWarden-installer" / "app" / "resources" / "app_icon.icns"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+OUT = REPO_ROOT / "app" / "resources" / "app_icon.icns"
 # Small menu bar PNG: 44px (22pt @2x retina). Template images for NSStatusBar
 # should be 22pt @2x = 44px. macOS automatically inverts a template image for
 # dark/light mode when template=True is set on the rumps App.
-MENUBAR_PNG_OUT = Path.home() / "MailWarden-installer" / "app" / "resources" / "menubar_icon.png"
+MENUBAR_PNG_OUT = REPO_ROOT / "app" / "resources" / "menubar_icon.png"
 
 # Colors
 NAVY = (28, 48, 82, 255)            # background squircle

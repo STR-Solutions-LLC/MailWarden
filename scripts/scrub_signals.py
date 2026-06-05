@@ -14,7 +14,7 @@ with all personally-identifiable content removed:
   4. `known_impersonated_brands` are kept as-is (public brand names) but
      de-duplicated case-insensitively.
 
-Writes to ~/MailWarden-installer/resources/defaults/signals.json atomically.
+Writes to the repo's resources/defaults/signals.json atomically.
 
 Usage: scripts/scrub_signals.py
 """
@@ -109,6 +109,7 @@ def scrub(src: dict) -> dict:
             "soft_signals": soft,
             "known_impersonated_brands": brands,
             "known_sending_infrastructure": infra,
+            "trusted_infrastructure": [],
             "learner_notes": GENERIC_LEARNER_NOTES,
         },
     }
@@ -116,7 +117,7 @@ def scrub(src: dict) -> dict:
 
 def main() -> int:
     src_path = Path.home() / "MailWarden" / "memory" / "signals.json"
-    dst_path = Path.home() / "MailWarden-installer" / "resources" / "defaults" / "signals.json"
+    dst_path = Path(__file__).resolve().parents[1] / "resources" / "defaults" / "signals.json"
 
     if not src_path.exists():
         print(f"ERROR: {src_path} does not exist. Cannot build scrubbed defaults.",

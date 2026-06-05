@@ -15,8 +15,9 @@ import re
 import sys
 from pathlib import Path
 
-SRC = Path.home() / "MailWarden-installer" / "resources" / "defaults" / "EULA.md"
-DST = Path.home() / "MailWarden-installer" / "resources" / "eula.html"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC = REPO_ROOT / "resources" / "defaults" / "EULA.md"
+DST = REPO_ROOT / "resources" / "eula.html"
 
 HEAD = """<!-- (c) 2026 STR Solutions, LLC. All rights reserved. -->
 <!DOCTYPE html>

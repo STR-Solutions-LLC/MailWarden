@@ -15,7 +15,8 @@
 # kill the script under -e.
 set -euo pipefail
 
-AUDIT_ROOT="${AUDIT_ROOT:-$HOME/MailWarden-installer}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AUDIT_ROOT="${AUDIT_ROOT:-$(dirname "$SCRIPT_DIR")}"
 FAIL=0
 
 fail() { echo "FAIL: $*" >&2; FAIL=1; }

@@ -174,6 +174,57 @@ def load_signals() -> dict:
         return {"signals": {}}
 
 
+def autoseed_trusted_infra(signals: dict, config: dict) -> bool:
+    """Ensure every configured account's own mail servers are recorded as the
+    user's TRUSTED infrastructure.
+
+    Collects each account's ``imap_host`` (and any per-account or the global
+    ``smtp`` host) from config and merges any that are missing into
+    ``signals['signals']['trusted_infrastructure']`` (case-insensitive). Runs on
+    every filter run, so adding a new account automatically trusts its servers
+    on the next run. It only ADDS hosts — it never removes ones the user (or a
+    future teach action) added — and the caller persists only when it returns
+    True.
+
+    Trusting a host neutralizes ONLY relay/infrastructure suspicion about that
+    hop in the Received chain (RELAY_INFRASTRUCTURE_MISMATCH). It does NOT trust
+    senders: shared providers (AOL, Gmail, Bluehost, ...) carry both the user's
+    own mail AND spam sent TO the user, so sender domain, brand match,
+    authentication, and content are still judged in full.
+
+    Returns True iff one or more hosts were added.
+    """
+    sig = signals.setdefault("signals", {})
+    current = sig.get("trusted_infrastructure")
+    if not isinstance(current, list):
+        current = []
+    existing = {h.strip().lower() for h in current
+                if isinstance(h, str) and h.strip()}
+
+    found = set()
+    for account in config.get("accounts", []):
+        if not isinstance(account, dict):
+            continue
+        host = (account.get("imap_host") or "").strip().lower()
+        if host:
+            found.add(host)
+        acct_smtp = account.get("smtp")
+        if isinstance(acct_smtp, dict):
+            sh = (acct_smtp.get("host") or "").strip().lower()
+            if sh:
+                found.add(sh)
+    global_smtp = (config.get("smtp") or {}).get("host", "")
+    global_smtp = (global_smtp or "").strip().lower()
+    if global_smtp:
+        found.add(global_smtp)
+
+    missing = sorted(found - existing)
+    if not missing:
+        return False
+    sig["trusted_infrastructure"] = current + missing
+    return True
+
+
 def load_whitelist(logger: logging.Logger) -> dict:
     """Load whitelist.json. Returns empty whitelist if file missing."""
     try:
@@ -1848,6 +1899,27 @@ def build_classifier_prompt(signals: dict, account_name: str = None,
             f"- Known spam infrastructure: {', '.join(infra)}"
         )
 
+    # The user's OWN mail infrastructure — every configured account's IMAP/SMTP
+    # servers (auto-seeded by autoseed_trusted_infra). Tell the classifier these
+    # hosts are EXPECTED in the Received chain so they are not mistaken for a
+    # suspicious relay, WITHOUT trusting senders (shared providers also carry
+    # spam sent to the user).
+    trusted = sig.get("trusted_infrastructure", [])
+    if trusted:
+        learned_parts.append(
+            "- The user's OWN mail infrastructure — their account mail servers "
+            "and providers: " + ", ".join(trusted) + ". These hosts appear in "
+            "the Received chain of the user's normal incoming mail, so their "
+            "presence is EXPECTED and must NOT be treated as a suspicious relay "
+            "hop or RELAY_INFRASTRUCTURE_MISMATCH — they are the user's own "
+            "receiving/sending servers, not spam relays. IMPORTANT: this removes "
+            "ONLY relay/infrastructure suspicion about these specific hops; it "
+            "does NOT vouch for the sender or the content. These are often "
+            "shared providers (e.g. AOL, Gmail, Bluehost) that ALSO carry spam "
+            "sent to the user, so judge the sender's domain, brand match, "
+            "authentication, and message content exactly as you normally would."
+        )
+
     # Inject APPROVED ai_refinements so they actually influence classification.
     # Previously this function read only signals["signals"] and silently
     # ignored ai_refinements, so an approved refinement never changed a single
@@ -3070,6 +3142,14 @@ def run_filter(force: bool = False):
 
     processed = load_processed_ids()
     signals = load_signals()
+    # Keep the user's own account mail servers (every configured account's IMAP
+    # host + the SMTP host) marked as trusted infrastructure, so they are not
+    # mistaken for a suspicious relay in the Received chain. Re-checks config
+    # every run (a newly added account is trusted on the next run); only adds,
+    # never removes; persists only when something actually changed.
+    if autoseed_trusted_infra(signals, config):
+        save_signals(signals)
+        logger.info("Trusted infrastructure updated from account config")
     whitelist = load_whitelist(logger)
     blacklist = load_blacklist(logger)
     detect_conflicts(whitelist, blacklist, logger)

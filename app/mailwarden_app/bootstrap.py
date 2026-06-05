@@ -30,7 +30,7 @@ from pathlib import Path
 
 from . import paths
 
-BUNDLED_FILTER_VERSION = "1.6.0-beta.15"
+BUNDLED_FILTER_VERSION = "1.6.0-beta.16"
 BUNDLED_INSTALLER_VERSION = "1.0"
 
 # Directories/files under Contents/Resources/ that we ship as payload.
@@ -63,7 +63,7 @@ def _bundle_payload_root() -> Path:
         if candidate.is_dir():
             return candidate
     # Fallback for dev checkout
-    dev = Path.home() / "MailWarden-installer" / "payload" / "MailWarden"
+    dev = here.parents[2] / "payload" / "MailWarden"
     return dev if dev.is_dir() else None
 
 
@@ -73,7 +73,7 @@ def _bundle_defaults_root() -> Path:
         candidate = ancestor / "defaults"
         if candidate.is_dir():
             return candidate
-    dev = Path.home() / "MailWarden-installer" / "resources" / "defaults"
+    dev = here.parents[2] / "resources" / "defaults"
     return dev if dev.is_dir() else None
 
 

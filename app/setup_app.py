@@ -3,7 +3,7 @@
 py2app build config for MailWarden.app.
 
 Usage:
-    cd ~/MailWarden-installer/app
+    cd <repo-root>/app
     python3 -m venv build-venv
     source build-venv/bin/activate
     pip install -U pip setuptools py2app rumps anthropic openpyxl
@@ -20,7 +20,7 @@ from setuptools import setup
 
 HERE = Path(__file__).parent.resolve()
 APP_NAME = "MailWarden"
-VERSION = "1.6.0-beta.15"
+VERSION = "1.6.0-beta.16"
 
 # ----------------------------------------------------------------------------
 # Copy the shared bundled defaults and runtime payload into app/resources/
