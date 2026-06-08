@@ -85,3 +85,6 @@ tests/fixtures/
 *.eml
 .claude/
 .claude-mpm/
+# Local MCP server config and trusty tooling — never commit
+.mcp.json
+.trusty-tools/
