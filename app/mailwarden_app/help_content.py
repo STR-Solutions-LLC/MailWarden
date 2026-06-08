@@ -8,7 +8,7 @@ across surfaces and a single edit updates every spot.
 # ---------------------------------------------------------------------------
 # Version and repo
 # ---------------------------------------------------------------------------
-VERSION = "1.6.0-beta.16"
+VERSION = "1.6.0-beta.16.1"
 GITHUB_URL = "https://github.com/STR-Solutions-LLC/MailWarden"
 FEEDBACK_EMAIL = "info@rentalist.pro"
 ANTHROPIC_CONSOLE_URL = "https://console.anthropic.com"
@@ -98,7 +98,7 @@ EMAIL_COMMAND_CHEAT_SHEET = (
     "• Fwd: Blacklist Address — block only this specific address.\n"
     "• Fwd: Blacklist Name — block senders using this display name.\n"
     "• Fwd: Remove from Blacklist — unblock a sender you previously blocked.\n"
-    "• Fwd: False Positive — an email was wrongly filtered; help MailWarden learn.\n"
+    "• Fwd: False Positive (or just NOT SPAM) — an email was wrongly filtered; help MailWarden learn.\n"
     "• Fwd: SPAM Example — same as dragging to the Train folder, when your\n"
     "  provider allows forwarding. If forwarding is blocked (AOL's PH01 often\n"
     "  does), use the Train folder instead.\n\n"
@@ -134,7 +134,7 @@ EMAIL_COMMAND_EXAMPLES = [
      "When you blacklisted someone by mistake. Forward any of their emails "
      "(or an old one you still have) with this subject and they go back to "
      "normal filtering."),
-    ("Fwd: False Positive",
+    ("Fwd: False Positive (or NOT SPAM)",
      "When MailWarden flagged something as spam that wasn't. Forward the "
      "mis-classified email with this subject. MailWarden analyzes why it "
      "got it wrong and proposes a refinement to its detection signals — "
@@ -195,7 +195,7 @@ HOW_IT_DECIDES = (
 
 SPAM_HANDLING_CHOICE = (
     "When MailWarden decides an email is spam, what happens next is up to you — per account. You'll see this choice when you add an account and you can change it any time from Dashboard → Accounts → Edit.\n\n"
-    "Move to Junk folder (the default). Spam goes into your Junk / Spam folder. Your email provider eventually empties Junk on its own schedule (usually 30 days). This is the safest choice: if MailWarden ever mis-flags a real email, you can find it in Junk and forward it back with the subject \"Fwd: False Positive\" to recover it and teach MailWarden it was wrong.\n\n"
+    "Move to Junk folder (the default). Spam goes into your Junk / Spam folder. Your email provider eventually empties Junk on its own schedule (usually 30 days). This is the safest choice: if MailWarden ever mis-flags a real email, you can find it in Junk and forward it back with the subject \"Fwd: False Positive\" (or just \"NOT SPAM\") to recover it and teach MailWarden it was wrong.\n\n"
     "Move to Trash (30-day buffer). Spam goes into your Trash folder instead. Functionally similar to Junk on most providers — Trash is also emptied on a delay — but useful if you check Junk regularly and don't want spam mixed in with mail you've actually deleted yourself. Same false-positive recovery path: forward it back from Trash before it auto-empties.\n\n"
     "Delete permanently (no recovery). Spam is removed from the server immediately. There is no Junk folder, no Trash folder, no recovery. If MailWarden ever mis-flags an important email, that email is gone for good. Use this only if you fully trust the filter and accept the trade-off. MailWarden will warn you and ask you to confirm when you pick this option.\n\n"
     "Most people should leave this on the default (Junk). The Delete option exists for the rare account where you genuinely want spam to disappear without leaving a trail — for example, a public-facing address that gets hundreds of obvious phishing attempts a day."
@@ -212,7 +212,7 @@ TRAIN_YOUR_FILTER = (
     "5. On the filter's next run (within 15 minutes by default) MailWarden will analyze the example and email you a refinement proposal: a one-sentence description of the pattern it learned, a short rationale, and what the pattern doesn't cover. Reply YES to apply, NO to reject, or use CONTEXT: / NARROW: to steer Claude's analysis with your own reasoning (e.g., \"CONTEXT: the 'reserved until 11:59 PM' pressure gave it away\"). The email walks you through all the reply options.\n\n"
     "6. You can also approve, reject, or withdraw any pending proposal from Dashboard → Signal History if MailWarden is open. Email and Dashboard are kept in sync.\n\n"
     "Catch spam the same way? Drag more examples to Train MailWarden. MailWarden will stop seeing it as ambiguous and start catching it on the pre-classifier (which is free) instead of the AI.\n\n"
-    "False positives — when the filter overreaches. If a real email ends up in Junk by mistake, forward it back with the subject 'Fwd: False Positive'. MailWarden analyzes why it mis-classified, proposes a refinement to its signals, and shows the proposed change on the Signal History tab. You approve or reject the change. Same run-based loop, same conversation.\n\n"
+    "False positives — when the filter overreaches. If a real email ends up in Junk by mistake, forward it back with the subject 'Fwd: False Positive' (or just 'NOT SPAM'). MailWarden analyzes why it mis-classified, proposes a refinement to its signals, and shows the proposed change on the Signal History tab. You approve or reject the change. Same run-based loop, same conversation.\n\n"
     "Every example makes your filter smarter. That's the whole idea. You don't have a spam filter — you have an AI trained on exactly the garbage that shows up in your mailbox."
 )
 

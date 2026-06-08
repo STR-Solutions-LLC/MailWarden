@@ -1311,3 +1311,51 @@ def test_pending_label_garbage_rule_class_falls_back_to_neutral():
     # Unknown/garbage rule_class on a spam rule must not crash or mislabel.
     assert dashboard.pending_proposal_label(
         {"verdict": "spam", "rule_class": "nonsense"}) == "Learned rule"
+
+
+# ---------------------------------------------------------------------------
+# NOT SPAM alias — "NOT SPAM" (and variants) must be recognized as an alias
+# for the canonical "False Positive" command, flowing through the identical
+# handler path. Regression checks confirm existing commands are unaffected.
+# ---------------------------------------------------------------------------
+
+def test_not_spam_upper_resolves_to_false_positive():
+    assert spam_filter.detect_email_command("NOT SPAM") == "False Positive"
+
+
+def test_not_spam_lower_resolves_to_false_positive():
+    assert spam_filter.detect_email_command("not spam") == "False Positive"
+
+
+def test_not_spam_mixed_case_resolves_to_false_positive():
+    assert spam_filter.detect_email_command("Not Spam") == "False Positive"
+
+
+def test_not_spam_fwd_upper_resolves_to_false_positive():
+    assert spam_filter.detect_email_command("Fwd: NOT SPAM") == "False Positive"
+
+
+def test_not_spam_fwd_lower_resolves_to_false_positive():
+    assert spam_filter.detect_email_command("FWD: not spam") == "False Positive"
+
+
+def test_not_spam_fw_mixed_resolves_to_false_positive():
+    assert spam_filter.detect_email_command("Fw: Not Spam") == "False Positive"
+
+
+# Regression: existing commands must still resolve correctly.
+
+def test_regression_spam_example():
+    assert spam_filter.detect_email_command("Fwd: SPAM Example") == "SPAM Example"
+
+
+def test_regression_false_positive_fwd():
+    assert spam_filter.detect_email_command("Fwd: False Positive") == "False Positive"
+
+
+def test_regression_whitelist_direct():
+    assert spam_filter.detect_email_command("Whitelist") == "Direct Whitelist"
+
+
+def test_regression_blacklist_direct():
+    assert spam_filter.detect_email_command("Blacklist") == "Direct Blacklist"

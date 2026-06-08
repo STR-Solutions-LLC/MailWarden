@@ -1251,6 +1251,7 @@ def strip_fwd_prefix(subject: str) -> str:
 EMAIL_COMMANDS = [
     ("Remove from Blacklist", "remove from blacklist"),
     ("False Positive",        "false positive"),
+    ("False Positive",        "not spam"),
     ("Whitelist Domain",      "whitelist domain"),
     ("Blacklist Address",     "blacklist address"),
     ("Blacklist Name",        "blacklist name"),
