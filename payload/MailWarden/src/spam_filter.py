@@ -926,6 +926,10 @@ def send_email(config: dict, subject: str, body: str, logger: logging.Logger,
     msg["Subject"] = subject
     msg["From"] = from_addr
     msg["To"] = to_addr
+    if to_addr:
+        # Ensure the owner's reply returns to the same mailbox this email was
+        # sent to (which is polled), not back to the SMTP From address.
+        msg["Reply-To"] = to_addr
     # Stamp every outgoing MailWarden system email so the filter can
     # recognise its own outgoing mail and skip it on re-ingestion.
     msg["X-MailWarden-System"] = "1"
@@ -1473,16 +1477,54 @@ def lookup_decision(from_addr: str, subject: str) -> dict:
     return best_match
 
 
-def _command_sender_is_owner(from_email: str, account: dict) -> bool:
+def _owner_identities(config: dict) -> set[str]:
+    """Return a lowercased, stripped set of every email address that belongs to
+    the owner across the entire config: every ENABLED account's username, plus
+    the SMTP sender username and from_address.
+
+    Used by _command_sender_is_owner to accept commands and approvals sent from
+    any of the owner's own identities (e.g. forwarding from a 'main' account
+    into a 'commerce' account inbox).
+    """
+    identities: set[str] = set()
+    for acct in config.get("accounts", []):
+        if acct.get("enabled", False):
+            username = (acct.get("username", "") or "").strip().lower()
+            if username:
+                identities.add(username)
+    smtp = config.get("smtp", {})
+    for key in ("username", "from_address"):
+        val = (smtp.get(key, "") or "").strip().lower()
+        if val:
+            identities.add(val)
+    return identities
+
+
+def _command_sender_is_owner(from_email: str, account: dict,
+                              config: dict | None = None) -> bool:
     """S1/S2 security guard: a Whitelist/Blacklist subject command or an
     [SFID-...] approval reply is honored ONLY when it genuinely came from the
-    account owner — i.e. the From address equals the account's own username.
-    This blocks a third party from mailing commands or approvals into the user's
-    inbox to reconfigure the filter or approve learned rules the user never saw.
+    account owner.
+
+    The check passes when the sender matches:
+    - the polled account's own username (original check), OR
+    - any of the owner's other configured identities (enabled account
+      usernames + SMTP username / from_address), when config is supplied.
+
+    This allows the owner to send commands or approvals from their 'main'
+    identity into a secondary account's inbox (e.g. Commerce).  It still
+    rejects true third parties — only addresses present in the owner's own
+    configuration are trusted.
     """
     owner = (account.get("username", "") or "").strip().lower()
     sender = (from_email or "").strip().lower()
-    return bool(owner) and sender == owner
+    if not sender:
+        return False
+    if bool(owner) and sender == owner:
+        return True
+    if config is not None:
+        return sender in _owner_identities(config)
+    return False
 
 
 def classify_reply(text: str) -> str:
@@ -3283,7 +3325,7 @@ def run_filter(force: bool = False):
                     # reconfigure the filter. A non-owner command is ignored and the
                     # message is then classified as ordinary mail.
                     if command and not _command_sender_is_owner(
-                            msg_data.get("from_email", ""), account):
+                            msg_data.get("from_email", ""), account, config):
                         logger.warning(
                             f"  Ignoring '{command}' command — sender "
                             f"{msg_data.get('from_email', '')!r} is not the account "
@@ -4163,7 +4205,7 @@ Conversation ID: {sfid}
                     # --- Detection branch 2: Reply to analysis email ---
                     sfid_match = re.search(r'\[SFID-(\d{8}-\d{3})\]', msg_data.get("subject", ""))
                     if sfid_match and not _command_sender_is_owner(
-                            msg_data.get("from_email", ""), account):
+                            msg_data.get("from_email", ""), account, config):
                         # S2 (security): only the account owner may approve/reject a
                         # refinement via an [SFID-...] reply. A spoofed approval could
                         # apply a learned rule the user never reviewed. Treat a

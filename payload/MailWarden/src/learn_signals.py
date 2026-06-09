@@ -1066,6 +1066,10 @@ def _send(config: dict, to_addr: str, subject: str, body: str,
         m["From"] = smtp_config.get("from_address",
                                      smtp_config.get("username", ""))
         m["To"] = to_addr
+        if to_addr:
+            # Ensure the owner's reply returns to the same mailbox this email
+            # was sent to (which is polled), not back to the SMTP From address.
+            m["Reply-To"] = to_addr
         return m
 
     def _get_server():

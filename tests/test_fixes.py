@@ -1359,3 +1359,173 @@ def test_regression_whitelist_direct():
 
 def test_regression_blacklist_direct():
     assert spam_filter.detect_email_command("Blacklist") == "Direct Blacklist"
+
+
+# ---------------------------------------------------------------------------
+# Fix B — _owner_identities and broadened _command_sender_is_owner
+# ---------------------------------------------------------------------------
+
+def _cfg(accounts=None, smtp_username="main@example.com",
+         smtp_from=None):
+    """Build a minimal config dict for owner-identity tests."""
+    accts = accounts if accounts is not None else [
+        {"username": "main@example.com", "enabled": True},
+        {"username": "commerce@example.com", "enabled": True},
+    ]
+    smtp = {"host": "smtp.example.com", "username": smtp_username}
+    if smtp_from:
+        smtp["from_address"] = smtp_from
+    return {"accounts": accts, "smtp": smtp}
+
+
+def test_fix_b_identities_includes_enabled_accounts():
+    cfg = _cfg()
+    ids = spam_filter._owner_identities(cfg)
+    assert "main@example.com" in ids
+    assert "commerce@example.com" in ids
+
+
+def test_fix_b_identities_includes_smtp_username_and_from_address():
+    cfg = _cfg(smtp_username="smtp@example.com", smtp_from="noreply@example.com")
+    ids = spam_filter._owner_identities(cfg)
+    assert "smtp@example.com" in ids
+    assert "noreply@example.com" in ids
+
+
+def test_fix_b_identities_excludes_disabled_account():
+    cfg = _cfg(accounts=[
+        {"username": "active@example.com", "enabled": True},
+        {"username": "inactive@example.com", "enabled": False},
+    ])
+    ids = spam_filter._owner_identities(cfg)
+    assert "active@example.com" in ids
+    assert "inactive@example.com" not in ids
+
+
+def test_fix_b_identities_case_insensitive_lowercased():
+    cfg = _cfg(accounts=[{"username": "Owner@Example.COM", "enabled": True}],
+               smtp_username="SMTP@Example.COM")
+    ids = spam_filter._owner_identities(cfg)
+    assert "owner@example.com" in ids
+    assert "smtp@example.com" in ids
+
+
+def test_fix_b_sender_is_polled_account_still_passes():
+    # Original behaviour: polled account username always accepted.
+    account = {"username": "commerce@example.com"}
+    assert spam_filter._command_sender_is_owner(
+        "commerce@example.com", account, _cfg()) is True
+
+
+def test_fix_b_sender_is_other_owner_identity_passes():
+    # Cross-account: owner sends from main@ into commerce@ inbox.
+    account = {"username": "commerce@example.com"}
+    cfg = _cfg()  # main@example.com is a configured enabled account
+    assert spam_filter._command_sender_is_owner(
+        "main@example.com", account, cfg) is True
+
+
+def test_fix_b_sender_is_smtp_identity_passes():
+    # Owner's SMTP from_address is also trusted.
+    account = {"username": "commerce@example.com"}
+    cfg = _cfg(smtp_from="noreply@example.com")
+    assert spam_filter._command_sender_is_owner(
+        "noreply@example.com", account, cfg) is True
+
+
+def test_fix_b_stranger_rejected_even_with_config():
+    account = {"username": "commerce@example.com"}
+    cfg = _cfg()
+    assert spam_filter._command_sender_is_owner(
+        "attacker@evil.com", account, cfg) is False
+
+
+def test_fix_b_empty_sender_rejected():
+    account = {"username": "commerce@example.com"}
+    assert spam_filter._command_sender_is_owner("", account, _cfg()) is False
+
+
+def test_fix_b_no_config_still_works_for_polled_account():
+    # Backward compat: no config supplied -> only polled account username accepted.
+    account = {"username": "owner@example.com"}
+    assert spam_filter._command_sender_is_owner(
+        "owner@example.com", account) is True
+    assert spam_filter._command_sender_is_owner(
+        "other@example.com", account) is False
+
+
+# ---------------------------------------------------------------------------
+# Fix C — Reply-To header in outbound mail
+# ---------------------------------------------------------------------------
+
+import email as _email_module
+from email.mime.text import MIMEText as _MIMEText
+
+
+def _capture_send_email(monkeypatch, to_addr):
+    """Call spam_filter.send_email with SMTP stubbed; return the MIMEText msg."""
+    from utils import smtp_login as _real_smtp_login
+    captured = {}
+
+    class _FakeServer:
+        def sendmail(self, frm, to, msg_str):
+            captured["msg_str"] = msg_str
+
+        def quit(self):
+            pass
+
+    monkeypatch.setattr("spam_filter.smtp_login", lambda cfg: _FakeServer(),
+                        raising=False)
+    # smtp_login is imported inside send_email as `from utils import smtp_login`
+    import utils as _utils_mod
+    monkeypatch.setattr(_utils_mod, "smtp_login", lambda cfg: _FakeServer())
+
+    cfg = {"smtp": {"host": "smtp.example.com", "username": "main@example.com",
+                    "from_address": "main@example.com", "port": 587,
+                    "use_starttls": True},
+           "summary": {"recipient_address": "main@example.com"}}
+
+    import logging as _log
+    spam_filter.send_email(cfg, "Test Subject", "Test body.",
+                           _log.getLogger("test"), to_addr=to_addr)
+    if "msg_str" not in captured:
+        return None
+    return _email_module.message_from_string(captured["msg_str"])
+
+
+def test_fix_c_send_email_sets_reply_to(monkeypatch):
+    msg = _capture_send_email(monkeypatch, "commerce@example.com")
+    assert msg is not None
+    assert msg["Reply-To"] == "commerce@example.com"
+
+
+def test_fix_c_send_email_reply_to_equals_to(monkeypatch):
+    msg = _capture_send_email(monkeypatch, "another@example.com")
+    assert msg is not None
+    assert msg["Reply-To"] == msg["To"]
+
+
+def test_fix_c_learner_send_sets_reply_to(monkeypatch):
+    """learn_signals._send must also set Reply-To = to_addr."""
+    captured = {}
+
+    class _FakeServer:
+        def sendmail(self, frm, to, msg_str):
+            captured["msg_str"] = msg_str
+
+        def quit(self):
+            pass
+
+    import utils as _utils_mod
+    monkeypatch.setattr(_utils_mod, "smtp_login", lambda cfg: _FakeServer())
+
+    cfg = {"smtp": {"host": "smtp.example.com", "username": "main@example.com",
+                    "from_address": "main@example.com"}}
+
+    import logging as _log
+    learn_signals._send(cfg, "commerce@example.com", "Proposal",
+                        "Is this spam?", _log.getLogger("test"))
+
+    assert "msg_str" in captured
+    parsed = _email_module.message_from_string(captured["msg_str"])
+    assert parsed["Reply-To"] == "commerce@example.com"
