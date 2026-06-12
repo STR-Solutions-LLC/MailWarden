@@ -231,24 +231,39 @@ def append_refinement_log(event: dict) -> None:
 
 
 def next_sfid(pending: dict) -> str:
+    """Generate an unguessable SFID-YYYYMMDD-<hextoken> conversation ID.
+
+    Byte-identical format to spam_filter.generate_sfid so one resolver regex
+    matches both. Random (not sequential) so IDs cannot collide or be forged;
+    regenerates on the unlikely chance of colliding with an existing id.
+    """
+    from utils import random_token
     today = datetime.now().strftime("%Y%m%d")
-    prefix = f"SFID-{today}-"
-    existing = [c["id"] for c in pending.get("conversations", [])
-                if c.get("id", "").startswith(prefix)]
-    return f"{prefix}{len(existing) + 1:03d}"
+    existing = {c.get("id", "") for c in pending.get("conversations", [])}
+    while True:
+        sfid = f"SFID-{today}-{random_token()}"
+        if sfid not in existing:
+            return sfid
 
 
 def next_refinement_id(signals_data: dict) -> str:
+    """Generate an unguessable R-YYYYMMDD-<hextoken> refinement ID.
+
+    Random (not sequential) so IDs cannot collide; uniqueness-checked against
+    existing ai_refinements ids plus any pending proposed_refinement ids.
+    """
+    from utils import random_token
     today = datetime.now().strftime("%Y%m%d")
-    prefix = f"R-{today}-"
-    existing = [r["id"] for r in signals_data.get("ai_refinements", [])
-                if r.get("id", "").startswith(prefix)]
+    existing = {r.get("id", "") for r in signals_data.get("ai_refinements", [])}
     pend = load_pending_signals()
     for c in pend.get("conversations", []):
         rid = (c.get("proposed_refinement") or {}).get("id", "")
-        if rid.startswith(prefix):
-            existing.append(rid)
-    return f"{prefix}{len(set(existing)) + 1:03d}"
+        if rid:
+            existing.add(rid)
+    while True:
+        rid = f"R-{today}-{random_token()}"
+        if rid not in existing:
+            return rid
 
 
 # ---------------------------------------------------------------------------

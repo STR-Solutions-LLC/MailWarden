@@ -191,6 +191,7 @@ Also MEDIUM: learner stores model-derived rule text verbatim with no code-level 
 These are queued for discussion before their fix sessions. Nothing here will be changed without your explicit per-item approval.
 
 1. **(C1)** When a command email from your address fails authentication checks — reject silently, reject with a notice, or warn-but-honor?
+   → DECIDED 2026-06-12: **reject with a notice** (never silently drop, never warn-but-honor). Refined during the fix: a strict-only gate (require SPF/DKIM/DMARC alignment) was the first choice, but live testing showed the production Bluehost host stamps no Authentication-Results on the owner's own outgoing mail (0 of 270 owner-sent inbox messages carried any auth header), so strict-only would have rejected 100% of genuine commands. Final policy is a **layered gate**: honor a command if the From-line matches an owner identity AND either (a) the From-domain is in the message's authenticated domains, OR (b) the message entered the account's own mail server via authenticated submission (`esmtpsa`/`esmtpa` at the entry hop). Accepted residual risk: a deliberate impersonator holding a valid mail login on the same shared Bluehost box. Implemented in Session 2 — see PART 5.
 2. **(C3)** What should "Dry Run" promise? Strictly nothing changes anywhere? Or "no mail moves, but teaching still works"?
 3. **(B4)** Should "Yes, but…" replies auto-apply, or open a follow-up question?
 4. **(C6)** Prompt-injection detectors: keep as $0 auto-junk with narrowed patterns, or downgrade to "route to the AI"? (Directly affects your AI-newsletter mail.)
@@ -198,6 +199,7 @@ These are queued for discussion before their fix sessions. Nothing here will be 
 6. **(C9)** When a user drags an email into a Blacklist folder — block on all accounts, or just that account?
 7. **(C10)** Daily report: true calendar day (no gaps possible) or rolling 24 hours?
 8. **(M4/D10)** Keep full signal-conversation history forever, or prune resolved ones?
+   → STILL OPEN as of 2026-06-12. Session 2 implemented only the "already applied" half of M4 (a second reply to a resolved SFID now returns an accurate status instead of "Not Found"); the retention/pruning question is untouched and awaits your decision.
 9. **(M12)** Retention policy for saved teaching emails (they're a permanent archive today).
 10. **(M14)** When an account is deleted, should its learned-rule scopes and trusted mail hosts be cleaned up?
 11. **Spam improvements (Part 3):** the Sonnet-escalation band for borderline emails; auth-gating the domain whitelist; retiring the three over-broad default soft signals; learned-rule decay/expiry; whether new cheap signals (link mismatch, Reply-To mismatch, punycode) ever become decisive vs. advisory-only.
@@ -311,7 +313,7 @@ Eight parallel read-only agents (Opus-class) audited: IMAP runtime/concurrency (
 
 # PART 5 — FIX SESSION STATUS *(update this section at the end of every fix session)*
 
-**Testing reality:** the app cannot run on the development machine. "Verified live" requires building an installer and running it on Matt's M1. To minimize builds, live checks are batched across sessions; each session records below exactly what is and is not yet verified.
+**Testing reality:** the *Python filter/learner engine* (the headless backend) CAN be live-verified on the development machine — run `run_filter` via `tests/.venv/bin/python` against the real mailbox with all `PROJECT_ROOT`-relative paths redirected to an isolated `/tmp` copy of the live config + memory store (proven in Session 2: real IMAP/SMTP, real account, live store never mutated). Only the *packaged macOS GUI app* (Setup Assistant, Dashboard, installer screens) still requires building an installer and running it on Matt's M1. To minimize builds, GUI/installer live checks are batched across sessions; each session records below exactly what is and is not yet verified.
 
 ## Session 1 — Shared file locking + save-as-you-go (completed 2026-06-11)
 **Status: COMPLETE — test suite green. Independent review gate: PASSED (2026-06-11, fresh-session reviewer). Live verification: PENDING (no installer built). Committed on `calibration-security-build1`.**
@@ -341,3 +343,36 @@ Eight parallel read-only agents (Opus-class) audited: IMAP runtime/concurrency (
 - Two reviewed-and-approved deviations from the original Session 1 prompt: the filter's pending_signals saves are a true re-read-merge (a plain lock could not fix T5, because the filter saves a run-start snapshot repeatedly), and the daily report's "Last ran" line now reads learner_state.json with config fallback (it would otherwise have silently frozen when the learner stopped writing config).
 
 **Next step:** Session 2 (command authentication, audit Part 4) in a fresh session — it begins with a plain-English discussion of Decision #1 before any code. Live checks for Session 1 remain queued in the list above for the next installer build.
+
+## Session 2 — Authenticate owner commands + unguessable approval IDs (completed 2026-06-12)
+**Status: COMPLETE — test suite green (246 passed). Live filter verification on the real Bluehost mailbox: PASSED (R1/A/B/B2/C). GUI/installer-side live verification: NOT APPLICABLE (this session touches only the headless filter/learner engine, no UI). Independent review gate: PASSED (2026-06-12, fresh-session reviewer). Committed on `calibration-security-build1`. NOT version-bumped (still 1.6.0-beta.16.2) and NOT deployed — batched for the next installer build.**
+
+**Findings closed: C1, B3, M4 (already-applied half).** Decision #1 resolved (reject-with-notice, layered gate — see PART 2). Decision #8 (M4/D10 history retention) remains OPEN — only the "already applied" reply was implemented.
+
+**What was built** (C1, B3, plus the approved fold-in of the `next_refinement_id` collision — first half of M4):
+- **C1 — command authentication.** A new gate `_command_auth_ok(msg_data, from_email, account, config)` in spam_filter.py now runs at BOTH command call sites (the S1 subject-command guard and the S2 SFID-approval guard). A command is honored only if the From-line matches an owner identity AND `_command_auth_ok` returns True via EITHER (a) **strict alignment** — the sender's From-domain appears in `utils.summarize_authentication(...)["authenticated_domains"]` (SPF/DKIM/DMARC pass + domain alignment; works for Gmail-class providers) — OR (b) **server-login** — the message entered the account's own mail server (own-host set = exact lowercased `account["imap_host"]` + `config["smtp"]["host"]`) via authenticated submission, proven by walking the server-written `Received` chain top-down and finding `with esmtpsa`/`esmtpa` at the entry hop (it stops at the entry hop; internal relays like LMTP are skipped; `with local` and external `with esmtp(s)` do NOT count). On failure (owner-looking From but auth fails) the command is NOT honored, a WARNING tagged "(S1 auth gate)" / "(S2 auth gate)" is logged, and exactly ONE notice email — subject "MailWarden — command not verified" — is sent to the account's own address. A self-loop guard (`X-MailWarden-System:1`) keeps that notice from being reprocessed.
+- **B3 + C1 predictability — unguessable IDs.** `generate_sfid` (spam_filter.py:~1087), `next_sfid` and `next_refinement_id` (learn_signals.py) changed from sequential count-based IDs (`SFID-YYYYMMDD-NNN` / `R-YYYYMMDD-NNN`, which collided and were predictable) to cryptographically random tokens (`SFID-YYYYMMDD-<hextoken>` / `R-YYYYMMDD-<hextoken>`, via `utils.random_token` = `secrets.token_hex`), regenerating on the unlikely chance of collision. The SFID reply-extraction regex was widened to `\[SFID-([A-Za-z0-9-]+)\]` so it matches both old in-flight IDs and the new tokens.
+- **M4 (first half) — "already applied".** A second reply to a resolved SFID previously said "Not Found"; `_resolved_sfid_reply(conv, sfid)` now returns an accurate message ("This was already applied." / "This was already declined." / "This request expired, so nothing was changed."), and falls through for still-awaiting requests.
+
+Files changed: `payload/MailWarden/src/spam_filter.py`, `learn_signals.py`, `utils.py`, `tests/test_fixes.py`.
+
+**Verified on the dev machine:**
+- Full pytest suite: **246 passed**. Test origin (so every diff hunk is attributable): Session 1's commit `46b5ccb` was the baseline at **219** (`test_fixes.py` = 140 functions), the working tree was clean at Session 2 start (only the untracked `payload/MailWarden/memory/`, no pre-existing uncommitted tests), and all **27** tests added since live only in `tests/test_fixes.py` (140 → 167) authored in this Session 2 — **19** in the first implementation pass (4 path-(a) auth-gate, 10 random-ID format/collision/regex, 5 resolver-message; 219 → 238) and **8** in the server-login revision (path-(b) auth-gate; 238 → 246).
+- Live end-to-end against the real Bluehost mailbox (filter run via the test venv with isolated paths):
+  - **R1 (regression):** 127/127 modern (Bluehost-era) owner-sent messages accepted via path (b), 0 false rejections. The 142 that returned False were all 2012–2020 pre-Bluehost legacy mail that never transited the current server — correct.
+  - **Phase A:** a genuine SMTP-submitted Whitelist command was HONORED (real store write, confirmation sent, no auth-gate warning).
+  - **Phase B:** a forged owner command with no Received chain was REJECTED + one notice sent.
+  - **Phase B2:** a forged command carrying a fake deep `esmtpsa` Received header below an unauthenticated entry hop was REJECTED (the top-down stop holds).
+  - **Phase C:** no notice loop (the self-loop guard skips the system mail).
+
+**NOT yet verified / NOT done:**
+1. GUI-side parity: not in scope here, but the Dashboard's own SFID approval path still returns the old "not found or not approvable from the Dashboard" wording — see follow-ups.
+2. Decision #8 (M4/D10 conversation-history retention/pruning) is not implemented — still queued for Matt.
+
+**Known follow-ups (not defects in this session):**
+- NOT version-bumped (still 1.6.0-beta.16.2 across all 5 version files) and NOT deployed — the live app runs from `~/MailWarden/src` (an older May-30 copy); this fix reaches it at the next installer build.
+- Accepted residual risk for path (b): a deliberate impersonator who holds a valid mail login on the same shared Bluehost box could submit an authenticated command.
+- Pre-existing UX gap (not in scope): subject commands written with a colon ("Whitelist: domain.com") still don't reach the store handlers — only bare-word + body forms, or the "Blacklist Address/Name/All" forms, do. Worth a future product decision.
+- Parallel surface: the Dashboard's own SFID approval path (`app/mailwarden_app/dashboard.py` ~2864-2886) still says "not found or not approvable from the Dashboard" — consider matching the new "already applied" wording later for consistency.
+
+**Next step:** Session 3 (forward-parsing safety, audit Part 4) in a fresh session — its discussion should also cover whether colon forms like 'Whitelist: domain.com' should be accepted as commands (pre-existing gap found in Session 2). Live checks for Session 1 remain queued for the next installer build.

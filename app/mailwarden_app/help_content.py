@@ -104,7 +104,14 @@ EMAIL_COMMAND_CHEAT_SHEET = (
     "  does), use the Train folder instead.\n\n"
     "You can write anything above the forwarded message — notes, context, an\n"
     "explanation. MailWarden reads the subject line, acts on it, and replies\n"
-    "on its next run (every 15 minutes by default) confirming what it did."
+    "on its next run (every 15 minutes by default) confirming what it did.\n\n"
+    "One thing that matters for every command: send it from your own email\n"
+    "account, the normal way — compose or forward and hit send like any other\n"
+    "message. MailWarden checks that a command really came from you before it\n"
+    "acts. If a command reaches your inbox another way — bounced through an\n"
+    "auto-forwarding service, a mailing list, or a \"send as\" relay that strips\n"
+    "your account's identity — MailWarden can't confirm it's you, so it won't\n"
+    "act on it and will send you a short \"command not verified\" note instead."
 )
 
 
@@ -143,6 +150,12 @@ EMAIL_COMMAND_EXAMPLES = [
      "When MailWarden let something obvious through. Forward the spam with "
      "this subject. MailWarden saves it as a training example and re-analyzes "
      "its signals to catch similar messages next time."),
+    ("A note on all commands",
+     "Whichever command you use, send it from your own email account the "
+     "normal way. MailWarden confirms a command really came from you before "
+     "acting. If it can't — usually because the message was auto-forwarded "
+     "through another service that strips your account's identity — it won't "
+     "act, and sends you a short 'command not verified' note instead."),
 ]
 
 
@@ -184,7 +197,7 @@ WHY_MAILWARDEN_IS_DIFFERENT = (
 
 HOW_IT_DECIDES = (
     "On a schedule you control — every 15 minutes by default, adjustable from 5 to 360 minutes under Dashboard → Settings — MailWarden pulls new mail and runs each message through five plain steps.\n\n"
-    "Step 1 — Your lists (instant, no Claude call needed). If the sender's exact address is on your whitelist, the email is trusted and left alone. If it's on your blacklist, or the display name matches a blacklisted name, the email is moved to Junk immediately. Your lists always win. You grow them by forwarding emails to yourself with subjects like 'Fwd: Whitelist' or 'Fwd: Blacklist All', or from Dashboard → Whitelist/Blacklist.\n\n"
+    "Step 1 — Your lists (instant, no Claude call needed). If the sender's exact address is on your whitelist, the email is trusted and left alone. If it's on your blacklist, or the display name matches a blacklisted name, the email is moved to Junk immediately. Your lists always win. You grow them by forwarding emails to yourself with subjects like 'Fwd: Whitelist' or 'Fwd: Blacklist All', or from Dashboard → Whitelist/Blacklist. When you grow your lists by email, MailWarden first confirms the command really came from you — send it from your own account the normal way; a command it can't verify is ignored (and you get a brief \"command not verified\" note).\n\n"
     "Step 2 — Domain allow list (instant, no Claude). If the sender's domain (for example, everyone at your-accountant.com) is on your whitelist, the email is trusted. Add to it via 'Fwd: Whitelist Domain'.\n\n"
     "Step 3 — Unambiguous instant blocks (instant, no Claude). A small set of clear-cut technical checks — a forged sender, a known-bad sending server, or a blatant hidden-AI-prompt attack inside the message — move mail to Junk on their own. These only fire when the tell is unmistakable, so on their own they won't cause false positives.\n\n"
     "Step 4 — Claude reads it. Everything that isn't handled above goes to Claude. Claude reads the headers and the full message body and reasons about what the email is actually trying to do — not just whether it matches a pattern. It sees when a 'shipping notification' isn't really from UPS, when 'your account is suspended' is a phish, when a friendly note is a prelude to a scam paragraph buried further down. You get back a verdict, a confidence score between 0 and 1, and a short sentence explaining why. This is the step your provider's filter can't match. It pattern-matches. Claude actually reads.\n\n"
@@ -209,7 +222,7 @@ TRAIN_YOUR_FILTER = (
     "2. Wait for the next run (up to 15 minutes by default). If the filter catches it, it'll disappear into Junk on its own.\n\n"
     "3. If it's still there after a run has gone by, it slipped past both the pre-classifier and the AI. That's a real learning opportunity.\n\n"
     "4. Drag the spam email into the \"Train MailWarden\" folder in that account. MailWarden creates this folder for you automatically the first time you save an account, so it should already be visible in your mail client's folder list. (If you don't see it, restart your mail client — IMAP folder refresh is on the client, not on MailWarden.) Dragging works in every mail client with IMAP — AOL webmail, Apple Mail, iOS Mail, Gmail web, Outlook. No typing, no forwarding, no outbound SMTP. It doesn't matter whether you've already opened or read the message — MailWarden processes every message you put in this folder, read or unread, because dropping it here is a deliberate training signal. The email is deleted from the Train folder as soon as MailWarden has analyzed it — the folder stays clean automatically.\n\n"
-    "5. On the filter's next run (within 15 minutes by default) MailWarden will analyze the example and email you a refinement proposal: a one-sentence description of the pattern it learned, a short rationale, and what the pattern doesn't cover. Reply YES to apply, NO to reject, or use CONTEXT: / NARROW: to steer Claude's analysis with your own reasoning (e.g., \"CONTEXT: the 'reserved until 11:59 PM' pressure gave it away\"). The email walks you through all the reply options.\n\n"
+    "5. On the filter's next run (within 15 minutes by default) MailWarden will analyze the example and email you a refinement proposal: a one-sentence description of the pattern it learned, a short rationale, and what the pattern doesn't cover. Reply YES to apply, NO to reject, or use CONTEXT: / NARROW: to steer Claude's analysis with your own reasoning (e.g., \"CONTEXT: the 'reserved until 11:59 PM' pressure gave it away\"). The email walks you through all the reply options. Just reply to MailWarden's email normally — your YES or NO needs to come from your own account so MailWarden can confirm the answer is really from you; if it can't verify the reply, it won't apply the change and will let you know.\n\n"
     "6. You can also approve, reject, or withdraw any pending proposal from Dashboard → Signal History if MailWarden is open. Email and Dashboard are kept in sync.\n\n"
     "Catch spam the same way? Drag more examples to Train MailWarden. MailWarden will stop seeing it as ambiguous and start catching it on the pre-classifier (which is free) instead of the AI.\n\n"
     "False positives — when the filter overreaches. If a real email ends up in Junk by mistake, forward it back with the subject 'Fwd: False Positive' (or just 'NOT SPAM'). MailWarden analyzes why it mis-classified, proposes a refinement to its signals, and shows the proposed change on the Signal History tab. You approve or reject the change. Same run-based loop, same conversation.\n\n"
@@ -507,7 +520,12 @@ CHECK_AND_TEACH_HELP = (
     "rather ask than wrongly junk a legitimate message.\n"
     "- Learned rules are strong guidance to Claude; your allow/block lists are "
     "absolute. You can limit any learned rule to specific accounts in Signal "
-    "History."
+    "History.\n"
+    "- The same \"is this really who it says\" check guards your commands: "
+    "MailWarden only acts on an email command or a YES/NO approval reply when "
+    "it can confirm the message genuinely came from your account. Send commands "
+    "from your own email the normal way; one it can't verify is ignored, with a "
+    "short \"command not verified\" note back to you."
 )
 
 

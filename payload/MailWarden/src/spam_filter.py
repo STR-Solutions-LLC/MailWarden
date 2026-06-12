@@ -32,6 +32,7 @@ from utils import (
     parse_from_address, extract_domain,
     check_header_signals, _extract_sending_ip,
     summarize_authentication, host_spam_verdict,
+    random_token,
 )
 from learn_signals import save_signals
 
@@ -1084,13 +1085,18 @@ def persist_pending_merge(pending: dict):
 
 
 def generate_sfid(pending: dict) -> str:
-    """Generate next SFID-YYYYMMDD-NNN conversation ID."""
+    """Generate an unguessable SFID-YYYYMMDD-<hextoken> conversation ID.
+
+    Uses a cryptographically random token (not a sequence) so IDs can neither
+    collide nor be predicted/forged. Regenerates on the (astronomically
+    unlikely) chance of colliding with an existing conversation id.
+    """
     today = datetime.now().strftime("%Y%m%d")
-    prefix = f"SFID-{today}-"
-    existing = [c["id"] for c in pending.get("conversations", [])
-                if c.get("id", "").startswith(prefix)]
-    seq = len(existing) + 1
-    return f"{prefix}{seq:03d}"
+    existing = {c.get("id", "") for c in pending.get("conversations", [])}
+    while True:
+        sfid = f"SFID-{today}-{random_token()}"
+        if sfid not in existing:
+            return sfid
 
 
 def send_email(config: dict, subject: str, body: str, logger: logging.Logger,
@@ -1718,6 +1724,164 @@ def _command_sender_is_owner(from_email: str, account: dict,
     if config is not None:
         return sender in _owner_identities(config)
     return False
+
+
+def _command_auth_ok(msg_data: dict, from_email: str,
+                     account: dict, config: dict) -> bool:
+    """S1/S2 auth gate: confirm an owner-LOOKING command/approval reply really
+    came from the owner. Returns True if EITHER of two layered paths passes.
+
+    Why two paths? The original strict path (a) requires SPF/DKIM/DMARC pass +
+    alignment, proven by ``summarize_authentication``. That works for
+    Gmail-class providers but is incompatible with the production mail host:
+    when the owner submits mail to their own server (Bluehost
+    box5275.bluehost.com) it is delivered locally over LMTP and NEVER carries
+    Authentication-Results, so path (a) alone would reject 100% of genuine
+    owner commands. Path (b) instead trusts the server-written Received chain:
+    if the mail entered the account's OWN mail server via authenticated
+    submission (the sender logged in with the account server's credentials),
+    that is proof of the owner — equivalent assurance to a passing DMARC.
+
+    Security reasoning for path (b):
+    * Only the TOP-DOWN server-written Received chain is trusted. The receiving
+      server prepends its own Received header to the top; everything BELOW the
+      entry hop is attacker-controllable text, so the walk stops at the entry
+      hop and never scans deeper. A forged ``with esmtpsa`` line planted lower
+      in the chain is therefore ignored.
+    * Own-host membership is EXACT string equality, never domain-suffix
+      matching. Suffix matching ("ends with .bluehost.com") would let ANY other
+      box on the same shared provider relay a forgery into the account — exact
+      equality limits trust to this account's specific IMAP/SMTP host.
+    * ``with local`` (same-box script/PHP submission) does NOT count: any
+      co-tenant script on a shared box could emit it without authenticating.
+    * Accepted residual risk: a deliberate impersonator who holds a valid mail
+      login ON THE SAME shared box could authenticate and forge the owner's
+      From. Matt accepted this tradeoff.
+    """
+    fe = (from_email or "")
+    from_dom = fe.split("@", 1)[1].strip().lower().rstrip(".") if "@" in fe else ""
+    if not from_dom:
+        return False
+
+    # --- Path (a): strict SPF/DKIM/DMARC pass + alignment (Gmail-class). ---
+    # A domain lands in ``authenticated_domains`` ONLY when the relevant check
+    # actually passed AND aligned, so a spoofer cannot put the owner's domain
+    # there. (For providers where MX host != IMAP host, e.g. Gmail, path (b)
+    # bails out and this is the layer that authenticates.)
+    auth = summarize_authentication({
+        "Authentication-Results": msg_data.get("auth_results", ""),
+        "ARC-Authentication-Results": msg_data.get("arc_auth_results", ""),
+        "Received-SPF": msg_data.get("received_spf", ""),
+        "DKIM-Signature": msg_data.get("dkim_signature", ""),
+    }, from_domain=from_dom)
+    if from_dom in set(auth.get("authenticated_domains", [])):
+        return True
+
+    # --- Path (b): authenticated submission into the account's OWN server. ---
+    # Build the own-host set: lowercased EXACT hostnames of this account's own
+    # mail infrastructure — the account's IMAP host plus the configured SMTP
+    # host. EXACT equality only (see docstring).
+    own_hosts = set()
+    imap_host = (account.get("imap_host", "") or "").strip().lower()
+    if imap_host:
+        own_hosts.add(imap_host)
+    smtp_host = ((config.get("smtp", {}) or {}).get("host", "") or "").strip().lower()
+    if smtp_host:
+        own_hosts.add(smtp_host)
+    if not own_hosts:
+        return False
+
+    mime_msg = msg_data.get("_mime_msg")
+    if mime_msg is None:
+        return False
+    try:
+        received = mime_msg.get_all("Received")
+    except Exception:
+        received = None
+    if not received:
+        # No server-written Received chain at all — e.g. an IMAP-APPENDed
+        # forgery. Cannot prove server-login submission.
+        return False
+
+    # Walk top-down (most recent hop first = the hop the receiving server
+    # wrote). Stop at the entry hop: below it is attacker-controllable.
+    for hop in received:
+        hop = str(hop)
+        by_m = re.search(r'\bby\s+([^\s;()]+)', hop, re.IGNORECASE)
+        by_host = by_m.group(1).strip().lower() if by_m else ""
+        from_m = re.search(r'\bfrom\s+([^\s;()]+)', hop, re.IGNORECASE)
+        from_host = from_m.group(1).strip().lower() if from_m else ""
+
+        if by_host not in own_hosts:
+            # The hop was written by a host that is NOT our own server. This is
+            # the entry hop (or a foreign chain) — stop. Covers Gmail-class
+            # providers where MX host != IMAP host (they fall back to path (a),
+            # which already ran above) and any wholly foreign chain.
+            return False
+
+        if re.search(r'\bwith\s+esmtps?a\b', hop, re.IGNORECASE):
+            # RFC 3848 ESMTPA / ESMTPSA (Exim lowercase esmtpsa): the mail was
+            # submitted to our own server by a client that AUTHENTICATED with
+            # the account server's credentials. Proof of the owner.
+            return True
+
+        if from_host in own_hosts:
+            # Pure internal relay (e.g. Bluehost's LMTP delivery hop:
+            # "from box5275... by box5275... with LMTP"). Not the entry hop;
+            # keep walking down to the hop that actually accepted the mail.
+            continue
+
+        # Our server is the `by` host, the `from` is external, and the hop is
+        # NOT authenticated submission: this is the entry hop and it was an
+        # unauthenticated handoff — external MX delivery (with esmtp/esmtps) or
+        # same-box script mail (with local). Neither proves the owner. Stop.
+        return False
+
+    # Received chain exhausted without finding an authenticated entry hop.
+    return False
+
+
+def _notify_unverified_command(config, account, logger):
+    """Tell the owner that an owner-looking command failed authentication and
+    was NOT acted on. Delivered to the owner's own inbox (account['username']);
+    send_email stamps X-MailWarden-System:1 so the self-loop guard skips it on
+    re-ingestion (no loop)."""
+    send_email(config,
+        "MailWarden — command not verified",
+        "We received a command (or approval reply) that appeared to come from "
+        "your address, but couldn't confirm it was actually sent by you, so we "
+        "did not act on it. If this was you, please resend it directly from "
+        "your email (not forwarded through another service).",
+        logger,
+        to_addr=account.get("username", ""))
+
+
+def _resolved_sfid_reply(conv, sfid):
+    """Build the (subject, body) reply for an [SFID-...] reply that targets a
+    request which is unknown or already resolved.
+
+    Returns ``None`` when the conversation is still ``awaiting_reply`` (the
+    caller falls through to the normal expiry check + reply handling).
+
+    Records carry status ∈ {awaiting_reply, approved, rejected, expired} and
+    resolution ∈ {None, approved, rejected}.
+    """
+    if conv is None:
+        return (f"Re: [{sfid}] — Not Found",
+                "We couldn't find that request. It may have been very old or "
+                "already cleared.")
+    if conv.get("status") == "awaiting_reply":
+        return None
+    st, res = conv.get("status"), conv.get("resolution")
+    if st == "approved" or res == "approved":
+        body = "This was already applied."
+    elif st == "rejected" or res == "rejected":
+        body = "This was already declined."
+    elif st == "expired":
+        body = "This request expired, so nothing was changed."
+    else:
+        body = "This request was already handled."
+    return (f"Re: [{sfid}]", body)
 
 
 def classify_reply(text: str) -> str:
@@ -3536,6 +3700,18 @@ def run_filter(force: bool = False):
                             f"{msg_data.get('from_email', '')!r} is not the account "
                             f"owner {account.get('username', '')!r} (S1).")
                         command = None
+                    elif command and not _command_auth_ok(
+                            msg_data, msg_data.get("from_email", ""),
+                            account, config):
+                        # Owner-LOOKING sender, but the From-domain is not
+                        # cryptographically authenticated — treat as a spoof or
+                        # alignment-breaking forward. Never honor; notify the owner.
+                        logger.warning(
+                            "  Ignoring '%s' — owner-looking sender %r failed "
+                            "authentication (S1 auth gate).",
+                            command, msg_data.get("from_email", ""))
+                        _notify_unverified_command(config, account, logger)
+                        command = None
 
                     if command:
                         # Mark the message \\Seen so a subsequent filter run
@@ -4438,7 +4614,7 @@ Conversation ID: {sfid}
                         continue
 
                     # --- Detection branch 2: Reply to analysis email ---
-                    sfid_match = re.search(r'\[SFID-(\d{8}-\d{3})\]', msg_data.get("subject", ""))
+                    sfid_match = re.search(r'\[SFID-([A-Za-z0-9-]+)\]', msg_data.get("subject", ""))
                     if sfid_match and not _command_sender_is_owner(
                             msg_data.get("from_email", ""), account, config):
                         # S2 (security): only the account owner may approve/reject a
@@ -4449,6 +4625,18 @@ Conversation ID: {sfid}
                             f"  Ignoring [SFID] approval reply — sender "
                             f"{msg_data.get('from_email', '')!r} is not the account "
                             f"owner {account.get('username', '')!r} (S2).")
+                        sfid_match = None
+                    elif sfid_match and not _command_auth_ok(
+                            msg_data, msg_data.get("from_email", ""),
+                            account, config):
+                        # Owner-LOOKING approval reply, but the From-domain is not
+                        # cryptographically authenticated — treat as a spoof or
+                        # alignment-breaking forward. Never honor; notify the owner.
+                        logger.warning(
+                            "  Ignoring [SFID] approval reply — owner-looking sender "
+                            "%r failed authentication (S2 auth gate).",
+                            msg_data.get("from_email", ""))
+                        _notify_unverified_command(config, account, logger)
                         sfid_match = None
                     if sfid_match:
                         sfid = f"SFID-{sfid_match.group(1)}"
@@ -4488,10 +4676,12 @@ Conversation ID: {sfid}
                                 conv = c
                                 break
 
-                        if conv is None or conv.get("status") not in ("awaiting_reply",):
+                        resolved_reply = _resolved_sfid_reply(conv, sfid)
+                        if resolved_reply is not None:
+                            resolved_subject, resolved_body = resolved_reply
                             send_email(config,
-                                f"Re: [{sfid}] — Not Found",
-                                "This conversation ID was not found or has already been resolved.",
+                                resolved_subject,
+                                resolved_body,
                                 logger,
                                 to_addr=account.get("username", ""))
                             account_processed.add(msg_id)

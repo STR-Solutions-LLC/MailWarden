@@ -1529,3 +1529,338 @@ def test_fix_c_learner_send_sets_reply_to(monkeypatch):
     assert "msg_str" in captured
     parsed = _email_module.message_from_string(captured["msg_str"])
     assert parsed["Reply-To"] == "commerce@example.com"
+
+
+# ---------------------------------------------------------------------------
+# C1 (auth gate) — an owner-LOOKING command/approval is honored ONLY when the
+# From-domain is cryptographically authenticated (SPF/DKIM/DMARC pass + strict
+# alignment). A spoof (no/failing auth) or an alignment-breaking forward fails.
+# ---------------------------------------------------------------------------
+
+# Realistic Gmail-style Authentication-Results aligned to the owner's domain.
+OWNER_AR = (
+    "mx.google.com; "
+    "dkim=pass header.i=@firstchairmarketing.com header.s=sel header.b=AbCdEf; "
+    "spf=pass (google.com: domain of bounce@firstchairmarketing.com designates "
+    "1.2.3.4 as permitted sender) smtp.mailfrom=bounce@firstchairmarketing.com; "
+    "dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=firstchairmarketing.com"
+)
+
+# Auth that passes only for a DIFFERENT domain than the From-domain.
+OTHER_AR = (
+    "mx.google.com; "
+    "dkim=pass header.i=@elsewhere.example header.s=sel header.b=AbCdEf; "
+    "spf=pass smtp.mailfrom=bounce@elsewhere.example; "
+    "dmarc=pass (p=REJECT) header.from=elsewhere.example"
+)
+
+
+# Minimal account/config whose hosts deliberately do NOT match anything in
+# these path-(a) tests, so path (b) bails out (no own-host match, no
+# _mime_msg) and ONLY the strict SPF/DKIM/DMARC alignment path is exercised.
+NO_MATCH_ACCT = {"imap_host": "imap.example.com"}
+NO_MATCH_CONFIG = {"smtp": {"host": "smtp.example.com"}}
+
+
+def test_authgate_true_for_aligned_authenticated_from():
+    md = {"auth_results": OWNER_AR}
+    assert spam_filter._command_auth_ok(
+        md, "matt@firstchairmarketing.com",
+        NO_MATCH_ACCT, NO_MATCH_CONFIG) is True
+
+
+def test_authgate_false_for_missing_auth_headers_spoof():
+    # No Authentication-Results at all — a forged From with nothing to back it.
+    md = {"auth_results": "", "arc_auth_results": "",
+          "received_spf": "", "dkim_signature": ""}
+    assert spam_filter._command_auth_ok(
+        md, "matt@firstchairmarketing.com",
+        NO_MATCH_ACCT, NO_MATCH_CONFIG) is False
+
+
+def test_authgate_false_when_auth_aligns_to_different_domain():
+    # Auth passes, but for elsewhere.example — NOT the From-domain. Proves the
+    # gate checks alignment, not a bare spf=pass.
+    md = {"auth_results": OTHER_AR}
+    assert spam_filter._command_auth_ok(
+        md, "matt@firstchairmarketing.com",
+        NO_MATCH_ACCT, NO_MATCH_CONFIG) is False
+
+
+def test_authgate_false_for_empty_from_email():
+    md = {"auth_results": OWNER_AR}
+    assert spam_filter._command_auth_ok(
+        md, "", NO_MATCH_ACCT, NO_MATCH_CONFIG) is False
+
+
+# ---------------------------------------------------------------------------
+# C1 path (b) — authenticated submission into the account's OWN mail server,
+# proven by the server-written Received chain. Own host = box5275.bluehost.com
+# (the live Bluehost host). These messages carry NO Authentication-Results, so
+# path (a) cannot fire — only path (b) can return True.
+# ---------------------------------------------------------------------------
+
+import email as _email  # noqa: E402
+
+# Own-host account/config for path (b) tests.
+BH_ACCT = {"imap_host": "box5275.bluehost.com"}
+BH_CONFIG = {"smtp": {"host": "box5275.bluehost.com"}}
+
+
+def _md_from_received(received_block: str) -> dict:
+    """Build a msg_data dict with a real parsed _mime_msg from a raw header
+    block. NO Authentication-Results, so path (a) is dead and only path (b)
+    can pass."""
+    raw = received_block.rstrip("\n") + "\n\nbody\n"
+    msg = _email.message_from_string(raw)
+    return {
+        "auth_results": "", "arc_auth_results": "",
+        "received_spf": "", "dkim_signature": "",
+        "_mime_msg": msg,
+    }
+
+
+def test_authgate_pathb_genuine_bluehost_chain_true():
+    # Verbatim genuine-mail evidence (UID 43023): hop 1 is the internal LMTP
+    # self-relay (skip), hop 2 is the authenticated submission (esmtpsa).
+    received = (
+        "Received: from box5275.bluehost.com by box5275.bluehost.com with LMTP "
+        "id abc123 for <matt@nthmonkey.com>\n"
+        "Received: from [72.80.205.252] (port=56467 helo=[192.168.1.202]) "
+        "by box5275.bluehost.com with esmtpsa (TLS1.3) tls "
+        "TLS_AES_256_GCM_SHA384 (Exim 4.99.2) "
+        "(envelope-from <matt@nthmonkey.com>) id def456 for matt@nthmonkey.com"
+    )
+    md = _md_from_received(received)
+    assert spam_filter._command_auth_ok(
+        md, "matt@nthmonkey.com", BH_ACCT, BH_CONFIG) is True
+
+
+def test_authgate_pathb_webmail_self_hop_esmtpsa_true():
+    # cPanel webmail: a single self-hop (from box5275 by box5275 with esmtpsa).
+    # The esmtpsa check fires before the self-relay continue, so it's accepted.
+    received = (
+        "Received: from box5275.bluehost.com ([127.0.0.1]) "
+        "by box5275.bluehost.com with esmtpsa (TLS1.3) id ghi789 "
+        "for matt@nthmonkey.com"
+    )
+    md = _md_from_received(received)
+    assert spam_filter._command_auth_ok(
+        md, "matt@nthmonkey.com", BH_ACCT, BH_CONFIG) is True
+
+
+def test_authgate_pathb_forged_external_entry_esmtp_false():
+    # External MX delivery: entry hop is "from mail.attacker.example by
+    # box5275 with esmtp" — unauthenticated handoff. Rejected.
+    received = (
+        "Received: from mail.attacker.example "
+        "by box5275.bluehost.com with esmtp id jkl012 for matt@nthmonkey.com"
+    )
+    md = _md_from_received(received)
+    assert spam_filter._command_auth_ok(
+        md, "matt@nthmonkey.com", BH_ACCT, BH_CONFIG) is False
+
+
+def test_authgate_pathb_fake_deep_esmtpsa_below_entry_false():
+    # Attacker plants a forged "with esmtpsa by box5275" Received BELOW the real
+    # unauthenticated entry hop. The walk stops at the entry hop (top-down) and
+    # never reaches the forged line. Rejected. Proves the top-down stop.
+    received = (
+        "Received: from mail.attacker.example "
+        "by box5275.bluehost.com with esmtp id mno345 for matt@nthmonkey.com\n"
+        "Received: from [10.0.0.9] "
+        "by box5275.bluehost.com with esmtpsa id pqr678 for matt@nthmonkey.com"
+    )
+    md = _md_from_received(received)
+    assert spam_filter._command_auth_ok(
+        md, "matt@nthmonkey.com", BH_ACCT, BH_CONFIG) is False
+
+
+def test_authgate_pathb_with_local_entry_false():
+    # Same-box script/PHP submission (with local) — any co-tenant could emit
+    # this without authenticating. Rejected.
+    received = (
+        "Received: from box5275.bluehost.com "
+        "by box5275.bluehost.com with local id stu901 for matt@nthmonkey.com"
+    )
+    md = _md_from_received(received)
+    assert spam_filter._command_auth_ok(
+        md, "matt@nthmonkey.com", BH_ACCT, BH_CONFIG) is False
+
+
+def test_authgate_pathb_no_received_headers_false():
+    # IMAP-APPENDed forgery: no server-written Received chain at all. Rejected.
+    msg = _email.message_from_string("Subject: hi\n\nbody\n")
+    md = {"auth_results": "", "arc_auth_results": "",
+          "received_spf": "", "dkim_signature": "", "_mime_msg": msg}
+    assert spam_filter._command_auth_ok(
+        md, "matt@nthmonkey.com", BH_ACCT, BH_CONFIG) is False
+
+
+def test_authgate_pathb_different_by_host_esmtpsa_false():
+    # Topmost `by` is a different host (mx.google.com), not our own server.
+    # Path (b) bails at the first hop. With no aligned stamps either, the gate
+    # is False overall — proves path (b) does not trust foreign servers.
+    received = (
+        "Received: from [10.0.0.9] "
+        "by mx.google.com with esmtpsa id vwx234 for matt@nthmonkey.com"
+    )
+    md = _md_from_received(received)
+    assert spam_filter._command_auth_ok(
+        md, "matt@nthmonkey.com", BH_ACCT, BH_CONFIG) is False
+
+
+def test_authgate_patha_still_true_with_foreign_received_chain():
+    # Layering proof: aligned stamps alone (path a) authenticate even when the
+    # Received chain is foreign / non-own-host. From-domain matches OWNER_AR.
+    received = (
+        "Received: from mail-sor.google.com "
+        "by mx.google.com with esmtps id yz567 "
+        "for matt@firstchairmarketing.com"
+    )
+    raw = received + "\n\nbody\n"
+    msg = _email.message_from_string(raw)
+    md = {"auth_results": OWNER_AR, "arc_auth_results": "",
+          "received_spf": "", "dkim_signature": "", "_mime_msg": msg}
+    # Own-host set is box5275; the chain's `by` is mx.google.com, so path (b)
+    # returns False — but path (a) (aligned OWNER_AR) makes the gate True.
+    assert spam_filter._command_auth_ok(
+        md, "matt@firstchairmarketing.com", BH_ACCT, BH_CONFIG) is True
+
+
+# ---------------------------------------------------------------------------
+# B3 + C1 (predictability) — SFIDs / R-IDs are unguessable random tokens that
+# cannot collide. Both SFID generators emit a byte-identical format so one
+# resolver regex matches both.
+# ---------------------------------------------------------------------------
+
+import re as _re  # noqa: E402
+
+_SFID_RE = _re.compile(r"^SFID-\d{8}-[0-9a-f]+$")
+_RID_RE = _re.compile(r"^R-\d{8}-[0-9a-f]+$")
+
+
+def test_b3_generate_sfid_matches_random_format():
+    assert _SFID_RE.match(spam_filter.generate_sfid({"conversations": []}))
+
+
+def test_b3_next_sfid_matches_random_format():
+    assert _SFID_RE.match(learn_signals.next_sfid({"conversations": []}))
+
+
+def test_b3_both_sfid_generators_identical_format():
+    a = spam_filter.generate_sfid({"conversations": []})
+    b = learn_signals.next_sfid({"conversations": []})
+    # Same prefix shape and token alphabet (the resolver regex must match both).
+    assert _SFID_RE.match(a) and _SFID_RE.match(b)
+
+
+def test_b3_generate_sfid_no_dupes_over_1000():
+    seen = set()
+    for _ in range(1000):
+        sfid = spam_filter.generate_sfid({"conversations": []})
+        assert sfid not in seen
+        seen.add(sfid)
+    assert len(seen) == 1000
+
+
+def test_b3_next_sfid_no_dupes_over_1000():
+    seen = set()
+    for _ in range(1000):
+        sfid = learn_signals.next_sfid({"conversations": []})
+        assert sfid not in seen
+        seen.add(sfid)
+    assert len(seen) == 1000
+
+
+def test_b3_generate_sfid_regenerates_on_collision(monkeypatch):
+    # Force the token source to return a colliding value once, then a fresh one.
+    # spam_filter binds random_token at import (`from utils import random_token`),
+    # so patch the name in the spam_filter module namespace.
+    today = _datetime_now_strftime()
+    colliding = f"SFID-{today}-deadbeef"
+    tokens = iter(["deadbeef", "cafef00d"])
+    monkeypatch.setattr(spam_filter, "random_token", lambda *a, **k: next(tokens))
+    out = spam_filter.generate_sfid({"conversations": [{"id": colliding}]})
+    assert out == f"SFID-{today}-cafef00d"
+    assert out != colliding
+
+
+def test_b3_next_sfid_regenerates_on_collision(monkeypatch):
+    # learn_signals.next_sfid re-imports random_token locally at call time, so
+    # patch the source symbol on the utils module.
+    today = _datetime_now_strftime()
+    colliding = f"SFID-{today}-deadbeef"
+    tokens = iter(["deadbeef", "cafef00d"])
+    monkeypatch.setattr(utils, "random_token", lambda *a, **k: next(tokens))
+    out = learn_signals.next_sfid({"conversations": [{"id": colliding}]})
+    assert out == f"SFID-{today}-cafef00d"
+    assert out != colliding
+
+
+def test_b3_next_refinement_id_matches_random_format(monkeypatch):
+    # Isolate from on-disk pending state.
+    monkeypatch.setattr(learn_signals, "load_pending_signals",
+                        lambda *a, **k: {"conversations": []})
+    assert _RID_RE.match(learn_signals.next_refinement_id({"ai_refinements": []}))
+
+
+def _datetime_now_strftime():
+    from datetime import datetime as _dt
+    return _dt.now().strftime("%Y%m%d")
+
+
+# ---------------------------------------------------------------------------
+# Backward-compat: the permissive resolver regex captures BOTH an old-format
+# in-flight ID and a new random-token ID.
+# ---------------------------------------------------------------------------
+
+_RESOLVER_RE = _re.compile(r"\[SFID-([A-Za-z0-9-]+)\]")
+
+
+def test_b3_resolver_regex_captures_old_format():
+    m = _RESOLVER_RE.search("Re: [SFID-20260601-001] approval")
+    assert m and m.group(1) == "20260601-001"
+
+
+def test_b3_resolver_regex_captures_new_token():
+    m = _RESOLVER_RE.search("Re: [SFID-20260612-cafef00d] approval")
+    assert m and m.group(1) == "20260612-cafef00d"
+
+
+# ---------------------------------------------------------------------------
+# Change 3 — an [SFID-...] reply to an already-resolved (or unknown) request
+# gets an accurate message; an awaiting_reply request falls through (None).
+# ---------------------------------------------------------------------------
+
+def test_resolved_reply_approved_says_already_applied():
+    subject, body = spam_filter._resolved_sfid_reply(
+        {"status": "approved", "resolution": "approved"}, "SFID-X")
+    assert subject == "Re: [SFID-X]"
+    assert body == "This was already applied."
+
+
+def test_resolved_reply_rejected_says_already_declined():
+    subject, body = spam_filter._resolved_sfid_reply(
+        {"status": "rejected", "resolution": "rejected"}, "SFID-X")
+    assert subject == "Re: [SFID-X]"
+    assert body == "This was already declined."
+
+
+def test_resolved_reply_expired_says_expired_copy():
+    subject, body = spam_filter._resolved_sfid_reply(
+        {"status": "expired", "resolution": None}, "SFID-X")
+    assert subject == "Re: [SFID-X]"
+    assert body == "This request expired, so nothing was changed."
+
+
+def test_resolved_reply_none_conv_says_not_found():
+    subject, body = spam_filter._resolved_sfid_reply(None, "SFID-X")
+    assert subject == "Re: [SFID-X] — Not Found"
+    assert body == ("We couldn't find that request. It may have been very old "
+                    "or already cleared.")
+
+
+def test_resolved_reply_awaiting_falls_through():
+    assert spam_filter._resolved_sfid_reply(
+        {"status": "awaiting_reply", "resolution": None}, "SFID-X") is None

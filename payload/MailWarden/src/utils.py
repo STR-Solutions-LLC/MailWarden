@@ -9,7 +9,13 @@ import email.header
 import email.policy
 import html
 import re
+import secrets
 import smtplib
+
+
+def random_token(nbytes: int = 6) -> str:
+    """Cryptographically random hex token (default 12 hex chars / 48 bits)."""
+    return secrets.token_hex(nbytes)
 
 
 def smtp_login(smtp_config: dict):
