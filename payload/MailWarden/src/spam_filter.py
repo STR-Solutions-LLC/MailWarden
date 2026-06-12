@@ -26,6 +26,8 @@ from pathlib import Path
 
 import anthropic
 
+import file_lock
+
 from utils import (
     parse_from_address, extract_domain,
     check_header_signals, _extract_sending_ip,
@@ -492,8 +494,6 @@ def add_blocklist_entry_local(value: str, kind: str, scope, logger) -> bool:
     if not v:
         return False
 
-    bl = load_blacklist(logger)
-
     def _entry_value(item) -> str:
         raw = item.get("value") if isinstance(item, dict) else item
         if not isinstance(raw, str):
@@ -501,15 +501,19 @@ def add_blocklist_entry_local(value: str, kind: str, scope, logger) -> bool:
         s = raw.strip().lower()
         return s.lstrip("@") if field == "domains" else s
 
-    items = bl.setdefault(field, [])
-    for i, item in enumerate(items):
-        if _entry_value(item) == v:
-            items[i] = {"value": v, "scope": scope}
-            save_blacklist(bl)
-            return True
-    items.append({"value": v, "scope": scope})
-    save_blacklist(bl)
-    return True
+    # Locked read-modify-write so a Dashboard list edit or a concurrent command
+    # handler can't lose this scoped block entry (G3/R5).
+    with file_lock.locked(BLACKLIST_PATH):
+        bl = load_blacklist(logger)
+        items = bl.setdefault(field, [])
+        for i, item in enumerate(items):
+            if _entry_value(item) == v:
+                items[i] = {"value": v, "scope": scope}
+                save_blacklist(bl)
+                return True
+        items.append({"value": v, "scope": scope})
+        save_blacklist(bl)
+        return True
 
 
 def save_whitelist(data: dict):
@@ -579,9 +583,16 @@ def detect_conflicts(whitelist: dict, blacklist: dict, logger: logging.Logger) -
 
 
 def append_decision(entry: str):
+    # spam_filter is the only writer of decisions.log, but a single filter run
+    # processes accounts/messages in sequence and a slow run can overlap the
+    # next launchd wake (R3); hold the lock across the append so two appends can
+    # never interleave and merge two records (D5). Readers (daily_report) parse
+    # the file unlocked — atomic os.replace isn't used here (append-only), so the
+    # lock is what guarantees whole-record writes.
     DECISIONS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(DECISIONS_LOG_PATH, "a") as f:
-        f.write(entry)
+    with file_lock.locked(DECISIONS_LOG_PATH):
+        with open(DECISIONS_LOG_PATH, "a") as f:
+            f.write(entry)
 
 
 def load_token_usage() -> dict:
@@ -632,9 +643,41 @@ def get_model_pricing(model: str) -> tuple:
     return (3.00, 15.00)
 
 
+def new_token_delta() -> dict:
+    """Create an empty token-usage delta accumulator (audit L5/R4/D2).
+
+    The filter mutates the in-memory token_usage dict for end-of-run logging as
+    before, but it ALSO records only the amounts IT added into this delta. The
+    FILE is updated solely via persist_token_delta, which re-reads the file
+    under lock and ADDS the delta — so concurrent learner / daily-report writes
+    are never clobbered by a blind end-of-run save.
+
+    ``by_date`` maps a YYYY-MM-DD string to the per-day increments mirroring the
+    fields record_token_usage / record_pre_classifier_skip touch.
+    """
+    return {
+        "lifetime_input_tokens": 0,
+        "lifetime_output_tokens": 0,
+        "lifetime_api_calls": 0,
+        "lifetime_api_calls_skipped": 0,
+        "by_date": {},
+    }
+
+
+def _delta_day(delta: dict, date_str: str) -> dict:
+    return delta["by_date"].setdefault(date_str, {
+        "input_tokens": 0, "output_tokens": 0, "api_calls": 0,
+        "api_calls_skipped_by_pre_classifier": 0, "estimated_cost_usd": 0.0,
+    })
+
+
 def record_token_usage(usage_data: dict, input_tokens: int, output_tokens: int,
-                       model: str = "claude-haiku-4-5-20251001"):
-    """Record token usage for the current API call into the daily record."""
+                       model: str = "claude-haiku-4-5-20251001",
+                       delta: dict | None = None):
+    """Record token usage for the current API call into the daily record.
+
+    When ``delta`` is supplied, the same increments are accumulated there for a
+    later locked merge onto the file (audit L5/R4/D2)."""
     today = datetime.now().strftime("%Y-%m-%d")
     in_rate, out_rate = get_model_pricing(model)
     cost = (input_tokens / 1_000_000) * in_rate + (output_tokens / 1_000_000) * out_rate
@@ -669,9 +712,22 @@ def record_token_usage(usage_data: dict, input_tokens: int, output_tokens: int,
 
     usage_data["daily_records"] = daily
 
+    if delta is not None:
+        delta["lifetime_input_tokens"] += input_tokens
+        delta["lifetime_output_tokens"] += output_tokens
+        delta["lifetime_api_calls"] += 1
+        dd = _delta_day(delta, today)
+        dd["input_tokens"] += input_tokens
+        dd["output_tokens"] += output_tokens
+        dd["api_calls"] += 1
+        dd["estimated_cost_usd"] += cost
 
-def record_pre_classifier_skip(usage_data: dict):
-    """Increment the 'skipped by pre-classifier' counter for today."""
+
+def record_pre_classifier_skip(usage_data: dict, delta: dict | None = None):
+    """Increment the 'skipped by pre-classifier' counter for today.
+
+    When ``delta`` is supplied, the same increment is accumulated there for a
+    later locked merge onto the file (audit L5/R4/D2)."""
     today = datetime.now().strftime("%Y-%m-%d")
     daily = usage_data.get("daily_records", [])
     today_record = None
@@ -690,6 +746,95 @@ def record_pre_classifier_skip(usage_data: dict):
     today_record["api_calls_skipped_by_pre_classifier"] += 1
     usage_data["daily_records"] = daily
     usage_data["lifetime_api_calls_skipped"] = usage_data.get("lifetime_api_calls_skipped", 0) + 1
+
+    if delta is not None:
+        delta["lifetime_api_calls_skipped"] += 1
+        _delta_day(delta, today)["api_calls_skipped_by_pre_classifier"] += 1
+
+
+def persist_token_delta(usage_data: dict, delta: dict):
+    """Merge the accumulated token delta onto a FRESH token_usage.json under
+    lock, then reset the delta to zero (audit L5/R4/D2/B7).
+
+    A blind end-of-run save of the filter's in-memory dict would erase the
+    learner's and daily report's concurrent writes. Instead we re-read the file
+    inside the lock and ADD only what this filter contributed since the last
+    persist. ``usage_data`` is left untouched (it stays the live in-memory copy
+    for any end-of-run logging); only ``delta`` is consumed and reset.
+    """
+    has_change = (
+        delta["lifetime_input_tokens"] or delta["lifetime_output_tokens"]
+        or delta["lifetime_api_calls"] or delta["lifetime_api_calls_skipped"]
+        or delta["by_date"]
+    )
+    if not has_change:
+        return
+
+    with file_lock.locked(TOKEN_USAGE_PATH):
+        fresh = load_token_usage()
+        fresh["lifetime_input_tokens"] = (
+            fresh.get("lifetime_input_tokens", 0) + delta["lifetime_input_tokens"])
+        fresh["lifetime_output_tokens"] = (
+            fresh.get("lifetime_output_tokens", 0) + delta["lifetime_output_tokens"])
+        fresh["lifetime_api_calls"] = (
+            fresh.get("lifetime_api_calls", 0) + delta["lifetime_api_calls"])
+        if delta["lifetime_api_calls_skipped"]:
+            fresh["lifetime_api_calls_skipped"] = (
+                fresh.get("lifetime_api_calls_skipped", 0)
+                + delta["lifetime_api_calls_skipped"])
+
+        daily = fresh.setdefault("daily_records", [])
+        by_date = {rec.get("date"): rec for rec in daily}
+        for date_str, dd in delta["by_date"].items():
+            rec = by_date.get(date_str)
+            if rec is None:
+                rec = {
+                    "date": date_str, "input_tokens": 0, "output_tokens": 0,
+                    "api_calls": 0, "api_calls_skipped_by_pre_classifier": 0,
+                    "estimated_cost_usd": 0.0,
+                }
+                daily.append(rec)
+                by_date[date_str] = rec
+            rec["input_tokens"] = rec.get("input_tokens", 0) + dd["input_tokens"]
+            rec["output_tokens"] = rec.get("output_tokens", 0) + dd["output_tokens"]
+            rec["api_calls"] = rec.get("api_calls", 0) + dd["api_calls"]
+            rec["api_calls_skipped_by_pre_classifier"] = (
+                rec.get("api_calls_skipped_by_pre_classifier", 0)
+                + dd["api_calls_skipped_by_pre_classifier"])
+            rec["estimated_cost_usd"] = round(
+                rec.get("estimated_cost_usd", 0.0) + dd["estimated_cost_usd"], 6)
+
+        save_token_usage(fresh)
+
+    # Reset the delta so the next persist only carries new spend.
+    delta["lifetime_input_tokens"] = 0
+    delta["lifetime_output_tokens"] = 0
+    delta["lifetime_api_calls"] = 0
+    delta["lifetime_api_calls_skipped"] = 0
+    delta["by_date"] = {}
+
+
+def persist_progress(processed: dict, token_usage: dict, token_delta: dict):
+    """Flush in-progress filter state to disk (audit B7 save-as-you-go).
+
+    Called after EACH account finishes (and once more at end of run) so a
+    crash / SIGKILL mid-run no longer discards everything processed so far.
+
+    processed_ids: a BLIND save under lock is correct here. spam_filter is the
+    ONLY writer of processed_ids.json in the whole codebase, and the run-flock
+    (app_entrypoint) guarantees a single filter instance, so no other process
+    can have changed the file since this run loaded (and pruned) it at start.
+    The in-memory dict only grows, so a straight overwrite cannot lose anyone
+    else's work. The lock just serialises against a (hypothetical) future
+    second writer and keeps readers from seeing a torn file.
+
+    token_usage: a blind save would be WRONG — the learner and daily report
+    also write this file concurrently. We persist the filter's delta via the
+    locked re-read-merge in persist_token_delta instead.
+    """
+    with file_lock.locked(PROCESSED_IDS_PATH):
+        save_processed_ids(processed)
+    persist_token_delta(token_usage, token_delta)
 
 
 def load_eula_text() -> str:
@@ -729,6 +874,10 @@ def deliver_eula_if_needed(config: dict, logger: logging.Logger) -> bool:
 
     any_sent = False
     config_changed = False
+    # Track exactly which (account -> version) EULA-tracking entries THIS call
+    # set, so the save below merges ONLY those onto a fresh config (L3) instead
+    # of blind-writing the whole run-start config snapshot mid-run.
+    newly_sent: dict = {}
 
     for account in config.get("accounts", []):
         if not account.get("enabled", False):
@@ -855,6 +1004,7 @@ def deliver_eula_if_needed(config: dict, logger: logging.Logger) -> bool:
             server.quit()
 
             sent_to[acct_name] = current_version
+            newly_sent[acct_name] = current_version
             config_changed = True
             any_sent = True
             logger.info(f"[EULA] Sent v{current_version} to {acct_name} ({username})")
@@ -862,8 +1012,19 @@ def deliver_eula_if_needed(config: dict, logger: logging.Logger) -> bool:
             logger.error(f"[EULA] Failed to send to {acct_name} ({username}): {e}")
 
     if config_changed:
+        # L3: do NOT blind-write the whole run-start config snapshot (that would
+        # revert a Dashboard settings/account/API-key change saved during this
+        # run). Re-read the live config under lock and set ONLY the EULA tracking
+        # entries this call recorded, then save. The in-memory `config` already
+        # carries these via `sent_to`, so callers reading config.eula stay
+        # consistent.
         try:
-            save_config_atomic(config, CONFIG_PATH)
+            with file_lock.locked(CONFIG_PATH):
+                fresh = load_config()
+                fresh_sent = fresh.setdefault("eula", {}).setdefault(
+                    "sent_to_accounts", {})
+                fresh_sent.update(newly_sent)
+                save_config_atomic(fresh, CONFIG_PATH)
         except Exception as e:
             logger.error(f"[EULA] Failed to save config after EULA send: {e}")
 
@@ -888,6 +1049,38 @@ def save_pending_signals(data: dict):
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
         raise
+
+
+def persist_pending_merge(pending: dict):
+    """Persist run_filter's pending_signals changes by MERGING them onto a fresh
+    copy under lock (audit T5).
+
+    The filter loads `pending` once at run start and resolves conversations in
+    place across the whole multi-account run, saving repeatedly. A learner can
+    APPEND a brand-new proposal to pending_signals.json during that run; a blind
+    save of the filter's stale snapshot would erase it before its email goes
+    out. The learner only ever ADDS conversations (it never resolves an existing
+    one — only the filter does), so the merge is unambiguous: start from the
+    fresh file, then overlay the filter's conversations by id (the filter wins
+    for any conversation it touched), and keep any fresh conversation the filter
+    has never seen (a concurrent learner addition).
+    """
+    with file_lock.locked(PENDING_SIGNALS_PATH):
+        fresh = load_pending_signals()
+        merged = list(fresh.get("conversations", []))
+        idx_by_id = {c.get("id"): i for i, c in enumerate(merged) if c.get("id")}
+        for conv in pending.get("conversations", []):
+            cid = conv.get("id")
+            if cid in idx_by_id:
+                merged[idx_by_id[cid]] = conv   # filter's version wins
+            else:
+                idx_by_id[cid] = len(merged)
+                merged.append(conv)             # filter-created proposal
+        fresh["conversations"] = merged
+        save_pending_signals(fresh)
+    # Keep the in-memory snapshot in step with what is now on disk, so the rest
+    # of this run sees the learner's concurrent additions too.
+    pending["conversations"] = fresh["conversations"]
 
 
 def generate_sfid(pending: dict) -> str:
@@ -1578,22 +1771,25 @@ def apply_ai_refinement(refinement: dict,
     """Append an approved AI refinement to signals.json[ai_refinements] and
     log the event. Returns a human-readable description for the email
     confirmation body."""
-    data = load_signals()
-    refinements = data.setdefault("ai_refinements", [])
-    existing_ids = {r.get("id") for r in refinements}
-    rid = refinement.get("id", "")
-    if rid and rid in existing_ids:
-        logger.info(f"  [AI REFINEMENT] {rid} already active — skipping add")
-    else:
-        record = dict(refinement)
-        record["status"] = "active"
-        record.setdefault("first_learned", datetime.now().isoformat())
-        record["last_reinforced"] = datetime.now().isoformat()
-        record.setdefault("match_count", 1)
-        refinements.append(record)
-        save_signals(data)
-        logger.info(f"  [AI REFINEMENT] Applied {rid}: "
-                    f"{refinement.get('headline', '')[:60]}")
+    # Locked read-modify-write of signals.json so a concurrent learner save is
+    # not clobbered (C7). The re-read happens inside the lock.
+    with file_lock.locked(SIGNALS_PATH):
+        data = load_signals()
+        refinements = data.setdefault("ai_refinements", [])
+        existing_ids = {r.get("id") for r in refinements}
+        rid = refinement.get("id", "")
+        if rid and rid in existing_ids:
+            logger.info(f"  [AI REFINEMENT] {rid} already active — skipping add")
+        else:
+            record = dict(refinement)
+            record["status"] = "active"
+            record.setdefault("first_learned", datetime.now().isoformat())
+            record["last_reinforced"] = datetime.now().isoformat()
+            record.setdefault("match_count", 1)
+            refinements.append(record)
+            save_signals(data)
+            logger.info(f"  [AI REFINEMENT] Applied {rid}: "
+                        f"{refinement.get('headline', '')[:60]}")
     append_refinement_log({
         "ts": datetime.now().isoformat(),
         "event": "applied",
@@ -1621,30 +1817,33 @@ def apply_ai_refinement(refinement: dict,
 
 def apply_signal_changes(proposed_changes: dict, logger: logging.Logger) -> str:
     """Apply proposed signal changes to signals.json. Returns description."""
-    signals_data = load_signals()
-    sig = signals_data.get("signals", {})
     descriptions = []
+    # Locked read-modify-write of signals.json so a concurrent learner save is
+    # not clobbered (C7). The re-read happens inside the lock.
+    with file_lock.locked(SIGNALS_PATH):
+        signals_data = load_signals()
+        sig = signals_data.get("signals", {})
 
-    narrowings = proposed_changes.get("signals_to_narrow", {})
-    for signal_name, refinement in narrowings.items():
-        # Add as a refinement note to soft_signals
-        note = f"REFINEMENT ({signal_name}): {refinement}"
-        sig.setdefault("soft_signals", []).append(note)
-        descriptions.append(f"Added refinement for {signal_name}: {refinement}")
-        logger.info(f"  [SIGNAL CHANGE] {note}")
+        narrowings = proposed_changes.get("signals_to_narrow", {})
+        for signal_name, refinement in narrowings.items():
+            # Add as a refinement note to soft_signals
+            note = f"REFINEMENT ({signal_name}): {refinement}"
+            sig.setdefault("soft_signals", []).append(note)
+            descriptions.append(f"Added refinement for {signal_name}: {refinement}")
+            logger.info(f"  [SIGNAL CHANGE] {note}")
 
-    signals_data["signals"] = sig
+        signals_data["signals"] = sig
 
-    # Save atomically
-    fd, tmp_path = tempfile.mkstemp(dir=SIGNALS_PATH.parent, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(signals_data, f, indent=2)
-        os.replace(tmp_path, SIGNALS_PATH)
-    except Exception:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-        raise
+        # Save atomically
+        fd, tmp_path = tempfile.mkstemp(dir=SIGNALS_PATH.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(signals_data, f, indent=2)
+            os.replace(tmp_path, SIGNALS_PATH)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
 
     return "\n".join(descriptions) if descriptions else "No specific changes applied."
 
@@ -3184,19 +3383,25 @@ def run_filter(force: bool = False):
     deliver_eula_if_needed(config, logger)
 
     processed = load_processed_ids()
-    signals = load_signals()
     # Keep the user's own account mail servers (every configured account's IMAP
     # host + the SMTP host) marked as trusted infrastructure, so they are not
     # mistaken for a suspicious relay in the Received chain. Re-checks config
     # every run (a newly added account is trusted on the next run); only adds,
-    # never removes; persists only when something actually changed.
-    if autoseed_trusted_infra(signals, config):
-        save_signals(signals)
-        logger.info("Trusted infrastructure updated from account config")
+    # never removes; persists only when something actually changed. The whole
+    # load->autoseed->save runs under the signals lock so a concurrent learner
+    # save is not clobbered (C7).
+    with file_lock.locked(SIGNALS_PATH):
+        signals = load_signals()
+        if autoseed_trusted_infra(signals, config):
+            save_signals(signals)
+            logger.info("Trusted infrastructure updated from account config")
     whitelist = load_whitelist(logger)
     blacklist = load_blacklist(logger)
     detect_conflicts(whitelist, blacklist, logger)
     token_usage = load_token_usage()
+    # The FILE is only ever updated via this delta (locked re-read-merge), so the
+    # learner / daily report token writes are never lost (B7/L5/R4/D2).
+    token_delta = new_token_delta()
     pending = load_pending_signals()
     # NOTE: the classifier prompt is now built PER ACCOUNT inside the loop below
     # (P1 per-account scoping), not once here.
@@ -3357,63 +3562,66 @@ def run_filter(force: bool = False):
                         orig_addr = orig_parsed.get("address")
                         orig_name = orig_parsed.get("display_name")
 
-                        # Remove from blacklist.json
-                        bl_data = load_blacklist(logger)
-                        addr_removed = False
-                        name_removed = False
+                        # Remove from blacklist.json — locked read-modify-write
+                        # so a Dashboard edit or concurrent command can't lose
+                        # the change (G3/R5).
+                        with file_lock.locked(BLACKLIST_PATH):
+                            bl_data = load_blacklist(logger)
+                            addr_removed = False
+                            name_removed = False
 
-                        if orig_addr:
-                            addrs = bl_data.get("addresses", [])
-                            new_addrs = [a for a in addrs if a.lower() != orig_addr.lower()]
-                            if len(new_addrs) != len(addrs):
-                                bl_data["addresses"] = new_addrs
-                                addr_removed = True
+                            if orig_addr:
+                                addrs = bl_data.get("addresses", [])
+                                new_addrs = [a for a in addrs if a.lower() != orig_addr.lower()]
+                                if len(new_addrs) != len(addrs):
+                                    bl_data["addresses"] = new_addrs
+                                    addr_removed = True
 
-                        if orig_name:
-                            names = bl_data.get("display_names", [])
-                            new_names = [n for n in names if n.strip().lower() != orig_name.strip().lower()]
-                            if len(new_names) != len(names):
-                                bl_data["display_names"] = new_names
-                                name_removed = True
+                            if orig_name:
+                                names = bl_data.get("display_names", [])
+                                new_names = [n for n in names if n.strip().lower() != orig_name.strip().lower()]
+                                if len(new_names) != len(names):
+                                    bl_data["display_names"] = new_names
+                                    name_removed = True
 
-                        if addr_removed or name_removed:
-                            save_blacklist(bl_data)
-                            # Reload in-memory set for the current run
-                            blacklist = load_blacklist(logger)
-                            lines_out = []
-                            if addr_removed:
-                                lines_out.append(f"Address removed: {orig_addr}")
-                                logger.info(f"  [BLACKLIST] Removed address: {orig_addr}")
-                            if name_removed:
-                                lines_out.append(f"Display name removed: {orig_name}")
-                                logger.info(f"  [BLACKLIST] Removed display name: {orig_name}")
-                            removed_text = "\n".join(lines_out)
-                            send_email(
-                                config,
-                                f"Blacklist Removal Confirmed — {orig_name or orig_addr}",
-                                f"The following entries have been removed from the blacklist:\n\n"
-                                f"{removed_text}\n\n"
-                                f"Future emails from this sender will be evaluated by the spam classifier.\n\n"
-                                f"To re-add: forward any email from this sender to yourself with\n"
-                                f"the subject line \"Fwd: Blacklist All\" (or \"Blacklist Address\"\n"
-                                f"or \"Blacklist Name\" for narrower blocking).",
-                                logger,
-                                to_addr=account.get("username", ""),
-                            )
-                        else:
-                            bl_totals = (
-                                len(bl_data.get("addresses", [])),
-                                len(bl_data.get("display_names", [])),
-                            )
-                            send_email(
-                                config,
-                                f"Blacklist Removal — Not Found",
-                                f"Neither the address ({orig_addr or 'none'}) nor the display name "
-                                f"({orig_name or 'none'}) was found in the blacklist. No changes were made.\n\n"
-                                f"Current blacklist: {bl_totals[0]} addresses | {bl_totals[1]} display names",
-                                logger,
-                                to_addr=account.get("username", ""),
-                            )
+                            if addr_removed or name_removed:
+                                save_blacklist(bl_data)
+                                # Reload in-memory set for the current run
+                                blacklist = load_blacklist(logger)
+                                lines_out = []
+                                if addr_removed:
+                                    lines_out.append(f"Address removed: {orig_addr}")
+                                    logger.info(f"  [BLACKLIST] Removed address: {orig_addr}")
+                                if name_removed:
+                                    lines_out.append(f"Display name removed: {orig_name}")
+                                    logger.info(f"  [BLACKLIST] Removed display name: {orig_name}")
+                                removed_text = "\n".join(lines_out)
+                                send_email(
+                                    config,
+                                    f"Blacklist Removal Confirmed — {orig_name or orig_addr}",
+                                    f"The following entries have been removed from the blacklist:\n\n"
+                                    f"{removed_text}\n\n"
+                                    f"Future emails from this sender will be evaluated by the spam classifier.\n\n"
+                                    f"To re-add: forward any email from this sender to yourself with\n"
+                                    f"the subject line \"Fwd: Blacklist All\" (or \"Blacklist Address\"\n"
+                                    f"or \"Blacklist Name\" for narrower blocking).",
+                                    logger,
+                                    to_addr=account.get("username", ""),
+                                )
+                            else:
+                                bl_totals = (
+                                    len(bl_data.get("addresses", [])),
+                                    len(bl_data.get("display_names", [])),
+                                )
+                                send_email(
+                                    config,
+                                    f"Blacklist Removal — Not Found",
+                                    f"Neither the address ({orig_addr or 'none'}) nor the display name "
+                                    f"({orig_name or 'none'}) was found in the blacklist. No changes were made.\n\n"
+                                    f"Current blacklist: {bl_totals[0]} addresses | {bl_totals[1]} display names",
+                                    logger,
+                                    to_addr=account.get("username", ""),
+                                )
 
                         account_processed.add(msg_id)
                         now_iso = datetime.now().isoformat()
@@ -3503,7 +3711,8 @@ CURRENT SIGNAL DEFINITIONS:
                             if hasattr(response, 'usage'):
                                 record_token_usage(token_usage,
                                     response.usage.input_tokens,
-                                    response.usage.output_tokens, model)
+                                    response.usage.output_tokens, model,
+                                    delta=token_delta)
 
                             # Generate SFID
                             sfid = generate_sfid(pending)
@@ -3537,7 +3746,7 @@ CURRENT SIGNAL DEFINITIONS:
                                 "resolution": None,
                             }
                             pending["conversations"].append(conv)
-                            save_pending_signals(pending)
+                            persist_pending_merge(pending)
 
                             # Send analysis email
                             email_body = f"""Your false positive has been analyzed.
@@ -3579,35 +3788,38 @@ Conversation ID: {sfid}
                         raw_body = msg_data.get("plain_text_body", "")
                         parsed_entries = parse_list_body(raw_body)
 
-                        wl_data = load_whitelist(logger)
-                        existing_addrs = {a.lower() for a in wl_data.get("addresses", [])}
-                        existing_domains = {d.lower() for d in wl_data.get("domains", [])}
+                        # Locked read-modify-write so a Dashboard edit or a
+                        # concurrent command can't lose these additions (G3/R5).
+                        with file_lock.locked(WHITELIST_PATH):
+                            wl_data = load_whitelist(logger)
+                            existing_addrs = {a.lower() for a in wl_data.get("addresses", [])}
+                            existing_domains = {d.lower() for d in wl_data.get("domains", [])}
 
-                        added_addrs: list = []
-                        added_domains: list = []
-                        already_addrs: list = []
-                        already_domains: list = []
+                            added_addrs: list = []
+                            added_domains: list = []
+                            already_addrs: list = []
+                            already_domains: list = []
 
-                        for addr in parsed_entries["addresses"]:
-                            if addr in existing_addrs:
-                                already_addrs.append(addr)
-                            else:
-                                wl_data.setdefault("addresses", []).append(addr)
-                                added_addrs.append(addr)
+                            for addr in parsed_entries["addresses"]:
+                                if addr in existing_addrs:
+                                    already_addrs.append(addr)
+                                else:
+                                    wl_data.setdefault("addresses", []).append(addr)
+                                    added_addrs.append(addr)
 
-                        for domain in parsed_entries["domains"]:
-                            if domain in existing_domains:
-                                already_domains.append(domain)
-                            else:
-                                wl_data.setdefault("domains", []).append(domain)
-                                added_domains.append(domain)
+                            for domain in parsed_entries["domains"]:
+                                if domain in existing_domains:
+                                    already_domains.append(domain)
+                                else:
+                                    wl_data.setdefault("domains", []).append(domain)
+                                    added_domains.append(domain)
 
-                        if added_addrs or added_domains:
-                            save_whitelist(wl_data)
-                            whitelist = load_whitelist(logger)
-                            logger.info(
-                                "  [DIRECT WHITELIST] added_addrs=%r added_domains=%r",
-                                added_addrs, added_domains)
+                            if added_addrs or added_domains:
+                                save_whitelist(wl_data)
+                                whitelist = load_whitelist(logger)
+                                logger.info(
+                                    "  [DIRECT WHITELIST] added_addrs=%r added_domains=%r",
+                                    added_addrs, added_domains)
 
                         added_all = added_addrs + [f"@{d}" for d in added_domains]
                         already_all = already_addrs + [f"@{d}" for d in already_domains]
@@ -3648,35 +3860,38 @@ Conversation ID: {sfid}
                         raw_body = msg_data.get("plain_text_body", "")
                         parsed_entries = parse_list_body(raw_body)
 
-                        bl_data = load_blacklist(logger)
-                        existing_addrs = {a.lower() for a in bl_data.get("addresses", [])}
-                        existing_domains = {d.lower() for d in bl_data.get("domains", [])}
+                        # Locked read-modify-write so a Dashboard edit or a
+                        # concurrent command can't lose these additions (G3/R5).
+                        with file_lock.locked(BLACKLIST_PATH):
+                            bl_data = load_blacklist(logger)
+                            existing_addrs = {a.lower() for a in bl_data.get("addresses", [])}
+                            existing_domains = {d.lower() for d in bl_data.get("domains", [])}
 
-                        added_addrs: list = []
-                        added_domains: list = []
-                        already_addrs: list = []
-                        already_domains: list = []
+                            added_addrs: list = []
+                            added_domains: list = []
+                            already_addrs: list = []
+                            already_domains: list = []
 
-                        for addr in parsed_entries["addresses"]:
-                            if addr in existing_addrs:
-                                already_addrs.append(addr)
-                            else:
-                                bl_data.setdefault("addresses", []).append(addr)
-                                added_addrs.append(addr)
+                            for addr in parsed_entries["addresses"]:
+                                if addr in existing_addrs:
+                                    already_addrs.append(addr)
+                                else:
+                                    bl_data.setdefault("addresses", []).append(addr)
+                                    added_addrs.append(addr)
 
-                        for domain in parsed_entries["domains"]:
-                            if domain in existing_domains:
-                                already_domains.append(domain)
-                            else:
-                                bl_data.setdefault("domains", []).append(domain)
-                                added_domains.append(domain)
+                            for domain in parsed_entries["domains"]:
+                                if domain in existing_domains:
+                                    already_domains.append(domain)
+                                else:
+                                    bl_data.setdefault("domains", []).append(domain)
+                                    added_domains.append(domain)
 
-                        if added_addrs or added_domains:
-                            save_blacklist(bl_data)
-                            blacklist = load_blacklist(logger)
-                            logger.info(
-                                "  [DIRECT BLACKLIST] added_addrs=%r added_domains=%r",
-                                added_addrs, added_domains)
+                            if added_addrs or added_domains:
+                                save_blacklist(bl_data)
+                                blacklist = load_blacklist(logger)
+                                logger.info(
+                                    "  [DIRECT BLACKLIST] added_addrs=%r added_domains=%r",
+                                    added_addrs, added_domains)
 
                         added_all = added_addrs + [f"@{d}" for d in added_domains]
                         already_all = already_addrs + [f"@{d}" for d in already_domains]
@@ -3760,32 +3975,38 @@ Conversation ID: {sfid}
                             )
                         else:
                             orig_addr = orig_addr.lower()
-                            wl_data = load_whitelist(logger)
-                            existing = {a.lower() for a in wl_data.get("addresses", [])}
-                            if orig_addr in existing:
-                                msg_out = f"The address {orig_addr} is already on the whitelist. No changes made."
-                            else:
-                                wl_data.setdefault("addresses", []).append(orig_addr)
-                                # strip in-memory set before saving
-                                to_save = {k: v for k, v in wl_data.items() if not k.startswith("_")}
-                                to_save["last_updated"] = datetime.now().isoformat()
-                                fd, tmp_path = tempfile.mkstemp(dir=WHITELIST_PATH.parent, suffix=".tmp")
-                                try:
-                                    with os.fdopen(fd, "w") as f:
-                                        json.dump(to_save, f, indent=2)
-                                    os.replace(tmp_path, WHITELIST_PATH)
-                                except Exception:
-                                    if os.path.exists(tmp_path):
-                                        os.unlink(tmp_path)
-                                    raise
-                                # Refresh in-memory view for this run
-                                whitelist = load_whitelist(logger)
-                                msg_out = (
-                                    f"Added to whitelist: {orig_addr}\n\n"
-                                    f"Future emails from this address will bypass the spam classifier "
-                                    f"entirely and land in your inbox."
-                                )
-                                logger.info(f"  [WHITELIST] Added address: {orig_addr}")
+                            # Locked read-modify-write so a Dashboard edit or a
+                            # concurrent command can't lose this addition (G3/R5).
+                            # The inline write below is byte-identical to
+                            # save_whitelist; kept inline + locked for a minimal,
+                            # surgical diff.
+                            with file_lock.locked(WHITELIST_PATH):
+                                wl_data = load_whitelist(logger)
+                                existing = {a.lower() for a in wl_data.get("addresses", [])}
+                                if orig_addr in existing:
+                                    msg_out = f"The address {orig_addr} is already on the whitelist. No changes made."
+                                else:
+                                    wl_data.setdefault("addresses", []).append(orig_addr)
+                                    # strip in-memory set before saving
+                                    to_save = {k: v for k, v in wl_data.items() if not k.startswith("_")}
+                                    to_save["last_updated"] = datetime.now().isoformat()
+                                    fd, tmp_path = tempfile.mkstemp(dir=WHITELIST_PATH.parent, suffix=".tmp")
+                                    try:
+                                        with os.fdopen(fd, "w") as f:
+                                            json.dump(to_save, f, indent=2)
+                                        os.replace(tmp_path, WHITELIST_PATH)
+                                    except Exception:
+                                        if os.path.exists(tmp_path):
+                                            os.unlink(tmp_path)
+                                        raise
+                                    # Refresh in-memory view for this run
+                                    whitelist = load_whitelist(logger)
+                                    msg_out = (
+                                        f"Added to whitelist: {orig_addr}\n\n"
+                                        f"Future emails from this address will bypass the spam classifier "
+                                        f"entirely and land in your inbox."
+                                    )
+                                    logger.info(f"  [WHITELIST] Added address: {orig_addr}")
                             send_email(config, f"Whitelist Confirmed — {orig_addr}", msg_out, logger,
                                        to_addr=account.get("username", ""))
 
@@ -3841,30 +4062,35 @@ Conversation ID: {sfid}
                                 to_addr=account.get("username", ""),
                             )
                         else:
-                            wl_data = load_whitelist(logger)
-                            existing = {d.lower() for d in wl_data.get("domains", [])}
-                            if domain in existing:
-                                msg_out = f"The domain {domain} is already on the whitelist. No changes made."
-                            else:
-                                wl_data.setdefault("domains", []).append(domain)
-                                to_save = {k: v for k, v in wl_data.items() if not k.startswith("_")}
-                                to_save["last_updated"] = datetime.now().isoformat()
-                                fd, tmp_path = tempfile.mkstemp(dir=WHITELIST_PATH.parent, suffix=".tmp")
-                                try:
-                                    with os.fdopen(fd, "w") as f:
-                                        json.dump(to_save, f, indent=2)
-                                    os.replace(tmp_path, WHITELIST_PATH)
-                                except Exception:
-                                    if os.path.exists(tmp_path):
-                                        os.unlink(tmp_path)
-                                    raise
-                                whitelist = load_whitelist(logger)
-                                msg_out = (
-                                    f"Added to whitelist: {domain}\n\n"
-                                    f"Future emails from any address at this domain will bypass "
-                                    f"the spam classifier and land in your inbox."
-                                )
-                                logger.info(f"  [WHITELIST] Added domain: {domain}")
+                            # Locked read-modify-write so a Dashboard edit or a
+                            # concurrent command can't lose this addition (G3/R5).
+                            # Inline write kept (byte-identical to save_whitelist)
+                            # + locked for a minimal, surgical diff.
+                            with file_lock.locked(WHITELIST_PATH):
+                                wl_data = load_whitelist(logger)
+                                existing = {d.lower() for d in wl_data.get("domains", [])}
+                                if domain in existing:
+                                    msg_out = f"The domain {domain} is already on the whitelist. No changes made."
+                                else:
+                                    wl_data.setdefault("domains", []).append(domain)
+                                    to_save = {k: v for k, v in wl_data.items() if not k.startswith("_")}
+                                    to_save["last_updated"] = datetime.now().isoformat()
+                                    fd, tmp_path = tempfile.mkstemp(dir=WHITELIST_PATH.parent, suffix=".tmp")
+                                    try:
+                                        with os.fdopen(fd, "w") as f:
+                                            json.dump(to_save, f, indent=2)
+                                        os.replace(tmp_path, WHITELIST_PATH)
+                                    except Exception:
+                                        if os.path.exists(tmp_path):
+                                            os.unlink(tmp_path)
+                                        raise
+                                    whitelist = load_whitelist(logger)
+                                    msg_out = (
+                                        f"Added to whitelist: {domain}\n\n"
+                                        f"Future emails from any address at this domain will bypass "
+                                        f"the spam classifier and land in your inbox."
+                                    )
+                                    logger.info(f"  [WHITELIST] Added domain: {domain}")
                             send_email(config, f"Whitelist Domain Confirmed — {domain}", msg_out, logger,
                                        to_addr=account.get("username", ""))
 
@@ -3927,40 +4153,43 @@ Conversation ID: {sfid}
                             total_evaluated += 1
                             continue
 
-                        bl_data = load_blacklist(logger)
-                        # Load skip_names to avoid blacklisting generic display names
-                        skip_names_set = set()
-                        try:
-                            skip_path = PROJECT_ROOT / "blacklist" / "skip_names.txt"
-                            if skip_path.exists():
-                                for line in skip_path.read_text().splitlines():
-                                    line = line.strip()
-                                    if line and not line.startswith("#"):
-                                        skip_names_set.add(line.lower())
-                        except Exception:
-                            pass
+                        # Locked read-modify-write so a Dashboard edit or a
+                        # concurrent command can't lose these additions (G3/R5).
+                        with file_lock.locked(BLACKLIST_PATH):
+                            bl_data = load_blacklist(logger)
+                            # Load skip_names to avoid blacklisting generic display names
+                            skip_names_set = set()
+                            try:
+                                skip_path = PROJECT_ROOT / "blacklist" / "skip_names.txt"
+                                if skip_path.exists():
+                                    for line in skip_path.read_text().splitlines():
+                                        line = line.strip()
+                                        if line and not line.startswith("#"):
+                                            skip_names_set.add(line.lower())
+                            except Exception:
+                                pass
 
-                        addr_added = False
-                        name_added = False
-                        skipped_name = None
-                        if orig_addr:
-                            orig_addr = orig_addr.lower()
-                            existing_addrs = {a.lower() for a in bl_data.get("addresses", [])}
-                            if orig_addr not in existing_addrs:
-                                bl_data.setdefault("addresses", []).append(orig_addr)
-                                addr_added = True
-                        if orig_name:
-                            if orig_name.strip().lower() in skip_names_set:
-                                skipped_name = orig_name
-                            else:
-                                existing_names = {n.strip().lower() for n in bl_data.get("display_names", [])}
-                                if orig_name.strip().lower() not in existing_names:
-                                    bl_data.setdefault("display_names", []).append(orig_name)
-                                    name_added = True
+                            addr_added = False
+                            name_added = False
+                            skipped_name = None
+                            if orig_addr:
+                                orig_addr = orig_addr.lower()
+                                existing_addrs = {a.lower() for a in bl_data.get("addresses", [])}
+                                if orig_addr not in existing_addrs:
+                                    bl_data.setdefault("addresses", []).append(orig_addr)
+                                    addr_added = True
+                            if orig_name:
+                                if orig_name.strip().lower() in skip_names_set:
+                                    skipped_name = orig_name
+                                else:
+                                    existing_names = {n.strip().lower() for n in bl_data.get("display_names", [])}
+                                    if orig_name.strip().lower() not in existing_names:
+                                        bl_data.setdefault("display_names", []).append(orig_name)
+                                        name_added = True
 
-                        if addr_added or name_added:
-                            save_blacklist(bl_data)
-                            blacklist = load_blacklist(logger)
+                            if addr_added or name_added:
+                                save_blacklist(bl_data)
+                                blacklist = load_blacklist(logger)
 
                         lines_out = []
                         if addr_added:
@@ -4037,20 +4266,23 @@ Conversation ID: {sfid}
                             )
                         else:
                             orig_addr = orig_addr.lower()
-                            bl_data = load_blacklist(logger)
-                            existing = {a.lower() for a in bl_data.get("addresses", [])}
-                            if orig_addr in existing:
-                                msg_out = f"The address {orig_addr} is already on the blacklist. No changes made."
-                            else:
-                                bl_data.setdefault("addresses", []).append(orig_addr)
-                                save_blacklist(bl_data)
-                                blacklist = load_blacklist(logger)
-                                msg_out = (
-                                    f"Added to blacklist: {orig_addr}\n\n"
-                                    f"Future emails from this address will be moved to Junk immediately.\n\n"
-                                    f"To remove: forward any email from them with subject \"Fwd: Remove from Blacklist\"."
-                                )
-                                logger.info(f"  [BLACKLIST] Added address: {orig_addr}")
+                            # Locked read-modify-write so a Dashboard edit or a
+                            # concurrent command can't lose this addition (G3/R5).
+                            with file_lock.locked(BLACKLIST_PATH):
+                                bl_data = load_blacklist(logger)
+                                existing = {a.lower() for a in bl_data.get("addresses", [])}
+                                if orig_addr in existing:
+                                    msg_out = f"The address {orig_addr} is already on the blacklist. No changes made."
+                                else:
+                                    bl_data.setdefault("addresses", []).append(orig_addr)
+                                    save_blacklist(bl_data)
+                                    blacklist = load_blacklist(logger)
+                                    msg_out = (
+                                        f"Added to blacklist: {orig_addr}\n\n"
+                                        f"Future emails from this address will be moved to Junk immediately.\n\n"
+                                        f"To remove: forward any email from them with subject \"Fwd: Remove from Blacklist\"."
+                                    )
+                                    logger.info(f"  [BLACKLIST] Added address: {orig_addr}")
                             send_email(config, f"Blacklist Address Confirmed — {orig_addr}", msg_out, logger,
                                        to_addr=account.get("username", ""))
 
@@ -4126,21 +4358,24 @@ Conversation ID: {sfid}
                                 to_addr=account.get("username", ""),
                             )
                         else:
-                            bl_data = load_blacklist(logger)
-                            existing = {n.strip().lower() for n in bl_data.get("display_names", [])}
-                            if orig_name.strip().lower() in existing:
-                                msg_out = f"The display name \"{orig_name}\" is already on the blacklist. No changes made."
-                            else:
-                                bl_data.setdefault("display_names", []).append(orig_name)
-                                save_blacklist(bl_data)
-                                blacklist = load_blacklist(logger)
-                                msg_out = (
-                                    f"Added to blacklist: display name \"{orig_name}\"\n\n"
-                                    f"Future emails with this display name will be moved to Junk, "
-                                    f"regardless of the sending address. Useful for political campaigns "
-                                    f"and mailing lists that rotate addresses."
-                                )
-                                logger.info(f"  [BLACKLIST] Added display name: {orig_name}")
+                            # Locked read-modify-write so a Dashboard edit or a
+                            # concurrent command can't lose this addition (G3/R5).
+                            with file_lock.locked(BLACKLIST_PATH):
+                                bl_data = load_blacklist(logger)
+                                existing = {n.strip().lower() for n in bl_data.get("display_names", [])}
+                                if orig_name.strip().lower() in existing:
+                                    msg_out = f"The display name \"{orig_name}\" is already on the blacklist. No changes made."
+                                else:
+                                    bl_data.setdefault("display_names", []).append(orig_name)
+                                    save_blacklist(bl_data)
+                                    blacklist = load_blacklist(logger)
+                                    msg_out = (
+                                        f"Added to blacklist: display name \"{orig_name}\"\n\n"
+                                        f"Future emails with this display name will be moved to Junk, "
+                                        f"regardless of the sending address. Useful for political campaigns "
+                                        f"and mailing lists that rotate addresses."
+                                    )
+                                    logger.info(f"  [BLACKLIST] Added display name: {orig_name}")
                             send_email(config, f"Blacklist Name Confirmed — {orig_name}", msg_out, logger,
                                        to_addr=account.get("username", ""))
 
@@ -4268,7 +4503,7 @@ Conversation ID: {sfid}
                         # Check expiry
                         if datetime.now().isoformat() > conv.get("expires", ""):
                             conv["status"] = "expired"
-                            save_pending_signals(pending)
+                            persist_pending_merge(pending)
                             send_email(config,
                                 f"Re: [{sfid}] — Expired",
                                 f"This proposal expired on {conv['expires'][:10]}. "
@@ -4304,7 +4539,7 @@ Conversation ID: {sfid}
                             ref["rationale"] = (
                                 f"{prev}\n\nUser context: {user_ctx}").strip()
                             conv["proposed_refinement"] = ref
-                            save_pending_signals(pending)
+                            persist_pending_merge(pending)
                             append_refinement_log({
                                 "ts": datetime.now().isoformat(),
                                 "event": "context_added",
@@ -4338,7 +4573,7 @@ Conversation ID: {sfid}
                             ref["what_this_doesnt_cover"] = (
                                 f"{prev}\nUser narrowing: {narrow_txt}").strip()
                             conv["proposed_refinement"] = ref
-                            save_pending_signals(pending)
+                            persist_pending_merge(pending)
                             append_refinement_log({
                                 "ts": datetime.now().isoformat(),
                                 "event": "narrow_added",
@@ -4387,7 +4622,7 @@ Conversation ID: {sfid}
                                 blacklist = load_blacklist(logger)
                                 conv["status"] = "approved"
                                 conv["resolution"] = "approved"
-                                save_pending_signals(pending)
+                                persist_pending_merge(pending)
                                 append_refinement_log({
                                     "ts": datetime.now().isoformat(),
                                     "event": "applied",
@@ -4429,7 +4664,7 @@ Conversation ID: {sfid}
                                     source="email", sfid=sfid)
                                 conv["status"] = "approved"
                                 conv["resolution"] = "approved"
-                                save_pending_signals(pending)
+                                persist_pending_merge(pending)
                                 send_email(
                                     config,
                                     f"The refinement has been applied [{sfid}]",
@@ -4446,7 +4681,7 @@ Conversation ID: {sfid}
                                     conv.get("proposed_changes", {}), logger)
                                 conv["status"] = "approved"
                                 conv["resolution"] = "approved"
-                                save_pending_signals(pending)
+                                persist_pending_merge(pending)
                                 append_refinement_log({
                                     "ts": datetime.now().isoformat(),
                                     "event": "applied",
@@ -4467,7 +4702,7 @@ Conversation ID: {sfid}
                         elif classification == "negative":
                             conv["status"] = "rejected"
                             conv["resolution"] = "rejected"
-                            save_pending_signals(pending)
+                            persist_pending_merge(pending)
                             refinement_id = (conv.get("proposed_refinement") or {}).get("id", "")
                             append_refinement_log({
                                 "ts": datetime.now().isoformat(),
@@ -4525,14 +4760,15 @@ USER'S FOLLOW-UP:
                                 if hasattr(response, 'usage'):
                                     record_token_usage(token_usage,
                                         response.usage.input_tokens,
-                                        response.usage.output_tokens, model)
+                                        response.usage.output_tokens, model,
+                                        delta=token_delta)
 
                                 conv["conversation_history"].append({
                                     "role": "system_email",
                                     "timestamp": datetime.now().isoformat(),
                                     "content": followup_reply[:200],
                                 })
-                                save_pending_signals(pending)
+                                persist_pending_merge(pending)
 
                                 send_email(config,
                                     f"Re: False Positive Analysis [{sfid}] — {conv.get('original_subject', '')[:40]}",
@@ -4635,7 +4871,7 @@ USER'S FOLLOW-UP:
                             else:
                                 action = action + " (subject-keyword)"
                         log_decision(account_name, msg_data, kw_result, action)
-                        record_pre_classifier_skip(token_usage)
+                        record_pre_classifier_skip(token_usage, delta=token_delta)
                         account_processed.add(msg_id)
                         now_iso = datetime.now().isoformat()
                         processed["ids"][account_name].append([msg_id, now_iso])
@@ -4704,7 +4940,7 @@ USER'S FOLLOW-UP:
                             # Append pre-classifier tag to action for log clarity
                             action = action + " (pre-classifier)"
                         log_decision(account_name, msg_data, pre_decision, action)
-                        record_pre_classifier_skip(token_usage)
+                        record_pre_classifier_skip(token_usage, delta=token_delta)
                         account_processed.add(msg_id)
                         now_iso = datetime.now().isoformat()
                         processed["ids"][account_name].append([msg_id, now_iso])
@@ -4741,7 +4977,8 @@ USER'S FOLLOW-UP:
                     if api_response and hasattr(api_response, 'usage'):
                         record_token_usage(token_usage,
                             api_response.usage.input_tokens,
-                            api_response.usage.output_tokens, model)
+                            api_response.usage.output_tokens, model,
+                            delta=token_delta)
 
                     if result is None:
                         logger.error(f"  Classification failed for {msg_id}, will retry next run")
@@ -4808,14 +5045,18 @@ USER'S FOLLOW-UP:
             except Exception:
                 pass
 
+        # Save-as-you-go (B7): flush this account's processed_ids and token spend
+        # before moving on. Runs after the finally — so it ALSO runs for an
+        # account that errored (persisting whatever it processed before the
+        # error) and for the account that triggers the max_per_run break below.
+        persist_progress(processed, token_usage, token_delta)
+
         if total_evaluated >= max_per_run:
             break
 
-    # Save processed_ids atomically
-    save_processed_ids(processed)
-
-    # Save token usage
-    save_token_usage(token_usage)
+    # Final flush of any residual progress (and a clean end-of-run save even when
+    # no account reached the per-account flush, e.g. all disabled / unreachable).
+    persist_progress(processed, token_usage, token_delta)
 
     logger.info(
         f"Filter complete: {accounts_checked} accounts, "

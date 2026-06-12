@@ -63,9 +63,11 @@ def _cli_set_dry_run(value: str) -> int:
     """Toggle dry_run from the command line. Value is 'true'/'false'/'on'/'off'."""
     from . import config_io
     truthy = value.strip().lower() in ("true", "1", "on", "yes", "y")
-    cfg = config_io.load_config()
-    cfg.setdefault("filter", {})["dry_run"] = truthy
-    config_io.save_config(cfg)
+    # C7: fresh read + write under the lock so a peer's concurrent config change
+    # isn't reverted; we touch ONLY filter.dry_run.
+    def _set(cfg):
+        cfg.setdefault("filter", {})["dry_run"] = truthy
+    config_io.update_config(_set)
     print(f"dry_run is now {truthy}")
     return 0
 
@@ -184,41 +186,32 @@ def _run_diagnose() -> int:
     return 0
 
 
-_FILTER_LOCK_MAX_AGE_SEC = 600  # 10 minutes
+_FILTER_LOCK_FD: int | None = None
 
 
 def _acquire_filter_lock() -> bool:
     """Return True if we obtained the filter lock, False if another process
-    is already inside the 10-minute window. Prevents launchd's 15-minute
-    tick and a Dashboard Run Now click from running the filter twice in
-    parallel (which otherwise doubles every log line and races on
-    decisions.log writes)."""
-    import time as _time
-    lock = paths.FILTER_LOCK
-    try:
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        if lock.exists():
-            age = _time.time() - lock.stat().st_mtime
-            if age < _FILTER_LOCK_MAX_AGE_SEC:
-                return False
-            # Stale lock — claim it.
-            try:
-                lock.unlink()
-            except OSError:
-                pass
-        lock.write_text(str(os.getpid()))
-    except OSError:
-        # If we can't write the lock file, proceed anyway rather than
-        # block the filter on a filesystem glitch.
-        return True
-    return True
+    already holds it. Prevents launchd's 15-minute tick and a Dashboard Run Now
+    click from running the filter twice in parallel (which otherwise doubles
+    every log line and races on decisions.log writes).
+
+    This is a real fcntl.flock held by THIS process for the whole run, not an
+    mtime check: a run longer than 10 minutes can no longer have a second run
+    started concurrently, a dead holder is detected immediately by the OS (no
+    staleness window, no liveness guessing), and we fail CLOSED — if the lock
+    can't be created we skip the run rather than run unguarded."""
+    from . import file_lock
+    global _FILTER_LOCK_FD
+    _FILTER_LOCK_FD = file_lock.try_acquire(paths.FILTER_LOCK)
+    return _FILTER_LOCK_FD is not None
 
 
 def _release_filter_lock() -> None:
-    try:
-        paths.FILTER_LOCK.unlink()
-    except (FileNotFoundError, OSError):
-        pass
+    from . import file_lock
+    global _FILTER_LOCK_FD
+    if _FILTER_LOCK_FD is not None:
+        file_lock.release(_FILTER_LOCK_FD)
+        _FILTER_LOCK_FD = None
 
 
 def _run_user_script(script_name: str) -> int:
@@ -279,9 +272,10 @@ def _run_user_script(script_name: str) -> int:
                                  if a not in our_flags and not a.startswith("--set-dry-run=")]
 
     # Filter + report share the same IMAP account list and decisions.log, so
-    # gate them behind a single lock. Scheduled runs and manual Run Now
-    # clicks that fire within 10 minutes of each other would otherwise
-    # both execute, doubling log lines and racing on processed_ids.
+    # gate them behind a single lock. A scheduled run and a manual Run Now
+    # click that overlap would otherwise both execute, doubling log lines and
+    # racing on processed_ids. The lock is a real flock held for the whole
+    # run, so overlap is impossible no matter how long the run takes.
     if script_name in ("spam_filter.py", "daily_report.py"):
         if not _acquire_filter_lock():
             sys.stderr.write(

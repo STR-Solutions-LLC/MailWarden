@@ -21,6 +21,7 @@ from typing import Any, Callable
 
 from . import app_entrypoint
 from . import config_io
+from . import file_lock
 from . import help_content
 from . import paths
 from . import smappservice_install
@@ -438,7 +439,11 @@ class SetupAssistant(tk.Tk):
         if self._accounts and not cfg.get("smtp", {}).get("from_address"):
             cfg.setdefault("smtp", {})["from_address"] = self._accounts[0].get("username", "")
 
-        config_io.save_config(cfg)
+        # C7: LOCK ONLY (no load-and-merge — the wizard's wholesale overwrite is
+        # audit B2, owned by another session). The lock serializes this blind
+        # save against other writers' read-modify-write windows on config.json.
+        with file_lock.locked(paths.CONFIG_PATH):
+            config_io.save_config(cfg)
 
         state = config_io.load_installer_state()
         if not state.get("installed_at"):
@@ -505,7 +510,10 @@ class SetupAssistant(tk.Tk):
             # User declined — mark as unapproved so Dashboard shows a banner.
             cfg = self.config_draft
             cfg.setdefault("ui", {})["smappservice_approved"] = False
-            config_io.save_config(cfg)
+            # C7: LOCK ONLY (wizard wholesale overwrite is audit B2; not merged
+            # here). Serializes against other writers' RMW windows.
+            with file_lock.locked(paths.CONFIG_PATH):
+                config_io.save_config(cfg)
             return
 
         smappservice_install.register_all(install_menubar=install_menubar)
@@ -543,11 +551,15 @@ class SetupAssistant(tk.Tk):
             # Still not approved — save flag for Dashboard warning banner.
             cfg = self.config_draft
             cfg.setdefault("ui", {})["smappservice_approved"] = False
-            config_io.save_config(cfg)
+            # C7: LOCK ONLY (audit B2 overwrite not merged here).
+            with file_lock.locked(paths.CONFIG_PATH):
+                config_io.save_config(cfg)
         else:
             cfg = self.config_draft
             cfg.setdefault("ui", {})["smappservice_approved"] = True
-            config_io.save_config(cfg)
+            # C7: LOCK ONLY (audit B2 overwrite not merged here).
+            with file_lock.locked(paths.CONFIG_PATH):
+                config_io.save_config(cfg)
 
     def _send_welcome_email(self):
         """Non-fatal — if sending fails, log it but don't block install."""

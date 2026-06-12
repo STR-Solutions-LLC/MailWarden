@@ -42,6 +42,8 @@ import time
 
 import anthropic
 
+import file_lock
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
 SIGNALS_PATH = PROJECT_ROOT / "memory" / "signals.json"
@@ -58,6 +60,12 @@ LOG_PATH = PROJECT_ROOT / "logs" / "learner.log"
 # pending_signals.json. Whoever holds this exclusive lock runs; others exit.
 LOCK_PATH = PROJECT_ROOT / "logs" / ".learner.lock"
 TOKEN_USAGE_PATH = PROJECT_ROOT / "memory" / "token_usage.json"
+# The learner's own scan watermark. Kept in its OWN small file (not config.json)
+# so updating it can never revert a concurrent Dashboard config save (audit L3).
+# Migration: read_learner_scan_timestamp falls back ONCE to the legacy
+# config['signal_learner']['last_scan_timestamp'] when this file is absent, so
+# existing installs never re-scan (and re-bill) every old .eml.
+LEARNER_STATE_PATH = PROJECT_ROOT / "memory" / "learner_state.json"
 
 
 # ---------------------------------------------------------------------------
@@ -84,16 +92,40 @@ def load_config() -> dict:
         return json.load(f)
 
 
-def save_config(config: dict) -> None:
-    fd, tmp = tempfile.mkstemp(dir=CONFIG_PATH.parent, suffix=".tmp")
+def read_learner_scan_timestamp(config: dict) -> str | None:
+    """Return the learner's last scan watermark (audit L3).
+
+    Reads memory/learner_state.json if present. When that file does NOT exist
+    yet (a pre-this-change install), fall back ONCE to the legacy
+    config['signal_learner']['last_scan_timestamp'] so existing installs do not
+    re-scan and re-bill every old .eml. If neither exists, return None
+    (preserving today's "scan everything" first-run behavior).
+    """
     try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(config, f, indent=2)
-        os.replace(tmp, CONFIG_PATH)
-    except Exception:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-        raise
+        with open(LEARNER_STATE_PATH, "r") as f:
+            ts = json.load(f).get("last_scan_timestamp")
+            if ts:
+                return ts
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return (config.get("signal_learner", {}) or {}).get("last_scan_timestamp")
+
+
+def save_learner_scan_timestamp(when_iso: str) -> None:
+    """Persist the learner's scan watermark to memory/learner_state.json under
+    lock (audit L3). Atomic mkstemp+os.replace, matching the module's save
+    style. NEVER writes config.json, so a concurrent Dashboard save survives."""
+    LEARNER_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock.locked(LEARNER_STATE_PATH):
+        fd, tmp = tempfile.mkstemp(dir=LEARNER_STATE_PATH.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump({"last_scan_timestamp": when_iso}, f, indent=2)
+            os.replace(tmp, LEARNER_STATE_PATH)
+        except Exception:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
 
 
 def load_signals() -> dict:
@@ -126,6 +158,50 @@ def save_signals(data: dict) -> None:
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
+
+
+def merge_save_signals_delta(reinforced_delta: dict,
+                             derived_increment: int = 0) -> None:
+    """Persist ONLY the learner's own reinforcement delta onto a FRESH copy of
+    signals.json, under lock (audit L1).
+
+    The learner loads a snapshot at run start and a long run follows; blind-
+    saving that snapshot erases anything the user changed via the Dashboard in
+    the meantime (e.g. an approved refinement, or a deleted one). Instead we
+    re-read the file under lock and apply only what THIS run changed:
+
+      * reinforced_delta maps refinement-id -> {"increment": n,
+        "last_reinforced": iso, "new_evidence": [filenames...]}. For each id
+        that STILL EXISTS in the fresh file we bump its match_count by the
+        increment, set last_reinforced, and prepend the new evidence (deduped,
+        capped at 10 — identical to handle_duplicate's own cap).
+      * derived_increment is added to derived_from_examples.
+
+    We NEVER add an id that is absent from fresh (no resurrecting a refinement
+    the user deleted mid-run) and never overwrite a fresh entry's other fields
+    with stale snapshot values.
+    """
+    with file_lock.locked(SIGNALS_PATH):
+        fresh = load_signals()
+        by_id = {r.get("id"): r for r in fresh.get("ai_refinements", [])}
+        for rid, change in (reinforced_delta or {}).items():
+            target = by_id.get(rid)
+            if target is None:
+                # Deleted on disk mid-run — do not resurrect it.
+                continue
+            target["match_count"] = (int(target.get("match_count", 1))
+                                     + int(change.get("increment", 0)))
+            if change.get("last_reinforced"):
+                target["last_reinforced"] = change["last_reinforced"]
+            evidence = target.setdefault("evidence", [])
+            for fname in reversed(change.get("new_evidence", []) or []):
+                if fname not in evidence:
+                    evidence.insert(0, fname)
+            target["evidence"] = evidence[:10]
+        if derived_increment:
+            fresh["derived_from_examples"] = (
+                int(fresh.get("derived_from_examples", 0)) + int(derived_increment))
+        save_signals(fresh)
 
 
 def load_pending_signals() -> dict:
@@ -785,30 +861,33 @@ def propose_from_teaching(eml_bytes: bytes, *, direction: str,
         if entry is None:
             return {"status": "declined",
                     "reason": "no sender address could be read from that email"}
-        pending = load_pending_signals()
-        sfid = next_sfid(pending)
-        now = datetime.now().isoformat()
-        expires = (datetime.now() + timedelta(days=7)).isoformat()
-        conv = {
-            "id": sfid,
-            "kind": "block_sender_proposal",
-            "status": "awaiting_reply",
-            "created": now,
-            "expires": expires,
-            "original_message_id": "",
-            "original_from": str(msg.get("From", "") or ""),
-            "original_subject": _decode(msg.get("Subject", "") or ""),
-            "forwarder": (str(originating_account).strip()
-                          if originating_account else ""),
-            "blocklist_entry": entry,
-            "resolution": None,
-            "conversation_history": [
-                {"role": "system", "timestamp": now,
-                 "content": "Block-this-sender proposed from the Check an Email "
-                            "screen"}],
-        }
-        pending.setdefault("conversations", []).append(conv)
-        save_pending_signals(pending)
+        # Allocate the SFID and append the proposal in ONE lock hold so a
+        # concurrent learner cannot erase this proposal or duplicate its ID (T5).
+        with file_lock.locked(PENDING_SIGNALS_PATH):
+            pending = load_pending_signals()
+            sfid = next_sfid(pending)
+            now = datetime.now().isoformat()
+            expires = (datetime.now() + timedelta(days=7)).isoformat()
+            conv = {
+                "id": sfid,
+                "kind": "block_sender_proposal",
+                "status": "awaiting_reply",
+                "created": now,
+                "expires": expires,
+                "original_message_id": "",
+                "original_from": str(msg.get("From", "") or ""),
+                "original_subject": _decode(msg.get("Subject", "") or ""),
+                "forwarder": (str(originating_account).strip()
+                              if originating_account else ""),
+                "blocklist_entry": entry,
+                "resolution": None,
+                "conversation_history": [
+                    {"role": "system", "timestamp": now,
+                     "content": "Block-this-sender proposed from the Check an Email "
+                                "screen"}],
+            }
+            pending.setdefault("conversations", []).append(conv)
+            save_pending_signals(pending)
         append_refinement_log({
             "ts": now, "event": "proposed", "id": sfid, "sfid": sfid,
             "headline": f"Block sender {entry['kind']}: {entry['value']}",
@@ -879,36 +958,40 @@ def propose_from_teaching(eml_bytes: bytes, *, direction: str,
                                "account was given to apply it to")}
         scope = resolved
 
-    refinement_id = next_refinement_id(signals_data)
-    refinement = teaching_refinement_from_classification(
-        cls, verdict=direction, scope=scope,
-        refinement_id=refinement_id, evidence_name="checked-email")
-    if refinement is None:
-        return {"status": "declined",
-                "reason": "no reliable, general rule could be derived"}
+    # Allocate the refinement ID + SFID and append the proposal in ONE lock
+    # hold so the IDs are unique against a concurrent learner and the proposal
+    # cannot be erased before it is recorded (T5).
+    with file_lock.locked(PENDING_SIGNALS_PATH):
+        refinement_id = next_refinement_id(signals_data)
+        refinement = teaching_refinement_from_classification(
+            cls, verdict=direction, scope=scope,
+            refinement_id=refinement_id, evidence_name="checked-email")
+        if refinement is None:
+            return {"status": "declined",
+                    "reason": "no reliable, general rule could be derived"}
 
-    pending = load_pending_signals()
-    sfid = next_sfid(pending)
-    now = datetime.now().isoformat()
-    expires = (datetime.now() + timedelta(days=7)).isoformat()
-    conv = {
-        "id": sfid,
-        "kind": "spam_example_proposal",
-        "status": "awaiting_reply",
-        "created": now,
-        "expires": expires,
-        "original_message_id": "",
-        "original_from": example["from"],
-        "original_subject": example["subject"],
-        "forwarder": "",
-        "proposed_refinement": refinement,
-        "resolution": None,
-        "conversation_history": [
-            {"role": "system", "timestamp": now,
-             "content": f"Proposed from the Check an Email screen ({direction})"}],
-    }
-    pending.setdefault("conversations", []).append(conv)
-    save_pending_signals(pending)
+        pending = load_pending_signals()
+        sfid = next_sfid(pending)
+        now = datetime.now().isoformat()
+        expires = (datetime.now() + timedelta(days=7)).isoformat()
+        conv = {
+            "id": sfid,
+            "kind": "spam_example_proposal",
+            "status": "awaiting_reply",
+            "created": now,
+            "expires": expires,
+            "original_message_id": "",
+            "original_from": example["from"],
+            "original_subject": example["subject"],
+            "forwarder": "",
+            "proposed_refinement": refinement,
+            "resolution": None,
+            "conversation_history": [
+                {"role": "system", "timestamp": now,
+                 "content": f"Proposed from the Check an Email screen ({direction})"}],
+        }
+        pending.setdefault("conversations", []).append(conv)
+        save_pending_signals(pending)
     append_refinement_log({
         "ts": now, "event": "proposed", "id": refinement_id, "sfid": sfid,
         "headline": refinement["headline"],
@@ -946,53 +1029,57 @@ def _record_learner_tokens(input_tokens: int, output_tokens: int,
     today = datetime.now().strftime("%Y-%m-%d")
 
     try:
-        try:
-            with open(TOKEN_USAGE_PATH, "r") as f:
-                usage_data = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            usage_data = {
-                "version": "1.0", "last_updated": "",
-                "lifetime_input_tokens": 0, "lifetime_output_tokens": 0,
-                "lifetime_api_calls": 0, "daily_records": [],
-            }
+        # Hold the token-usage lock across the whole re-read + add + save so the
+        # filter and daily report cannot lose this learner spend (L5). The
+        # re-read INSIDE the lock makes this a correct locked merge as-is.
+        with file_lock.locked(TOKEN_USAGE_PATH):
+            try:
+                with open(TOKEN_USAGE_PATH, "r") as f:
+                    usage_data = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                usage_data = {
+                    "version": "1.0", "last_updated": "",
+                    "lifetime_input_tokens": 0, "lifetime_output_tokens": 0,
+                    "lifetime_api_calls": 0, "daily_records": [],
+                }
 
-        usage_data["lifetime_input_tokens"] += input_tokens
-        usage_data["lifetime_output_tokens"] += output_tokens
-        usage_data["lifetime_api_calls"] += 1
+            usage_data["lifetime_input_tokens"] += input_tokens
+            usage_data["lifetime_output_tokens"] += output_tokens
+            usage_data["lifetime_api_calls"] += 1
 
-        daily = usage_data.get("daily_records", [])
-        today_record = None
-        for rec in daily:
-            if rec.get("date") == today:
-                today_record = rec
-                break
-        if today_record is None:
-            today_record = {
-                "date": today, "input_tokens": 0, "output_tokens": 0,
-                "api_calls": 0, "api_calls_skipped_by_pre_classifier": 0,
-                "estimated_cost_usd": 0.0,
-            }
-            daily.append(today_record)
+            daily = usage_data.get("daily_records", [])
+            today_record = None
+            for rec in daily:
+                if rec.get("date") == today:
+                    today_record = rec
+                    break
+            if today_record is None:
+                today_record = {
+                    "date": today, "input_tokens": 0, "output_tokens": 0,
+                    "api_calls": 0, "api_calls_skipped_by_pre_classifier": 0,
+                    "estimated_cost_usd": 0.0,
+                }
+                daily.append(today_record)
 
-        today_record["input_tokens"] += input_tokens
-        today_record["output_tokens"] += output_tokens
-        today_record["api_calls"] += 1
-        today_record["estimated_cost_usd"] = round(
-            today_record["estimated_cost_usd"] + cost, 6
-        )
-        today_record.setdefault("api_calls_skipped_by_pre_classifier", 0)
-        usage_data["daily_records"] = daily
-        usage_data["last_updated"] = datetime.now().isoformat()
+            today_record["input_tokens"] += input_tokens
+            today_record["output_tokens"] += output_tokens
+            today_record["api_calls"] += 1
+            today_record["estimated_cost_usd"] = round(
+                today_record["estimated_cost_usd"] + cost, 6
+            )
+            today_record.setdefault("api_calls_skipped_by_pre_classifier", 0)
+            usage_data["daily_records"] = daily
+            usage_data["last_updated"] = datetime.now().isoformat()
 
-        fd, tmp_path = tempfile.mkstemp(dir=TOKEN_USAGE_PATH.parent, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(usage_data, f, indent=2)
-            os.replace(tmp_path, TOKEN_USAGE_PATH)
-        except Exception:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-            raise
+            fd, tmp_path = tempfile.mkstemp(dir=TOKEN_USAGE_PATH.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(usage_data, f, indent=2)
+                os.replace(tmp_path, TOKEN_USAGE_PATH)
+            except Exception:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+                raise
     except Exception as e:
         logger.warning(f"Failed to record learner token usage: {e}")
 
@@ -1131,9 +1218,17 @@ def _pick_recipient(example: dict, config: dict) -> str:
 def handle_duplicate(classification: dict, example: dict,
                      signals_data: dict, config: dict,
                      logger: logging.Logger,
-                     smtp_conn: list | None = None) -> bool:
+                     smtp_conn: list | None = None,
+                     delta: dict | None = None) -> bool:
     """Update an existing active refinement with the new example evidence
-    and email a short 'another example of ...' acknowledgment."""
+    and email a short 'another example of ...' acknowledgment.
+
+    The in-memory ``signals_data`` snapshot is still mutated (so the email/log
+    below report the right counts), but the persistent change is recorded into
+    ``delta`` and applied to a FRESH file at save time via
+    merge_save_signals_delta — see audit L1. ``delta`` maps refinement-id ->
+    {"increment": n, "last_reinforced": iso, "new_evidence": [filenames]}.
+    """
     rid = classification.get("refinement_id", "")
     target = None
     for r in signals_data.get("ai_refinements", []):
@@ -1144,13 +1239,25 @@ def handle_duplicate(classification: dict, example: dict,
         logger.warning(f"  [LEARNER] duplicate_of {rid} but not found; treating as new")
         return False
 
+    reinforced_at = datetime.now().isoformat()
     target["match_count"] = int(target.get("match_count", 1)) + 1
-    target["last_reinforced"] = datetime.now().isoformat()
+    target["last_reinforced"] = reinforced_at
     evidence = target.setdefault("evidence", [])
     if example["filename"] not in evidence:
         evidence.insert(0, example["filename"])
         # Cap visible evidence list at 10; older matches live in the log.
         target["evidence"] = evidence[:10]
+
+    # Record the persistent delta for the locked merge-save (L1). Multiple
+    # duplicates of the same rule in one run accumulate the increment and the
+    # evidence list; the latest reinforced timestamp wins.
+    if delta is not None:
+        d = delta.setdefault(rid, {"increment": 0, "last_reinforced": "",
+                                   "new_evidence": []})
+        d["increment"] += 1
+        d["last_reinforced"] = reinforced_at
+        if example["filename"] not in d["new_evidence"]:
+            d["new_evidence"].insert(0, example["filename"])
 
     append_refinement_log({
         "ts": datetime.now().isoformat(),
@@ -1196,71 +1303,77 @@ def handle_new_pattern(classification: dict, example: dict,
         logger.warning(f"  [LEARNER] new_pattern without headline — skipping")
         return False
 
-    refinement_id = next_refinement_id(signals_data)
-    refinement = {
-        "id": refinement_id,
-        "kind": kind,
-        "headline": headline,
-        "rationale": rationale,
-        "what_this_doesnt_cover": disclaimer,
-        "confidence": confidence,
-        "evidence": [example["filename"]],
-        "first_learned": datetime.now().isoformat(),
-        "last_reinforced": datetime.now().isoformat(),
-        "match_count": 1,
-        "status": "proposed",
-    }
-    # P1 scope capture: bind this learned rule to the inbox that taught it.
-    # The forwarder is the account username stamped on the example via the
-    # X-MailWarden-Forwarder header (both the training-folder drop and the
-    # forward-with-explanation paths set it). originating_account = forwarder.
-    #
-    # rule_class: the email-forward learner does not yet classify protect vs.
-    # curate, so a forwarded example normally carries no rule_class. In that
-    # case we PRESERVE the pre-existing P1 capture (scope to the forwarder, or
-    # "all" when there is none) and record the rule as "protect" (its effective,
-    # threat-style behavior). When a rule_class IS present we resolve scope via
-    # the shared _resolve_scope: a curate rule with no forwarder cannot be
-    # account-scoped, so per R2 it becomes "all" (migration-safe) and we log it.
-    forwarder = (example.get("forwarder", "") or "").strip().lower()
-    raw_rule_class = (classification.get("rule_class") or "").strip().lower()
-    if raw_rule_class in ("protect", "curate"):
-        resolved = _resolve_scope(raw_rule_class, classification.get("apply_scope"),
-                                  forwarder)
-        if resolved is _SCOPE_NEEDS_EXPLICIT:
-            logger.info("  [LEARNER] curate rule with no forwarder — scoping to "
-                        "'all' (migration-safe; owner can re-scope)")
-            resolved = "all"
-        refinement["scope"] = resolved
-        refinement["rule_class"] = raw_rule_class
-    else:
-        # Pre-existing behavior preserved verbatim for the un-classified forward
-        # path; record the effective threat class for downstream rendering.
-        refinement["scope"] = [forwarder] if forwarder else "all"
-        refinement["rule_class"] = "protect"
+    # Allocate the refinement ID + SFID and append the proposal in ONE lock
+    # hold so the IDs are unique against a concurrent learner/check-screen and
+    # the proposal can't be erased before it is recorded (T5). The scope
+    # resolution in between touches no shared file, so holding the lock across
+    # it is cheap and keeps ID allocation atomic with the append.
+    with file_lock.locked(PENDING_SIGNALS_PATH):
+        refinement_id = next_refinement_id(signals_data)
+        refinement = {
+            "id": refinement_id,
+            "kind": kind,
+            "headline": headline,
+            "rationale": rationale,
+            "what_this_doesnt_cover": disclaimer,
+            "confidence": confidence,
+            "evidence": [example["filename"]],
+            "first_learned": datetime.now().isoformat(),
+            "last_reinforced": datetime.now().isoformat(),
+            "match_count": 1,
+            "status": "proposed",
+        }
+        # P1 scope capture: bind this learned rule to the inbox that taught it.
+        # The forwarder is the account username stamped on the example via the
+        # X-MailWarden-Forwarder header (both the training-folder drop and the
+        # forward-with-explanation paths set it). originating_account = forwarder.
+        #
+        # rule_class: the email-forward learner does not yet classify protect vs.
+        # curate, so a forwarded example normally carries no rule_class. In that
+        # case we PRESERVE the pre-existing P1 capture (scope to the forwarder, or
+        # "all" when there is none) and record the rule as "protect" (its effective,
+        # threat-style behavior). When a rule_class IS present we resolve scope via
+        # the shared _resolve_scope: a curate rule with no forwarder cannot be
+        # account-scoped, so per R2 it becomes "all" (migration-safe) and we log it.
+        forwarder = (example.get("forwarder", "") or "").strip().lower()
+        raw_rule_class = (classification.get("rule_class") or "").strip().lower()
+        if raw_rule_class in ("protect", "curate"):
+            resolved = _resolve_scope(raw_rule_class, classification.get("apply_scope"),
+                                      forwarder)
+            if resolved is _SCOPE_NEEDS_EXPLICIT:
+                logger.info("  [LEARNER] curate rule with no forwarder — scoping to "
+                            "'all' (migration-safe; owner can re-scope)")
+                resolved = "all"
+            refinement["scope"] = resolved
+            refinement["rule_class"] = raw_rule_class
+        else:
+            # Pre-existing behavior preserved verbatim for the un-classified forward
+            # path; record the effective threat class for downstream rendering.
+            refinement["scope"] = [forwarder] if forwarder else "all"
+            refinement["rule_class"] = "protect"
 
-    pending = load_pending_signals()
-    sfid = next_sfid(pending)
-    expires = (datetime.now() + timedelta(days=7)).isoformat()
-    conv = {
-        "id": sfid,
-        "kind": "spam_example_proposal",
-        "status": "awaiting_reply",
-        "created": datetime.now().isoformat(),
-        "expires": expires,
-        "original_message_id": "",
-        "original_from": example.get("from", ""),
-        "original_subject": example.get("subject", ""),
-        "forwarder": example.get("forwarder", ""),
-        "proposed_refinement": refinement,
-        "resolution": None,
-        "conversation_history": [
-            {"role": "system", "timestamp": datetime.now().isoformat(),
-             "content": f"Proposal generated from {example['filename']}"}
-        ],
-    }
-    pending.setdefault("conversations", []).append(conv)
-    save_pending_signals(pending)
+        pending = load_pending_signals()
+        sfid = next_sfid(pending)
+        expires = (datetime.now() + timedelta(days=7)).isoformat()
+        conv = {
+            "id": sfid,
+            "kind": "spam_example_proposal",
+            "status": "awaiting_reply",
+            "created": datetime.now().isoformat(),
+            "expires": expires,
+            "original_message_id": "",
+            "original_from": example.get("from", ""),
+            "original_subject": example.get("subject", ""),
+            "forwarder": example.get("forwarder", ""),
+            "proposed_refinement": refinement,
+            "resolution": None,
+            "conversation_history": [
+                {"role": "system", "timestamp": datetime.now().isoformat(),
+                 "content": f"Proposal generated from {example['filename']}"}
+            ],
+        }
+        pending.setdefault("conversations", []).append(conv)
+        save_pending_signals(pending)
 
     append_refinement_log({
         "ts": datetime.now().isoformat(),
@@ -1355,7 +1468,9 @@ def _run(logger: logging.Logger) -> int:
         logger.info(f"No examples folder at {folder} — nothing to learn")
         return 0
 
-    last_scan = learner_cfg.get("last_scan_timestamp")
+    # Read the scan watermark from learner_state.json (falling back ONCE to the
+    # legacy config value for existing installs — see read_learner_scan_timestamp).
+    last_scan = read_learner_scan_timestamp(config)
     last_scan_dt = datetime.fromisoformat(last_scan) if last_scan else None
 
     new_files = _new_eml_files(folder, last_scan_dt)
@@ -1396,6 +1511,8 @@ def _run(logger: logging.Logger) -> int:
     smtp_conn: list = [None]
 
     signals_needs_save = False
+    # Persistent reinforcement delta from this run's duplicates (audit L1).
+    reinforced_delta: dict = {}
     try:
         for i, cls in enumerate(classifications):
             if i > 0:
@@ -1408,7 +1525,7 @@ def _run(logger: logging.Logger) -> int:
             kind = (cls.get("kind") or "").lower()
             if kind == "duplicate_of":
                 if handle_duplicate(cls, ex, signals_data, config, logger,
-                                    smtp_conn):
+                                    smtp_conn, delta=reinforced_delta):
                     signals_needs_save = True
             elif kind in ("new_pattern", "add_infrastructure"):
                 handle_new_pattern(cls, ex, signals_data, config, logger,
@@ -1425,14 +1542,16 @@ def _run(logger: logging.Logger) -> int:
             smtp_conn[0] = None
 
     if signals_needs_save:
-        signals_data["derived_from_examples"] = int(
-            signals_data.get("derived_from_examples", 0)) + len(examples)
-        save_signals(signals_data)
+        # Apply ONLY this run's delta onto a fresh, under-lock copy of
+        # signals.json — never blind-save the stale run-start snapshot (L1).
+        # The derived_from_examples increment is preserved exactly (len(examples)
+        # when at least one duplicate was reinforced).
+        merge_save_signals_delta(reinforced_delta, derived_increment=len(examples))
 
-    # Update last_scan_timestamp so the next run only considers fresh .emls.
-    config.setdefault("signal_learner", {})["last_scan_timestamp"] = \
-        datetime.now().isoformat()
-    save_config(config)
+    # Update the learner's scan watermark in its OWN file (NOT config.json), so
+    # a concurrent Dashboard config save is never reverted (L3). Same point in
+    # the run as before — timing semantics unchanged.
+    save_learner_scan_timestamp(datetime.now().isoformat())
 
     logger.info(f"Signal learner complete: processed {len(examples)} examples, "
                 f"{len(classifications)} classifications; "

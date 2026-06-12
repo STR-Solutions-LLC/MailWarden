@@ -21,6 +21,8 @@ from email.mime.text import MIMEText
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+import file_lock
+
 from utils import parse_from_address, process_blacklist_entry
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -31,6 +33,10 @@ WHITELIST_PATH = PROJECT_ROOT / "memory" / "whitelist.json"
 BLACKLIST_PATH = PROJECT_ROOT / "memory" / "blacklist.json"
 TOKEN_USAGE_PATH = PROJECT_ROOT / "memory" / "token_usage.json"
 PENDING_SIGNALS_PATH = PROJECT_ROOT / "memory" / "pending_signals.json"
+# The learner now stores its scan watermark here (audit L3) instead of in
+# config.json; the report reads it for the "Last ran" line, falling back to the
+# legacy config value for installs that predate the change.
+LEARNER_STATE_PATH = PROJECT_ROOT / "memory" / "learner_state.json"
 LOG_PATH = PROJECT_ROOT / "logs" / "spam_filter.log"
 
 
@@ -116,81 +122,85 @@ def process_whitelist_emls(whitelist_dir: Path, logger: logging.Logger) -> list:
     Returns a list of dicts describing what was added.
     """
     additions = []
-    whitelist = load_whitelist()
-    existing = {a.lower() for a in whitelist.get("addresses", [])}
+    # Locked read-modify-write of whitelist.json so the filter's command
+    # handlers / Dashboard edits can't be clobbered by this folder sync (C7).
+    # The load is fresh-under-lock and the save stays inside the same hold.
+    with file_lock.locked(WHITELIST_PATH):
+        whitelist = load_whitelist()
+        existing = {a.lower() for a in whitelist.get("addresses", [])}
 
-    if not whitelist_dir.is_dir():
-        logger.warning(f"[WHITELIST] Folder does not exist: {whitelist_dir}")
-        return additions
+        if not whitelist_dir.is_dir():
+            logger.warning(f"[WHITELIST] Folder does not exist: {whitelist_dir}")
+            return additions
 
-    eml_files = sorted(whitelist_dir.glob("*.eml"))
-    if not eml_files:
-        return additions
+        eml_files = sorted(whitelist_dir.glob("*.eml"))
+        if not eml_files:
+            return additions
 
-    changed = False
-    for eml_path in eml_files:
-        try:
-            with open(eml_path, "rb") as f:
-                msg = email.message_from_binary_file(f, policy=email.policy.compat32)
-
-            from_header = msg.get("From", "")
-            parsed = parse_from_address(from_header)
-            addr = parsed.get("address")
-
-            if addr is None:
-                logger.error(
-                    f"[WHITELIST] Failed to parse From: header in {eml_path.name} "
-                    f"— raw header: {from_header!r}. File left for investigation."
-                )
-                continue
-
-            subject = msg.get("Subject", "(no subject)")
-            # Decode subject if needed
+        changed = False
+        for eml_path in eml_files:
             try:
-                decoded_parts = email.header.decode_header(subject)
-                subject_parts = []
-                for part, charset in decoded_parts:
-                    if isinstance(part, bytes):
-                        subject_parts.append(part.decode(charset or "utf-8", errors="replace"))
-                    else:
-                        subject_parts.append(part)
-                subject = " ".join(subject_parts)
-            except Exception:
-                pass
+                with open(eml_path, "rb") as f:
+                    msg = email.message_from_binary_file(f, policy=email.policy.compat32)
 
-            if addr in existing:
+                from_header = msg.get("From", "")
+                parsed = parse_from_address(from_header)
+                addr = parsed.get("address")
+
+                if addr is None:
+                    logger.error(
+                        f"[WHITELIST] Failed to parse From: header in {eml_path.name} "
+                        f"— raw header: {from_header!r}. File left for investigation."
+                    )
+                    continue
+
+                subject = msg.get("Subject", "(no subject)")
+                # Decode subject if needed
+                try:
+                    decoded_parts = email.header.decode_header(subject)
+                    subject_parts = []
+                    for part, charset in decoded_parts:
+                        if isinstance(part, bytes):
+                            subject_parts.append(part.decode(charset or "utf-8", errors="replace"))
+                        else:
+                            subject_parts.append(part)
+                    subject = " ".join(subject_parts)
+                except Exception:
+                    pass
+
+                if addr in existing:
+                    logger.info(
+                        f"[WHITELIST] Address already present: {addr} "
+                        f"(from: {eml_path.name}). Deleting .eml."
+                    )
+                    eml_path.unlink()
+                    continue
+
+                whitelist.setdefault("addresses", []).append(addr)
+                existing.add(addr)
+                changed = True
+
                 logger.info(
-                    f"[WHITELIST] Address already present: {addr} "
-                    f"(from: {eml_path.name}). Deleting .eml."
+                    f"[WHITELIST] Added address: {addr} "
+                    f"(from: {from_header}, subject: {subject})"
                 )
+                additions.append({
+                    "address": addr,
+                    "from_header": from_header,
+                    "subject": subject,
+                })
+
+                # Delete the .eml after successful processing
                 eml_path.unlink()
-                continue
 
-            whitelist.setdefault("addresses", []).append(addr)
-            existing.add(addr)
-            changed = True
+            except Exception as e:
+                logger.error(
+                    f"[WHITELIST] Error processing {eml_path.name}: {e}. "
+                    f"File left for investigation."
+                )
 
-            logger.info(
-                f"[WHITELIST] Added address: {addr} "
-                f"(from: {from_header}, subject: {subject})"
-            )
-            additions.append({
-                "address": addr,
-                "from_header": from_header,
-                "subject": subject,
-            })
-
-            # Delete the .eml after successful processing
-            eml_path.unlink()
-
-        except Exception as e:
-            logger.error(
-                f"[WHITELIST] Error processing {eml_path.name}: {e}. "
-                f"File left for investigation."
-            )
-
-    if changed:
-        save_whitelist(whitelist)
+        if changed:
+            save_whitelist(whitelist)
 
     return additions
 
@@ -225,23 +235,26 @@ def sync_domains_txt(whitelist_dir: Path, logger: logging.Logger) -> dict:
     else:
         logger.warning("[WHITELIST] domains.txt not found")
 
-    whitelist = load_whitelist()
-    old_domains = set(d.lower() for d in whitelist.get("domains", []))
-    new_domains_set = set(new_domains)
+    # Locked read-modify-write of whitelist.json so a concurrent filter command
+    # handler / Dashboard edit is not clobbered by this domains.txt sync (C7).
+    with file_lock.locked(WHITELIST_PATH):
+        whitelist = load_whitelist()
+        old_domains = set(d.lower() for d in whitelist.get("domains", []))
+        new_domains_set = set(new_domains)
 
-    result["added"] = sorted(new_domains_set - old_domains)
-    result["removed"] = sorted(old_domains - new_domains_set)
-    result["total"] = len(new_domains_set)
+        result["added"] = sorted(new_domains_set - old_domains)
+        result["removed"] = sorted(old_domains - new_domains_set)
+        result["total"] = len(new_domains_set)
 
-    if result["added"] or result["removed"]:
-        whitelist["domains"] = sorted(new_domains_set)
-        save_whitelist(whitelist)
-        for d in result["added"]:
-            logger.info(f"[WHITELIST] Domain added: {d}")
-        for d in result["removed"]:
-            logger.info(f"[WHITELIST] Domain removed: {d}")
-    else:
-        logger.info(f"[WHITELIST] Domain list unchanged ({result['total']} domains)")
+        if result["added"] or result["removed"]:
+            whitelist["domains"] = sorted(new_domains_set)
+            save_whitelist(whitelist)
+            for d in result["added"]:
+                logger.info(f"[WHITELIST] Domain added: {d}")
+            for d in result["removed"]:
+                logger.info(f"[WHITELIST] Domain removed: {d}")
+        else:
+            logger.info(f"[WHITELIST] Domain list unchanged ({result['total']} domains)")
 
     return result
 
@@ -405,36 +418,137 @@ def process_imap_blacklist_folders(account: dict, skip_names: set,
 
     try:
         folder_names = ensure_blacklist_folders(conn, prefix, logger)
+        # Locked read-modify-write of blacklist.json so a concurrent filter
+        # command handler / Dashboard edit isn't clobbered by this folder sync
+        # (C7). NOTE: the .lower() on possibly-dict scoped entries (C9) is a
+        # SEPARATE known crash bug owned by Session 9 — left unchanged here.
+        with file_lock.locked(BLACKLIST_PATH):
+            blacklist = load_blacklist()
+            existing_addrs = {a.lower() for a in blacklist.get("addresses", [])}
+            existing_names = {n.lower() for n in blacklist.get("display_names", [])}
+            changed = False
+
+            for subfolder_type, full_name in folder_names.items():
+                try:
+                    status, _ = conn.select(full_name)
+                    if status != "OK":
+                        logger.debug(f"[BLACKLIST] Cannot select {full_name}")
+                        continue
+
+                    status, data = conn.uid("SEARCH", None, "ALL")
+                    if status != "OK":
+                        continue
+
+                    uids = data[0].split() if data[0] else []
+                    if not uids:
+                        continue
+
+                    logger.info(f"[BLACKLIST] Processing {len(uids)} messages in {full_name} ({account_name})")
+
+                    for uid in uids:
+                        # Fetch raw email
+                        status, fetch_data = conn.uid("FETCH", uid, "(BODY.PEEK[])")
+                        if status != "OK" or not fetch_data or not fetch_data[0]:
+                            logger.error(f"[BLACKLIST] Failed to fetch UID {uid} in {full_name}")
+                            continue
+
+                        eml_bytes = fetch_data[0][1]
+                        entry = process_blacklist_entry(eml_bytes, subfolder_type, skip_names)
+
+                        addr = entry.get("address")
+                        name = entry.get("display_name")
+                        warning = entry.get("warning")
+                        skipped = entry.get("skipped_name")
+
+                        addr_added = False
+                        name_added = False
+                        if addr and addr not in existing_addrs:
+                            blacklist.setdefault("addresses", []).append(addr)
+                            existing_addrs.add(addr)
+                            changed = True
+                            addr_added = True
+                        if name and name.lower() not in existing_names:
+                            blacklist.setdefault("display_names", []).append(name)
+                            existing_names.add(name.lower())
+                            changed = True
+                            name_added = True
+
+                        if addr_added or name_added:
+                            logger.info(
+                                f"[BLACKLIST] Added via IMAP ({account_name}/{subfolder_type}): "
+                                f"addr={addr if addr_added else 'no'} name={name if name_added else 'no'}"
+                            )
+                            additions.append({
+                                "address": addr if addr_added else None,
+                                "display_name": name if name_added else None,
+                                "source": f"IMAP, {account_name}",
+                                "subfolder_type": subfolder_type,
+                                "original_from": entry.get("original_from", ""),
+                            })
+                        if warning:
+                            logger.warning(f"[BLACKLIST] {warning}")
+                        if skipped:
+                            logger.info(
+                                f"[BLACKLIST] Skipped generic name '{skipped}' (in skip_names.txt)"
+                            )
+
+                        # Delete the message from the folder
+                        try:
+                            conn.uid("STORE", uid, "+FLAGS", "\\Deleted")
+                        except Exception as e:
+                            logger.error(f"[BLACKLIST] Failed to flag UID {uid} for deletion: {e}")
+
+                    # Expunge after processing all messages in this folder
+                    try:
+                        conn.expunge()
+                    except Exception as e:
+                        logger.error(f"[BLACKLIST] Expunge failed in {full_name}: {e}")
+
+                except Exception as e:
+                    logger.error(f"[BLACKLIST] Error processing {full_name}: {e}")
+
+            if changed:
+                save_blacklist(blacklist)
+
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+
+    return additions
+
+
+def process_filesystem_blacklist_folders(blacklist_dir: Path, skip_names: set,
+                                           logger: logging.Logger) -> list:
+    """Process filesystem blacklist/{both,name-only,address-only} folders."""
+    additions = []
+
+    if not blacklist_dir.is_dir():
+        logger.warning(f"[BLACKLIST] Folder does not exist: {blacklist_dir}")
+        return additions
+
+    # Locked read-modify-write of blacklist.json so a concurrent filter command
+    # handler / Dashboard edit isn't clobbered by this folder sync (C7). NOTE:
+    # the .lower() on possibly-dict scoped entries (C9) is a SEPARATE known
+    # crash bug owned by Session 9 — left unchanged here.
+    with file_lock.locked(BLACKLIST_PATH):
         blacklist = load_blacklist()
         existing_addrs = {a.lower() for a in blacklist.get("addresses", [])}
         existing_names = {n.lower() for n in blacklist.get("display_names", [])}
         changed = False
 
-        for subfolder_type, full_name in folder_names.items():
-            try:
-                status, _ = conn.select(full_name)
-                if status != "OK":
-                    logger.debug(f"[BLACKLIST] Cannot select {full_name}")
-                    continue
+        for subfolder_type in ("both", "name-only", "address-only"):
+            subdir = blacklist_dir / subfolder_type
+            if not subdir.is_dir():
+                continue
 
-                status, data = conn.uid("SEARCH", None, "ALL")
-                if status != "OK":
-                    continue
+            eml_files = sorted(subdir.glob("*.eml"))
+            for eml_path in eml_files:
+                try:
+                    with open(eml_path, "rb") as f:
+                        eml_bytes = f.read()
 
-                uids = data[0].split() if data[0] else []
-                if not uids:
-                    continue
-
-                logger.info(f"[BLACKLIST] Processing {len(uids)} messages in {full_name} ({account_name})")
-
-                for uid in uids:
-                    # Fetch raw email
-                    status, fetch_data = conn.uid("FETCH", uid, "(BODY.PEEK[])")
-                    if status != "OK" or not fetch_data or not fetch_data[0]:
-                        logger.error(f"[BLACKLIST] Failed to fetch UID {uid} in {full_name}")
-                        continue
-
-                    eml_bytes = fetch_data[0][1]
                     entry = process_blacklist_entry(eml_bytes, subfolder_type, skip_names)
 
                     addr = entry.get("address")
@@ -457,120 +571,29 @@ def process_imap_blacklist_folders(account: dict, skip_names: set,
 
                     if addr_added or name_added:
                         logger.info(
-                            f"[BLACKLIST] Added via IMAP ({account_name}/{subfolder_type}): "
+                            f"[BLACKLIST] Added via filesystem ({subfolder_type}): "
                             f"addr={addr if addr_added else 'no'} name={name if name_added else 'no'}"
                         )
                         additions.append({
                             "address": addr if addr_added else None,
                             "display_name": name if name_added else None,
-                            "source": f"IMAP, {account_name}",
+                            "source": "filesystem",
                             "subfolder_type": subfolder_type,
                             "original_from": entry.get("original_from", ""),
                         })
                     if warning:
                         logger.warning(f"[BLACKLIST] {warning}")
                     if skipped:
-                        logger.info(
-                            f"[BLACKLIST] Skipped generic name '{skipped}' (in skip_names.txt)"
-                        )
+                        logger.info(f"[BLACKLIST] Skipped generic name '{skipped}'")
 
-                    # Delete the message from the folder
-                    try:
-                        conn.uid("STORE", uid, "+FLAGS", "\\Deleted")
-                    except Exception as e:
-                        logger.error(f"[BLACKLIST] Failed to flag UID {uid} for deletion: {e}")
+                    # Delete the .eml file
+                    eml_path.unlink()
 
-                # Expunge after processing all messages in this folder
-                try:
-                    conn.expunge()
                 except Exception as e:
-                    logger.error(f"[BLACKLIST] Expunge failed in {full_name}: {e}")
-
-            except Exception as e:
-                logger.error(f"[BLACKLIST] Error processing {full_name}: {e}")
+                    logger.error(f"[BLACKLIST] Error processing {eml_path.name}: {e}")
 
         if changed:
             save_blacklist(blacklist)
-
-    finally:
-        try:
-            conn.logout()
-        except Exception:
-            pass
-
-    return additions
-
-
-def process_filesystem_blacklist_folders(blacklist_dir: Path, skip_names: set,
-                                           logger: logging.Logger) -> list:
-    """Process filesystem blacklist/{both,name-only,address-only} folders."""
-    additions = []
-
-    if not blacklist_dir.is_dir():
-        logger.warning(f"[BLACKLIST] Folder does not exist: {blacklist_dir}")
-        return additions
-
-    blacklist = load_blacklist()
-    existing_addrs = {a.lower() for a in blacklist.get("addresses", [])}
-    existing_names = {n.lower() for n in blacklist.get("display_names", [])}
-    changed = False
-
-    for subfolder_type in ("both", "name-only", "address-only"):
-        subdir = blacklist_dir / subfolder_type
-        if not subdir.is_dir():
-            continue
-
-        eml_files = sorted(subdir.glob("*.eml"))
-        for eml_path in eml_files:
-            try:
-                with open(eml_path, "rb") as f:
-                    eml_bytes = f.read()
-
-                entry = process_blacklist_entry(eml_bytes, subfolder_type, skip_names)
-
-                addr = entry.get("address")
-                name = entry.get("display_name")
-                warning = entry.get("warning")
-                skipped = entry.get("skipped_name")
-
-                addr_added = False
-                name_added = False
-                if addr and addr not in existing_addrs:
-                    blacklist.setdefault("addresses", []).append(addr)
-                    existing_addrs.add(addr)
-                    changed = True
-                    addr_added = True
-                if name and name.lower() not in existing_names:
-                    blacklist.setdefault("display_names", []).append(name)
-                    existing_names.add(name.lower())
-                    changed = True
-                    name_added = True
-
-                if addr_added or name_added:
-                    logger.info(
-                        f"[BLACKLIST] Added via filesystem ({subfolder_type}): "
-                        f"addr={addr if addr_added else 'no'} name={name if name_added else 'no'}"
-                    )
-                    additions.append({
-                        "address": addr if addr_added else None,
-                        "display_name": name if name_added else None,
-                        "source": "filesystem",
-                        "subfolder_type": subfolder_type,
-                        "original_from": entry.get("original_from", ""),
-                    })
-                if warning:
-                    logger.warning(f"[BLACKLIST] {warning}")
-                if skipped:
-                    logger.info(f"[BLACKLIST] Skipped generic name '{skipped}'")
-
-                # Delete the .eml file
-                eml_path.unlink()
-
-            except Exception as e:
-                logger.error(f"[BLACKLIST] Error processing {eml_path.name}: {e}")
-
-    if changed:
-        save_blacklist(blacklist)
 
     return additions
 
@@ -583,28 +606,31 @@ def sync_display_names_txt(blacklist_dir: Path, logger: logging.Logger) -> list:
         logger.warning(f"[BLACKLIST] display_names.txt not found at {path}")
         return added
 
-    blacklist = load_blacklist()
-    existing = {n.lower() for n in blacklist.get("display_names", [])}
-    changed = False
+    # Locked read-modify-write of blacklist.json so a concurrent filter command
+    # handler / Dashboard edit isn't clobbered by this sync (C7).
+    with file_lock.locked(BLACKLIST_PATH):
+        blacklist = load_blacklist()
+        existing = {n.lower() for n in blacklist.get("display_names", [])}
+        changed = False
 
-    try:
-        with open(path, "r") as f:
-            for line in f:
-                line = line.strip().rstrip("\r")
-                if not line or line.startswith("#"):
-                    continue
-                if line.lower() not in existing:
-                    blacklist.setdefault("display_names", []).append(line)
-                    existing.add(line.lower())
-                    added.append(line)
-                    changed = True
-                    logger.info(f"[BLACKLIST] Added display name from file: {line}")
-    except Exception as e:
-        logger.error(f"[BLACKLIST] Failed to read display_names.txt: {e}")
-        return added
+        try:
+            with open(path, "r") as f:
+                for line in f:
+                    line = line.strip().rstrip("\r")
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.lower() not in existing:
+                        blacklist.setdefault("display_names", []).append(line)
+                        existing.add(line.lower())
+                        added.append(line)
+                        changed = True
+                        logger.info(f"[BLACKLIST] Added display name from file: {line}")
+        except Exception as e:
+            logger.error(f"[BLACKLIST] Failed to read display_names.txt: {e}")
+            return added
 
-    if changed:
-        save_blacklist(blacklist)
+        if changed:
+            save_blacklist(blacklist)
 
     return added
 
@@ -764,24 +790,27 @@ def save_pending_signals(data: dict):
 def expire_pending_signals(logger: logging.Logger) -> dict:
     """Expire pending conversations past their expiry date.
     Returns dict with 'expired' list and 'active' list for the report."""
-    pending = load_pending_signals()
     now_iso = datetime.now().isoformat()
     result = {"expired": [], "active": []}
-    changed = False
+    # Locked read-modify-write of pending_signals.json so a concurrent learner
+    # append or filter resolution isn't clobbered by this expiry pass (T5/C7).
+    with file_lock.locked(PENDING_SIGNALS_PATH):
+        pending = load_pending_signals()
+        changed = False
 
-    for conv in pending.get("conversations", []):
-        if conv.get("status") == "awaiting_reply":
-            if now_iso > conv.get("expires", ""):
-                conv["status"] = "expired"
-                conv["resolution"] = "expired"
-                result["expired"].append(conv)
-                changed = True
-                logger.info(f"[SIGNAL] Expired: {conv.get('id')} — {conv.get('original_subject', '')[:40]}")
-            else:
-                result["active"].append(conv)
+        for conv in pending.get("conversations", []):
+            if conv.get("status") == "awaiting_reply":
+                if now_iso > conv.get("expires", ""):
+                    conv["status"] = "expired"
+                    conv["resolution"] = "expired"
+                    result["expired"].append(conv)
+                    changed = True
+                    logger.info(f"[SIGNAL] Expired: {conv.get('id')} — {conv.get('original_subject', '')[:40]}")
+                else:
+                    result["active"].append(conv)
 
-    if changed:
-        save_pending_signals(pending)
+        if changed:
+            save_pending_signals(pending)
 
     # Gather lifetime stats
     all_convs = pending.get("conversations", [])
@@ -1073,7 +1102,16 @@ def build_report_body(config: dict, decisions: dict, last_run: datetime,
 
     # Signal learner status
     learner = config.get("signal_learner", {})
-    last_scan = learner.get("last_scan_timestamp")
+    # Prefer the learner's own state file (L3); fall back to the legacy config
+    # value so installs that predate the change still show an accurate "Last ran".
+    last_scan = None
+    try:
+        with open(LEARNER_STATE_PATH, "r") as f:
+            last_scan = json.load(f).get("last_scan_timestamp")
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    if not last_scan:
+        last_scan = learner.get("last_scan_timestamp")
     sig_version = learner.get("signals_version", "1.0")
     derived = signals_data.get("derived_from_examples", 0)
 
@@ -1225,9 +1263,14 @@ def main():
     api_key = config.get("anthropic", {}).get("api_key", "")
 
     # --- Token usage: load, prune old records, save ---
-    token_usage = load_token_usage()
-    token_usage = prune_token_usage(token_usage)
-    save_token_usage(token_usage)
+    # The report is a THIRD writer of token_usage.json (filter + learner are the
+    # others). Hold the lock across the whole load->prune->save so the load is
+    # fresh-under-lock and the report can't erase a concurrent filter/learner
+    # write (audit D3). 90-day prune behavior is unchanged.
+    with file_lock.locked(TOKEN_USAGE_PATH):
+        token_usage = load_token_usage()
+        token_usage = prune_token_usage(token_usage)
+        save_token_usage(token_usage)
 
     # --- Pending signal expiry cleanup ---
     logger.info("Checking pending signal proposals...")

@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from . import file_lock
 from . import paths
 
 
@@ -180,6 +181,26 @@ def save_config(config: dict) -> None:
         pass
 
 
+def update_config(mutator) -> dict:
+    """Atomic read-modify-write of config.json under the cross-process lock.
+
+    Loads the LATEST config FRESH inside the lock, applies ``mutator(config)``
+    (which mutates the dict in place — its return value is ignored), saves, and
+    returns the saved config. Holding file_lock.locked() across the whole span
+    means a concurrent writer (the filter's command handlers, the EULA save, a
+    peer UI process) cannot land a change between this load and save that the
+    blind save would silently revert (audit C7). The mutator must touch ONLY the
+    keys this caller intends to change — everything else it reads fresh and
+    re-saves untouched. A TimeoutError from locked() (only if a peer hangs >30s)
+    propagates to the caller's existing error handling.
+    """
+    with file_lock.locked(paths.CONFIG_PATH):
+        config = load_config()
+        mutator(config)
+        save_config(config)
+        return config
+
+
 # ---------------------------------------------------------------------------
 # Memory-file helpers
 # ---------------------------------------------------------------------------
@@ -238,6 +259,20 @@ def add_blocklist_entry(value: str, kind: str, scope) -> bool:
     EITHER shape), its scope is updated in place rather than duplicating the
     value. Returns True if the file was changed, False on a bad kind/empty value.
     """
+    # Lock the whole load→modify→save span (C7): a concurrent writer of
+    # blacklist.json (the filter's "block sender" handler, a list-tab edit)
+    # cannot land a change between the fresh load and the save below.
+    with file_lock.locked(paths.BLACKLIST_PATH):
+        return _add_blocklist_entry_locked(value, kind, scope)
+
+
+def _add_blocklist_entry_locked(value: str, kind: str, scope) -> bool:
+    """Unlocked core of add_blocklist_entry — the caller MUST already hold the
+    blacklist.json sidecar lock. flock is not re-entrant across two fds in one
+    process, so a caller that already holds the lock (e.g.
+    apply_blocklist_proposal_from_pending) calls this directly instead of the
+    public wrapper, which would deadlock against itself. Same logic, same
+    return contract as add_blocklist_entry."""
     field = _BLOCK_KIND_TO_FIELD.get((kind or "").strip().lower())
     if field is None:
         return False
@@ -354,18 +389,21 @@ def delete_active_refinement(refinement_id: str, source: str = "dashboard",
                               reason: str = "") -> bool:
     """Remove a refinement from the active list. Logs the deletion.
     Returns True if something was deleted, False if id wasn't found."""
-    data = load_signals()
-    remaining = []
-    found = None
-    for r in data.get("ai_refinements", []):
-        if r.get("id") == refinement_id:
-            found = r
-            continue
-        remaining.append(r)
-    if found is None:
-        return False
-    data["ai_refinements"] = remaining
-    save_signals(data)
+    # Lock the signals.json RMW span (C7): the learner's merge-save or a
+    # concurrent Dashboard edit cannot race this delete and resurrect the row.
+    with file_lock.locked(paths.SIGNALS_PATH):
+        data = load_signals()
+        remaining = []
+        found = None
+        for r in data.get("ai_refinements", []):
+            if r.get("id") == refinement_id:
+                found = r
+                continue
+            remaining.append(r)
+        if found is None:
+            return False
+        data["ai_refinements"] = remaining
+        save_signals(data)
     append_refinement_log({
         "ts": now_iso(),
         "event": "deleted",
@@ -386,13 +424,16 @@ def set_refinement_scope(refinement_id: str, scope) -> bool:
     per-account toggle row so a scope change takes effect on the next filter
     tick without an email round-trip.
     """
-    data = load_signals()
-    for r in data.get("ai_refinements", []):
-        if r.get("id") == refinement_id:
-            r["scope"] = scope
-            save_signals(data)
-            return True
-    return False
+    # Lock the signals.json RMW span (C7): a fresh read under the lock means a
+    # concurrent learner merge-save / Dashboard edit isn't clobbered by this one.
+    with file_lock.locked(paths.SIGNALS_PATH):
+        data = load_signals()
+        for r in data.get("ai_refinements", []):
+            if r.get("id") == refinement_id:
+                r["scope"] = scope
+                save_signals(data)
+                return True
+        return False
 
 
 def apply_refinement_from_pending(sfid: str, source: str = "dashboard") -> dict | None:
@@ -404,55 +445,62 @@ def apply_refinement_from_pending(sfid: str, source: str = "dashboard") -> dict 
     when the SFID wasn't found / wasn't an approvable kind / was already
     resolved.
     """
-    pending = load_pending_signals()
-    conv = None
-    for c in pending.get("conversations", []):
-        if c.get("id") == sfid:
-            conv = c
-            break
-    if conv is None:
-        return None
-    if conv.get("status") not in ("awaiting_reply",):
-        return None
-    if conv.get("kind") != "spam_example_proposal":
-        return None
-    refinement = conv.get("proposed_refinement")
-    if not isinstance(refinement, dict):
-        return None
+    # ONE lock over BOTH files for the whole operation (C7). file_lock.locked
+    # sorts the two sidecar paths into a fixed order internally, so this can
+    # never deadlock against another op that takes the same pair in the opposite
+    # order. Fresh reads under the lock mean a concurrent learner save or a
+    # parallel approval cannot be clobbered.
+    with file_lock.locked(paths.PENDING_SIGNALS_PATH, paths.SIGNALS_PATH):
+        pending = load_pending_signals()
+        conv = None
+        for c in pending.get("conversations", []):
+            if c.get("id") == sfid:
+                conv = c
+                break
+        if conv is None:
+            return None
+        if conv.get("status") not in ("awaiting_reply",):
+            return None
+        if conv.get("kind") != "spam_example_proposal":
+            return None
+        refinement = conv.get("proposed_refinement")
+        if not isinstance(refinement, dict):
+            return None
 
-    # Add to active list
-    data = load_signals()
-    refinements = data.setdefault("ai_refinements", [])
-    existing_ids = {r.get("id") for r in refinements}
-    if refinement.get("id") in existing_ids:
-        # Already active — treat as no-op but still mark conv resolved
-        pass
-    else:
-        refinement = dict(refinement)
-        # P1 approval backstop: proposals created before scope-capture existed
-        # carry no scope. Bind them to the inbox that forwarded the example so
-        # the rule does not silently leak onto every account. Only fills a
-        # MISSING scope key — never overwrites a scope the proposal already has
-        # (including an empty list, which is a deliberate "no accounts").
-        if "scope" not in refinement:
-            conv_forwarder = (conv.get("forwarder") or "").strip().lower()
-            if conv_forwarder:
-                refinement["scope"] = [conv_forwarder]
-        refinement["status"] = "active"
-        refinement.setdefault("first_learned", now_iso())
-        refinement.setdefault("last_reinforced", now_iso())
-        refinement.setdefault("match_count", 1)
-        refinements.append(refinement)
-        save_signals(data)
+        # Add to active list
+        data = load_signals()
+        refinements = data.setdefault("ai_refinements", [])
+        existing_ids = {r.get("id") for r in refinements}
+        if refinement.get("id") in existing_ids:
+            # Already active — treat as no-op but still mark conv resolved
+            pass
+        else:
+            refinement = dict(refinement)
+            # P1 approval backstop: proposals created before scope-capture
+            # existed carry no scope. Bind them to the inbox that forwarded the
+            # example so the rule does not silently leak onto every account.
+            # Only fills a MISSING scope key — never overwrites a scope the
+            # proposal already has (including an empty list, a deliberate
+            # "no accounts").
+            if "scope" not in refinement:
+                conv_forwarder = (conv.get("forwarder") or "").strip().lower()
+                if conv_forwarder:
+                    refinement["scope"] = [conv_forwarder]
+            refinement["status"] = "active"
+            refinement.setdefault("first_learned", now_iso())
+            refinement.setdefault("last_reinforced", now_iso())
+            refinement.setdefault("match_count", 1)
+            refinements.append(refinement)
+            save_signals(data)
 
-    conv["status"] = "approved"
-    conv["resolution"] = "approved"
-    conv.setdefault("conversation_history", []).append({
-        "role": "system",
-        "timestamp": now_iso(),
-        "content": f"Approved via {source}",
-    })
-    save_pending_signals(pending)
+        conv["status"] = "approved"
+        conv["resolution"] = "approved"
+        conv.setdefault("conversation_history", []).append({
+            "role": "system",
+            "timestamp": now_iso(),
+            "content": f"Approved via {source}",
+        })
+        save_pending_signals(pending)
     append_refinement_log({
         "ts": now_iso(),
         "event": "applied",
@@ -474,33 +522,41 @@ def apply_blocklist_proposal_from_pending(sfid: str,
     tick. Returns the written entry dict, or None when the SFID wasn't found /
     wasn't a block_sender_proposal / was already resolved.
     """
-    pending = load_pending_signals()
-    conv = None
-    for c in pending.get("conversations", []):
-        if c.get("id") == sfid:
-            conv = c
-            break
-    if conv is None:
-        return None
-    if conv.get("status") not in ("awaiting_reply",):
-        return None
-    if conv.get("kind") != "block_sender_proposal":
-        return None
-    entry = conv.get("blocklist_entry")
-    if not isinstance(entry, dict) or not entry.get("value"):
-        return None
+    # ONE lock over BOTH files for the whole operation (C7), sorted internally
+    # so it can't deadlock against a peer taking the same pair in the other
+    # order. The blacklist write below uses the UNLOCKED core
+    # (_add_blocklist_entry_locked) on purpose: flock is not re-entrant across
+    # two fds in one process, so calling the locking add_blocklist_entry here
+    # would block forever waiting on the lock this very call already holds.
+    with file_lock.locked(paths.PENDING_SIGNALS_PATH, paths.BLACKLIST_PATH):
+        pending = load_pending_signals()
+        conv = None
+        for c in pending.get("conversations", []):
+            if c.get("id") == sfid:
+                conv = c
+                break
+        if conv is None:
+            return None
+        if conv.get("status") not in ("awaiting_reply",):
+            return None
+        if conv.get("kind") != "block_sender_proposal":
+            return None
+        entry = conv.get("blocklist_entry")
+        if not isinstance(entry, dict) or not entry.get("value"):
+            return None
 
-    add_blocklist_entry(entry.get("value", ""), entry.get("kind", "domain"),
-                        entry.get("scope", "all"))
+        _add_blocklist_entry_locked(entry.get("value", ""),
+                                    entry.get("kind", "domain"),
+                                    entry.get("scope", "all"))
 
-    conv["status"] = "approved"
-    conv["resolution"] = "approved"
-    conv.setdefault("conversation_history", []).append({
-        "role": "system",
-        "timestamp": now_iso(),
-        "content": f"Block-sender approved via {source}",
-    })
-    save_pending_signals(pending)
+        conv["status"] = "approved"
+        conv["resolution"] = "approved"
+        conv.setdefault("conversation_history", []).append({
+            "role": "system",
+            "timestamp": now_iso(),
+            "content": f"Block-sender approved via {source}",
+        })
+        save_pending_signals(pending)
     append_refinement_log({
         "ts": now_iso(),
         "event": "applied",
@@ -515,22 +571,25 @@ def apply_blocklist_proposal_from_pending(sfid: str,
 def reject_pending(sfid: str, source: str = "dashboard",
                     reason: str = "") -> bool:
     """Mark a pending SFID proposal as rejected. Works for any kind."""
-    pending = load_pending_signals()
-    conv = None
-    for c in pending.get("conversations", []):
-        if c.get("id") == sfid:
-            conv = c
-            break
-    if conv is None or conv.get("status") not in ("awaiting_reply",):
-        return False
-    conv["status"] = "rejected"
-    conv["resolution"] = "rejected"
-    conv.setdefault("conversation_history", []).append({
-        "role": "system",
-        "timestamp": now_iso(),
-        "content": f"Rejected via {source}" + (f": {reason}" if reason else ""),
-    })
-    save_pending_signals(pending)
+    # Lock the pending_signals.json RMW span (C7): a concurrent filter command
+    # handler / parallel approval cannot race this reject and lose either edit.
+    with file_lock.locked(paths.PENDING_SIGNALS_PATH):
+        pending = load_pending_signals()
+        conv = None
+        for c in pending.get("conversations", []):
+            if c.get("id") == sfid:
+                conv = c
+                break
+        if conv is None or conv.get("status") not in ("awaiting_reply",):
+            return False
+        conv["status"] = "rejected"
+        conv["resolution"] = "rejected"
+        conv.setdefault("conversation_history", []).append({
+            "role": "system",
+            "timestamp": now_iso(),
+            "content": f"Rejected via {source}" + (f": {reason}" if reason else ""),
+        })
+        save_pending_signals(pending)
     refinement_id = (conv.get("proposed_refinement") or {}).get("id", "")
     append_refinement_log({
         "ts": now_iso(),
@@ -545,13 +604,16 @@ def reject_pending(sfid: str, source: str = "dashboard",
 
 def withdraw_pending(sfid: str, source: str = "dashboard") -> bool:
     """Remove a pending proposal the user no longer wants to decide on."""
-    pending = load_pending_signals()
-    before = len(pending.get("conversations", []))
-    pending["conversations"] = [c for c in pending.get("conversations", [])
-                                 if c.get("id") != sfid]
-    if len(pending["conversations"]) == before:
-        return False
-    save_pending_signals(pending)
+    # Lock the pending_signals.json RMW span (C7): the fresh read under the lock
+    # means a concurrent writer's change to the conversation list isn't erased.
+    with file_lock.locked(paths.PENDING_SIGNALS_PATH):
+        pending = load_pending_signals()
+        before = len(pending.get("conversations", []))
+        pending["conversations"] = [c for c in pending.get("conversations", [])
+                                     if c.get("id") != sfid]
+        if len(pending["conversations"]) == before:
+            return False
+        save_pending_signals(pending)
     append_refinement_log({
         "ts": now_iso(),
         "event": "withdrawn",

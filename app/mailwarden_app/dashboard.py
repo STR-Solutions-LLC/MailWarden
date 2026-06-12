@@ -22,6 +22,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from . import config_io
 from . import explain_text
+from . import file_lock
 from . import help_content
 from . import paths
 from . import smappservice_install
@@ -1026,9 +1027,11 @@ class HomeTab(ttk.Frame):
             ):
                 self._dry_run_var.set(True)
                 return
-        config = config_io.load_config()
-        config.setdefault("filter", {})["dry_run"] = new_val
-        config_io.save_config(config)
+        # C7: fresh read + write under the lock so a peer's concurrent config
+        # change isn't reverted; we touch ONLY filter.dry_run.
+        def _set(c):
+            c.setdefault("filter", {})["dry_run"] = new_val
+        config_io.update_config(_set)
         self.refresh()
 
     def _on_run_now(self):
@@ -1297,9 +1300,13 @@ class AccountsTab(ttk.Frame):
         dlg = setup_assistant.AccountFormDialog(self.app)
         self.app.wait_window(dlg)
         if dlg.saved_account is not None:
-            config = config_io.load_config()
-            config.setdefault("accounts", []).append(dlg.saved_account)
-            config_io.save_config(config)
+            # C7: the dialog ran (user interaction) BETWEEN the old load and
+            # save — a stale-snapshot window. Apply ONLY the accounts append on
+            # a FRESH read under the lock so a peer's concurrent config change
+            # isn't reverted.
+            def _append(config):
+                config.setdefault("accounts", []).append(dlg.saved_account)
+            config_io.update_config(_append)
             self.app.refresh_all()
 
     def _on_edit(self):
@@ -1307,35 +1314,41 @@ class AccountsTab(ttk.Frame):
         if idx is None:
             return
         from . import setup_assistant
-        config = config_io.load_config()
-        existing = config["accounts"][idx]
+        existing = config_io.load_config()["accounts"][idx]
         dlg = setup_assistant.AccountFormDialog(self.app, existing=existing)
         self.app.wait_window(dlg)
         if dlg.saved_account is not None:
-            config["accounts"][idx] = dlg.saved_account
-            config_io.save_config(config)
+            # C7: dialog interaction between read and write — replace ONLY the
+            # account at idx on a fresh read under the lock.
+            def _replace(config):
+                config["accounts"][idx] = dlg.saved_account
+            config_io.update_config(_replace)
             self.app.refresh_all()
 
     def _on_remove(self):
         idx = self._selected_index()
         if idx is None:
             return
-        config = config_io.load_config()
-        name = config["accounts"][idx]["name"]
+        name = config_io.load_config()["accounts"][idx]["name"]
         if not messagebox.askyesno("Remove account?",
                                     f"Remove account '{name}' from MailWarden?"):
             return
-        del config["accounts"][idx]
-        config_io.save_config(config)
+        # C7: askyesno interaction between read and write — delete ONLY the
+        # account at idx on a fresh read under the lock.
+        def _delete(config):
+            del config["accounts"][idx]
+        config_io.update_config(_delete)
         self.app.refresh_all()
 
     def _on_toggle(self):
         idx = self._selected_index()
         if idx is None:
             return
-        config = config_io.load_config()
-        config["accounts"][idx]["enabled"] = not config["accounts"][idx].get("enabled", True)
-        config_io.save_config(config)
+        # C7: flip ONLY accounts[idx].enabled on a fresh read under the lock.
+        def _flip(config):
+            config["accounts"][idx]["enabled"] = \
+                not config["accounts"][idx].get("enabled", True)
+        config_io.update_config(_flip)
         self.app.refresh_all()
 
 
@@ -1535,41 +1548,49 @@ class ListsTab(ttk.Frame):
                     if not proceed:
                         return
 
-                # --- Deduplication ---
-                data = config_io.load_blacklist()
-                if val in {d.lower() for d in data.get("domains", [])}:
-                    messagebox.showinfo("Already blocked",
-                                        f"'{val}' is already on the blacklist.",
-                                        parent=self.app)
-                    return
-                data.setdefault("domains", []).append(val)
-                config_io.save_blacklist(data)
+                # --- Deduplication + write (C7: dedup-load + append + save
+                # under one lock so a concurrent writer of blacklist.json isn't
+                # clobbered; the fresh read inside the lock is the dedup read). ---
+                with file_lock.locked(paths.BLACKLIST_PATH):
+                    data = config_io.load_blacklist()
+                    if val in {d.lower() for d in data.get("domains", [])}:
+                        messagebox.showinfo("Already blocked",
+                                            f"'{val}' is already on the blacklist.",
+                                            parent=self.app)
+                        return
+                    data.setdefault("domains", []).append(val)
+                    config_io.save_blacklist(data)
             else:
-                # Whitelist domain
-                data = config_io.load_whitelist()
-                if val in {d.lower() for d in data.get("domains", [])}:
-                    messagebox.showinfo("Already whitelisted",
-                                        f"'{val}' is already on the whitelist.",
-                                        parent=self.app)
-                    return
-                data.setdefault("domains", []).append(val)
-                config_io.save_whitelist(data)
+                # Whitelist domain (C7: dedup-load + append + save under lock).
+                with file_lock.locked(paths.WHITELIST_PATH):
+                    data = config_io.load_whitelist()
+                    if val in {d.lower() for d in data.get("domains", [])}:
+                        messagebox.showinfo("Already whitelisted",
+                                            f"'{val}' is already on the whitelist.",
+                                            parent=self.app)
+                        return
+                    data.setdefault("domains", []).append(val)
+                    config_io.save_whitelist(data)
         elif which == "whitelist":
             val = val.strip()
-            data = config_io.load_whitelist()
-            key = "addresses" if kind == "address" else "domains"
-            if val.lower() not in {x.lower() for x in data[key]}:
-                data[key].append(val)
-                config_io.save_whitelist(data)
+            # C7: dedup-load + append + save under one lock.
+            with file_lock.locked(paths.WHITELIST_PATH):
+                data = config_io.load_whitelist()
+                key = "addresses" if kind == "address" else "domains"
+                if val.lower() not in {x.lower() for x in data[key]}:
+                    data[key].append(val)
+                    config_io.save_whitelist(data)
         else:
             val = val.strip()
-            data = config_io.load_blacklist()
-            key = {"address": "addresses",
-                   "display_name": "display_names",
-                   "subject_keyword": "subject_keywords"}[kind]
-            if val.lower() not in {x.lower() for x in data.setdefault(key, [])}:
-                data[key].append(val)
-                config_io.save_blacklist(data)
+            # C7: dedup-load + append + save under one lock.
+            with file_lock.locked(paths.BLACKLIST_PATH):
+                data = config_io.load_blacklist()
+                key = {"address": "addresses",
+                       "display_name": "display_names",
+                       "subject_keyword": "subject_keywords"}[kind]
+                if val.lower() not in {x.lower() for x in data.setdefault(key, [])}:
+                    data[key].append(val)
+                    config_io.save_blacklist(data)
         self.refresh()
 
     def _remove_entry(self, which: str):
@@ -1579,22 +1600,26 @@ class ListsTab(ttk.Frame):
             return
         kind, value = tree.item(sel[0], "values")
         if which == "whitelist":
-            data = config_io.load_whitelist()
-            key = "addresses" if kind == "address" else "domains"
-            data[key] = [x for x in data[key] if x.lower() != value.lower()]
-            config_io.save_whitelist(data)
+            # C7: load + filter + save under one lock (fresh read under lock).
+            with file_lock.locked(paths.WHITELIST_PATH):
+                data = config_io.load_whitelist()
+                key = "addresses" if kind == "address" else "domains"
+                data[key] = [x for x in data[key] if x.lower() != value.lower()]
+                config_io.save_whitelist(data)
         else:
-            data = config_io.load_blacklist()
-            if kind == "address":
-                key = "addresses"
-            elif kind == "domain":
-                key = "domains"
-            elif kind == "subject_keyword":
-                key = "subject_keywords"
-            else:
-                key = "display_names"
-            data[key] = [x for x in data.get(key, []) if x.lower() != value.lower()]
-            config_io.save_blacklist(data)
+            # C7: load + filter + save under one lock (fresh read under lock).
+            with file_lock.locked(paths.BLACKLIST_PATH):
+                data = config_io.load_blacklist()
+                if kind == "address":
+                    key = "addresses"
+                elif kind == "domain":
+                    key = "domains"
+                elif kind == "subject_keyword":
+                    key = "subject_keywords"
+                else:
+                    key = "display_names"
+                data[key] = [x for x in data.get(key, []) if x.lower() != value.lower()]
+                config_io.save_blacklist(data)
         self.refresh()
 
     def _on_import_csv(self):
@@ -3303,16 +3328,22 @@ class SettingsTab(ttk.Frame):
         self._pause_btn.config(text=("Resume all filtering" if paused else "Pause all filtering"))
 
     def _on_save_api(self):
-        config = config_io.load_config()
-        config.setdefault("anthropic", {})["api_key"] = self._api_var.get().strip()
-        # Also save model + threshold + max
-        for label, value in MODEL_CHOICES:
-            if label == self._model_var.get():
-                config["anthropic"]["model"] = value
-                break
-        config["anthropic"]["confidence_threshold"] = round(float(self._threshold_var.get()), 2)
-        config.setdefault("filter", {})["max_emails_per_run"] = int(self._maxrun_var.get())
-        config_io.save_config(config)
+        # Read the Tk vars once (this runs on the Tk thread), then apply ONLY
+        # these keys on a fresh read under the lock (C7).
+        api_key = self._api_var.get().strip()
+        model_label = self._model_var.get()
+        model_value = next((v for label, v in MODEL_CHOICES
+                            if label == model_label), None)
+        threshold = round(float(self._threshold_var.get()), 2)
+        max_per_run = int(self._maxrun_var.get())
+
+        def _apply(config):
+            config.setdefault("anthropic", {})["api_key"] = api_key
+            if model_value is not None:
+                config["anthropic"]["model"] = model_value
+            config["anthropic"]["confidence_threshold"] = threshold
+            config.setdefault("filter", {})["max_emails_per_run"] = max_per_run
+        config_io.update_config(_apply)
         self._api_status.config(text="Saved.")
 
     def _on_model_selected(self, _event=None):
@@ -3328,9 +3359,10 @@ class SettingsTab(ttk.Frame):
             (v for label, v in MODEL_CHOICES if label == selected), None)
         if model_value is None:
             return
-        config = config_io.load_config()
-        config.setdefault("anthropic", {})["model"] = model_value
-        config_io.save_config(config)
+        # C7: set ONLY anthropic.model on a fresh read under the lock.
+        def _set(config):
+            config.setdefault("anthropic", {})["model"] = model_value
+        config_io.update_config(_set)
         self._show_model_saved()
 
     def _show_model_saved(self):
@@ -3371,10 +3403,11 @@ class SettingsTab(ttk.Frame):
         # preference to config.json so the filter/report agents respect it,
         # and then register or unregister via SMAppService. No launchctl or
         # plist writing needed.
-        config = config_io.load_config()
         on = bool(self._menubar_var.get())
-        config.setdefault("ui", {})["menu_bar_enabled"] = on
-        config_io.save_config(config)
+        # C7: write ONLY ui.menu_bar_enabled on a fresh read under the lock.
+        def _set(config):
+            config.setdefault("ui", {})["menu_bar_enabled"] = on
+        config_io.update_config(_set)
         try:
             if on:
                 ok, err = smappservice_install.register_menubar()
@@ -3388,10 +3421,11 @@ class SettingsTab(ttk.Frame):
             messagebox.showerror("Menu bar", str(e))
 
     def _on_train_prompt_toggle(self):
-        config = config_io.load_config()
-        config.setdefault("ui", {})["prompt_missing_train_folder"] = \
-            bool(self._train_prompt_var.get())
-        config_io.save_config(config)
+        on = bool(self._train_prompt_var.get())
+        # C7: write ONLY ui.prompt_missing_train_folder fresh under the lock.
+        def _set(config):
+            config.setdefault("ui", {})["prompt_missing_train_folder"] = on
+        config_io.update_config(_set)
 
     def _on_check_train_folders_now(self):
         # Button bypasses the prompt-on-launch setting — user explicitly asked.
@@ -3409,10 +3443,11 @@ class SettingsTab(ttk.Frame):
         except ValueError:
             messagebox.showerror("Time format", "Use HH:MM in 24-hour format.")
             return
-        config = config_io.load_config()
-        config.setdefault("summary", {})["hour"] = h
-        config["summary"]["minute"] = m
-        config_io.save_config(config)
+        # C7: write ONLY summary.hour/minute fresh under the lock.
+        def _set(config):
+            config.setdefault("summary", {})["hour"] = h
+            config["summary"]["minute"] = m
+        config_io.update_config(_set)
         # v1.6.0: SMAppService plists are static inside the .app bundle.
         # Schedule changes are written to config.json; daily_report.py reads
         # config.json at runtime for its report hour/minute. No plist rewrite
@@ -3447,9 +3482,10 @@ class SettingsTab(ttk.Frame):
                 f"Continue?")
             if not proceed:
                 return
-        config = config_io.load_config()
-        config.setdefault("filter", {})["interval_minutes"] = minutes
-        config_io.save_config(config)
+        # C7: write ONLY filter.interval_minutes fresh under the lock.
+        def _set(config):
+            config.setdefault("filter", {})["interval_minutes"] = minutes
+        config_io.update_config(_set)
         # v1.6.0: SMAppService plists are static and signed read-only, so the
         # cadence can't be written into the plist. Instead the plist wakes the
         # filter every 5 minutes and spam_filter.run_filter() reads this value
@@ -3999,37 +4035,42 @@ class SettingsTab(ttk.Frame):
         self.after(150, lambda: _poll_worker(t))
 
     def _on_pause_toggle(self):
-        config = config_io.load_config()
-        accounts = config.get("accounts", [])
-        if not accounts:
-            return
-        ui = config.setdefault("ui", {})
-        currently_paused = not any(a.get("enabled") for a in accounts)
-        if currently_paused:
-            # Restore per-position. The old version keyed on account name,
-            # which collapsed duplicate/empty names into the same bucket
-            # and lost one account's enabled state on resume. Using index
-            # survives duplicates and un-named accounts.
-            pre_list = ui.get("_pre_pause_enabled_list")
-            if isinstance(pre_list, list) and len(pre_list) == len(accounts):
-                for a, was_enabled in zip(accounts, pre_list):
-                    a["enabled"] = bool(was_enabled)
+        # C7: run the whole load->flip-pause-keys->save FRESH under the lock
+        # (the same fix as menu_bar.toggle_pause). The mutator touches ONLY the
+        # pause keys; every other config key is read fresh and re-saved
+        # untouched, so a peer's concurrent change can't be reverted and the
+        # pause flag can't be erased by a peer's blind save.
+        def _flip_pause(config):
+            accounts = config.get("accounts", [])
+            if not accounts:
+                return
+            ui = config.setdefault("ui", {})
+            currently_paused = not any(a.get("enabled") for a in accounts)
+            if currently_paused:
+                # Restore per-position. The old version keyed on account name,
+                # which collapsed duplicate/empty names into the same bucket
+                # and lost one account's enabled state on resume. Using index
+                # survives duplicates and un-named accounts.
+                pre_list = ui.get("_pre_pause_enabled_list")
+                if isinstance(pre_list, list) and len(pre_list) == len(accounts):
+                    for a, was_enabled in zip(accounts, pre_list):
+                        a["enabled"] = bool(was_enabled)
+                else:
+                    # Fall back to the name-keyed legacy map (older configs) or
+                    # default everything to enabled if no snapshot exists.
+                    legacy = ui.get("_pre_pause_enabled", {})
+                    for a in accounts:
+                        a["enabled"] = bool(legacy.get(a.get("name", ""), True))
+                ui.pop("_pre_pause_enabled_list", None)
+                ui.pop("_pre_pause_enabled", None)
+                ui["paused"] = False
             else:
-                # Fall back to the name-keyed legacy map (older configs) or
-                # default everything to enabled if no snapshot exists.
-                legacy = ui.get("_pre_pause_enabled", {})
+                ui["_pre_pause_enabled_list"] = [bool(a.get("enabled")) for a in accounts]
+                ui.pop("_pre_pause_enabled", None)  # clear any legacy key
                 for a in accounts:
-                    a["enabled"] = bool(legacy.get(a.get("name", ""), True))
-            ui.pop("_pre_pause_enabled_list", None)
-            ui.pop("_pre_pause_enabled", None)
-            ui["paused"] = False
-        else:
-            ui["_pre_pause_enabled_list"] = [bool(a.get("enabled")) for a in accounts]
-            ui.pop("_pre_pause_enabled", None)  # clear any legacy key
-            for a in accounts:
-                a["enabled"] = False
-            ui["paused"] = True
-        config_io.save_config(config)
+                    a["enabled"] = False
+                ui["paused"] = True
+        config_io.update_config(_flip_pause)
         self.app.refresh_all()
 
     def _on_share_signals(self):
@@ -5035,14 +5076,10 @@ def _last_filter_run() -> datetime | None:
 
 
 def _lock_active() -> bool:
-    import time
-    if not paths.FILTER_LOCK.exists():
-        return False
-    try:
-        age = time.time() - paths.FILTER_LOCK.stat().st_mtime
-        return age < 600
-    except OSError:
-        return False
+    # Probe the real flock instead of the lock file's mtime, in lockstep with
+    # menu_bar.lock_is_active and the app_entrypoint filter lock: a live holder
+    # is detected for the whole run and a dead holder reads as free at once.
+    return file_lock.is_locked(paths.FILTER_LOCK)
 
 
 def _determine_health(last_run: datetime | None) -> tuple[str, str]:
@@ -5226,19 +5263,24 @@ def _is_newer(latest: str, installed: str) -> bool:
 
 def _import_tabular_csv(path: Path) -> tuple[int, int]:
     added = skipped = 0
-    wl = config_io.load_whitelist()
-    bl = config_io.load_blacklist()
-    with path.open(newline="") as f:
-        reader = csv.reader(f)
-        header = [h.strip().lower() for h in next(reader, [])]
-        for row in reader:
-            if not row:
-                continue
-            added_this, skipped_this = _absorb_row(header, row, wl, bl)
-            added += added_this
-            skipped += skipped_this
-    config_io.save_whitelist(wl)
-    config_io.save_blacklist(bl)
+    # C7: load BOTH lists, absorb every row, save BOTH — all under ONE lock over
+    # both files (file_lock sorts the pair internally, so it can't deadlock
+    # against a peer taking them in the other order). Fresh reads under the lock
+    # mean a concurrent list-tab edit isn't clobbered by this bulk import.
+    with file_lock.locked(paths.WHITELIST_PATH, paths.BLACKLIST_PATH):
+        wl = config_io.load_whitelist()
+        bl = config_io.load_blacklist()
+        with path.open(newline="") as f:
+            reader = csv.reader(f)
+            header = [h.strip().lower() for h in next(reader, [])]
+            for row in reader:
+                if not row:
+                    continue
+                added_this, skipped_this = _absorb_row(header, row, wl, bl)
+                added += added_this
+                skipped += skipped_this
+        config_io.save_whitelist(wl)
+        config_io.save_blacklist(bl)
     return added, skipped
 
 
@@ -5254,17 +5296,19 @@ def _import_tabular_xlsx(path: Path) -> tuple[int, int]:
     header = [str(h).strip().lower() if h is not None else "" for h in header_row]
 
     added = skipped = 0
-    wl = config_io.load_whitelist()
-    bl = config_io.load_blacklist()
-    for row in rows_iter:
-        if row is None:
-            continue
-        added_this, skipped_this = _absorb_row(
-            header, [str(c) if c is not None else "" for c in row], wl, bl)
-        added += added_this
-        skipped += skipped_this
-    config_io.save_whitelist(wl)
-    config_io.save_blacklist(bl)
+    # C7: same one-lock-over-both-files bulk import as the CSV path.
+    with file_lock.locked(paths.WHITELIST_PATH, paths.BLACKLIST_PATH):
+        wl = config_io.load_whitelist()
+        bl = config_io.load_blacklist()
+        for row in rows_iter:
+            if row is None:
+                continue
+            added_this, skipped_this = _absorb_row(
+                header, [str(c) if c is not None else "" for c in row], wl, bl)
+            added += added_this
+            skipped += skipped_this
+        config_io.save_whitelist(wl)
+        config_io.save_blacklist(bl)
     return added, skipped
 
 

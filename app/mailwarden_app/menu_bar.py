@@ -13,7 +13,6 @@ import os
 import signal
 import subprocess
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -23,12 +22,12 @@ except ImportError:  # rumps is only present in the bundled .app
     rumps = None  # type: ignore
 
 from . import config_io
+from . import file_lock
 from . import paths
 from . import startup_log
 
 
 POLL_INTERVAL_SEC = 30
-LOCK_MAX_AGE_SEC = 600
 
 # Menu bar indicator: prefer a real image file (the app icon) because
 # text glyphs have repeatedly failed the font-fallback lottery on Sonoma
@@ -142,13 +141,10 @@ def determine_state() -> tuple[str, str, str]:
 
 
 def lock_is_active() -> bool:
-    if not paths.FILTER_LOCK.exists():
-        return False
-    try:
-        age = time.time() - paths.FILTER_LOCK.stat().st_mtime
-        return age < LOCK_MAX_AGE_SEC
-    except OSError:
-        return False
+    # Probe the real flock instead of the lock file's mtime: a live holder is
+    # detected no matter how long it has run, and a dead holder reads as free
+    # immediately (no 10-minute staleness window).
+    return file_lock.is_locked(paths.FILTER_LOCK)
 
 
 def run_filter_subprocess() -> tuple[bool, str]:
@@ -259,38 +255,55 @@ def toggle_pause() -> tuple[bool, str]:
     per-account enabled state for accounts that were already disabled before the
     pause.
     """
-    config = config_io.load_config()
-    accounts = config.get("accounts", [])
-    if not accounts:
+    # C7 fix: persist through config_io.update_config so the whole
+    # load->flip-pause-keys->save runs FRESH under the cross-process lock. A
+    # config change another writer (the filter's command handler, the EULA save,
+    # the Dashboard) committed between this read and write is no longer silently
+    # reverted, and the pause flag can no longer be erased by a peer's blind
+    # save. The mutator touches ONLY the pause keys (accounts[].enabled and the
+    # ui pause snapshot) — every other key is read fresh and re-saved untouched.
+    if not config_io.load_config().get("accounts"):
         return False, "No accounts configured."
 
-    currently_paused = not any(a.get("enabled") for a in accounts)
-    ui = config.setdefault("ui", {})
+    result: dict = {}
 
-    if currently_paused:
-        # Restore per-position (index-keyed to survive duplicate/empty names).
-        pre_list = ui.get("_pre_pause_enabled_list")
-        if isinstance(pre_list, list) and len(pre_list) == len(accounts):
-            for a, was_enabled in zip(accounts, pre_list):
-                a["enabled"] = bool(was_enabled)
+    def _flip_pause(config: dict) -> None:
+        accounts = config.get("accounts", [])
+        if not accounts:
+            # Raced to empty between the guard above and the lock — bail without
+            # changing anything; the outer return uses result["msg"].
+            result["paused"] = False
+            result["msg"] = "No accounts configured."
+            return
+        ui = config.setdefault("ui", {})
+        currently_paused = not any(a.get("enabled") for a in accounts)
+        if currently_paused:
+            # Restore per-position (index-keyed to survive duplicate/empty names).
+            pre_list = ui.get("_pre_pause_enabled_list")
+            if isinstance(pre_list, list) and len(pre_list) == len(accounts):
+                for a, was_enabled in zip(accounts, pre_list):
+                    a["enabled"] = bool(was_enabled)
+            else:
+                # Fall back to legacy name-keyed map (older configs) or enable all.
+                legacy = ui.get("_pre_pause_enabled", {})
+                for a in accounts:
+                    a["enabled"] = bool(legacy.get(a.get("name", ""), True))
+            ui.pop("_pre_pause_enabled_list", None)
+            ui.pop("_pre_pause_enabled", None)
+            ui["paused"] = False
+            result["paused"] = False
+            result["msg"] = "Filtering resumed."
         else:
-            # Fall back to legacy name-keyed map (older configs) or enable all.
-            legacy = ui.get("_pre_pause_enabled", {})
+            ui["_pre_pause_enabled_list"] = [bool(a.get("enabled")) for a in accounts]
+            ui.pop("_pre_pause_enabled", None)  # clear any legacy key
             for a in accounts:
-                a["enabled"] = bool(legacy.get(a.get("name", ""), True))
-        ui.pop("_pre_pause_enabled_list", None)
-        ui.pop("_pre_pause_enabled", None)
-        ui["paused"] = False
-        config_io.save_config(config)
-        return False, "Filtering resumed."
-    else:
-        ui["_pre_pause_enabled_list"] = [bool(a.get("enabled")) for a in accounts]
-        ui.pop("_pre_pause_enabled", None)  # clear any legacy key
-        for a in accounts:
-            a["enabled"] = False
-        ui["paused"] = True
-        config_io.save_config(config)
-        return True, "Filtering paused."
+                a["enabled"] = False
+            ui["paused"] = True
+            result["paused"] = True
+            result["msg"] = "Filtering paused."
+
+    config_io.update_config(_flip_pause)
+    return result["paused"], result["msg"]
 
 
 # ---------------------------------------------------------------------------
