@@ -567,6 +567,45 @@ def parse_list_body(body_text: str) -> dict:
     return result
 
 
+def _apply_parsed_list_entries(store: dict, parsed: dict) -> dict:
+    """Merge parse_list_body output into a whitelist/blacklist store dict.
+
+    Mutates *store* in place: new addresses/domains are appended to
+    store["addresses"] / store["domains"]; entries already present (case-
+    insensitive) are reported as "already". Shared by the Direct Whitelist and
+    Direct Blacklist handlers so the two stores apply parsed entries through
+    one code path (and so persistence is unit-testable without driving the
+    full IMAP loop). Returns a summary:
+
+        {"added_addrs": [...], "added_domains": [...],
+         "already_addrs": [...], "already_domains": [...]}
+    """
+    # Snapshot of existing entries, built once (NOT updated inside the loop) so
+    # behavior is byte-identical to the prior inline handler blocks: parse_list_
+    # body does not dedupe, so a value repeated within one payload is appended
+    # as many times as it appears — preserved here intentionally.
+    existing_addrs = {a.lower() for a in store.get("addresses", [])}
+    existing_domains = {d.lower() for d in store.get("domains", [])}
+    summary = {"added_addrs": [], "added_domains": [],
+               "already_addrs": [], "already_domains": []}
+
+    for addr in parsed.get("addresses", []):
+        if addr in existing_addrs:
+            summary["already_addrs"].append(addr)
+        else:
+            store.setdefault("addresses", []).append(addr)
+            summary["added_addrs"].append(addr)
+
+    for domain in parsed.get("domains", []):
+        if domain in existing_domains:
+            summary["already_domains"].append(domain)
+        else:
+            store.setdefault("domains", []).append(domain)
+            summary["added_domains"].append(domain)
+
+    return summary
+
+
 def detect_conflicts(whitelist: dict, blacklist: dict, logger: logging.Logger) -> list:
     """Detect addresses that appear on both whitelist and blacklist.
     Returns list of conflicting addresses. Logs warnings."""
@@ -836,6 +875,25 @@ def persist_progress(processed: dict, token_usage: dict, token_delta: dict):
     with file_lock.locked(PROCESSED_IDS_PATH):
         save_processed_ids(processed)
     persist_token_delta(token_usage, token_delta)
+
+
+def _record_processed(processed: dict, account_name: str,
+                      account_processed: set, msg_id: str) -> None:
+    """Record *msg_id* as handled for *account_name* — the single canonical way
+    a message is marked processed (audit hardening).
+
+    Adds msg_id to the in-memory account_processed set and appends an
+    [msg_id, iso_timestamp] entry to processed["ids"][account_name], creating
+    the per-account list if needed. Idempotent: a msg_id already in
+    account_processed is NOT appended a second time, so callers can invoke this
+    from the auth-rejection path AND let the message fall through to normal
+    classification without producing a duplicate processed_ids entry.
+    """
+    processed.setdefault("ids", {}).setdefault(account_name, [])
+    if msg_id in account_processed:
+        return
+    account_processed.add(msg_id)
+    processed["ids"][account_name].append([msg_id, datetime.now().isoformat()])
 
 
 def load_eula_text() -> str:
@@ -1151,6 +1209,138 @@ def send_email(config: dict, subject: str, body: str, logger: logging.Logger,
                 pass
 
 
+def _strip_date_fragment(name: str) -> str:
+    """Strip a leading date fragment that an inline-attribution regex absorbed
+    into the captured display name (M7).
+
+    Inline patterns like "On <date>, <name> <addr> wrote:" can over-capture the
+    date into the name group when the date itself contains commas. Split on the
+    LAST comma; if the prefix before it looks date-ish (a 4-digit year, a HH:MM
+    time, or an AM/PM marker), return the suffix (the real name). Otherwise the
+    name is returned unchanged so a genuine comma-surname ("Doe, Jane") is kept.
+
+    Accepted limitation: a comma-surname combined with date contamination
+    ("...10:23 AM, Doe, Jane") resolves to "Jane" — the address is still correct.
+    """
+    if not name or "," not in name:
+        return name
+    prefix, suffix = name.rsplit(",", 1)
+    if re.search(r'\d{4}|\d{1,2}:\d{2}|\b[AP]M\b', prefix, re.IGNORECASE):
+        return suffix.strip()
+    return name
+
+
+# Inline-attribution patterns shared by parse_forwarded_email's inline passes
+# and the C2a candidate scanner. Each yields (address, name) where name may be
+# empty (bare-address form). Kept as module-level so the scanner and the live
+# extraction stay in lock-step.
+_INLINE_ATTRIBUTION_PATTERNS = [
+    # Primary: "On <date>, Name <addr> wrote:"
+    (r'On\s+[^\n]{3,120}?,\s*(.+?)\s*<([^>\s]+@[^>\s]+)>\s*wrote:',
+     0, "inline-quote-on-wrote"),
+    # Bare address: "On <date>, addr wrote:"
+    (r'On\s+[^\n]{3,120}?,\s*([^<>\s]+@[^<>\s]+)\s+wrote:',
+     None, "inline-quote-on-wrote-bare"),
+    # Short form: "Name <addr> wrote:" with no "On ..." prefix
+    (r'(.+?)\s*<([^>\s]+@[^>\s]+)>\s*wrote:\s*$',
+     0, "inline-quote-short"),
+]
+
+
+def _is_divider_line(unquoted: str, lines: list[str], idx: int) -> bool:
+    """True if *unquoted* (a quote-stripped, stripped line) is any recognized
+    forward divider. ``lines``/``idx`` allow the bare-dashes+From: lookahead."""
+    if re.match(r'-{3,}.*[Ff]orward.*-{3,}', unquoted):
+        return True
+    if unquoted == "Begin forwarded message:":
+        return True
+    if re.match(r'^-{3,}\s*[Oo]riginal\s+[Mm]essage\s*-{3,}\s*$', unquoted):
+        return True
+    if re.match(r'^-{3,}\s*$', unquoted) and idx + 1 < len(lines):
+        nxt = re.sub(r'^(\s*>\s*)+', '', lines[idx + 1].strip()).strip()
+        if nxt.lower().startswith("from:"):
+            return True
+    return False
+
+
+def _find_next_divider_offset(sub_lines: list[str]) -> "int | None":
+    """Offset of the first recognized divider in *sub_lines*, or None."""
+    for i, ln in enumerate(sub_lines):
+        unquoted = re.sub(r'^(\s*>\s*)+', '', ln.strip()).strip()
+        if _is_divider_line(unquoted, sub_lines, i):
+            return i
+    return None
+
+
+def _find_first_from_offset(sub_lines: list[str]) -> "int | None":
+    """Offset of the first ``From:`` header line in *sub_lines*, or None.
+
+    Matches how the divider-path From: extraction works (quote-stripped line
+    beginning with ``from:``), so the offset lines up with the address actually
+    used by ``re.search(... from: ...)`` over the unfolded block.
+    """
+    for i, ln in enumerate(sub_lines):
+        unquoted = re.sub(r'^(\s*>\s*)+', '', ln).strip()
+        if re.match(r'(?i)^from:\s*\S', unquoted):
+            return i
+    return None
+
+
+def _scan_inline_candidates(text: str) -> list[dict]:
+    """Return all inline-attribution senders found in *text*, in positional
+    order, as a list of {"address","name","kind"} dicts (deduped by address,
+    case-insensitively, keeping the first occurrence).
+
+    Used by C2a: (i) to find a genuine client attribution ABOVE a chosen
+    divider, and (iii) to collect positional fallback candidates when there is
+    no divider. Names get the same date-fragment cleanup as live extraction.
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    if not text:
+        return out
+    found: list[tuple[int, str, str, str]] = []
+    for pattern, name_group, kind in _INLINE_ATTRIBUTION_PATTERNS:
+        flags = re.MULTILINE if kind == "inline-quote-short" else 0
+        for m in re.finditer(pattern, text, flags):
+            if name_group is None:
+                addr = m.group(1).strip()
+                name = ""
+            else:
+                name = m.group(1).strip().strip('"').strip("'").strip()
+                name = _strip_date_fragment(name)
+                if "\n" in name or len(name) > 80:
+                    continue
+                addr = m.group(2).strip()
+            found.append((m.start(), addr, name, kind))
+    found.sort(key=lambda t: t[0])
+    for _pos, addr, name, kind in found:
+        key = addr.lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append({"address": addr, "name": name, "kind": kind})
+    return out
+
+
+def _inline_candidates(chosen_from: str, body: str) -> list[dict]:
+    """Build the ordered _candidates list for an inline (no-divider) parse:
+    the chosen sender first, then any other inline senders found in *body*
+    positionally (deduped). Used for Fix 2's owner-skip resolver."""
+    chosen_parsed = parse_from_address(chosen_from)
+    chosen_addr = (chosen_parsed.get("address") or "").lower()
+    chosen_name = chosen_parsed.get("display_name") or ""
+    out: list[dict] = []
+    if chosen_from:
+        out.append({"address": chosen_addr or chosen_from,
+                    "name": chosen_name, "kind": "inline"})
+    for cand in _scan_inline_candidates(body):
+        if cand["address"].lower() in {c["address"].lower() for c in out}:
+            continue
+        out.append(cand)
+    return out
+
+
 def parse_forwarded_email(plain_body: str, html_body: str = "",
                           mime_msg: "email.message.Message | None" = None) -> dict:
     """Parse a forwarded email body into user explanation and original content.
@@ -1183,6 +1373,12 @@ def parse_forwarded_email(plain_body: str, html_body: str = "",
         "original_body": "",
         "_divider_kind": "none",
         "_source": "plain",
+        # C2a (additive): ordered candidate senders (chosen first) and
+        # sender-conflict metadata. Body paths populate these; the rfc822
+        # attachment path (highest-fidelity, authoritative) leaves them at
+        # their defaults — there is no ambiguity to surface there.
+        "_candidates": [],
+        "_sender_conflict": None,
     }
 
     # --- Task 2: rfc822 attachment walk (highest-fidelity path) ---
@@ -1334,6 +1530,55 @@ def parse_forwarded_email(plain_body: str, html_body: str = "",
                 break
 
         result["original_body"] = "\n".join(lines[body_start:]).strip()[:1000]
+
+        # --- C2a: candidate collection + sender-conflict surfacing -----------
+        # The chosen original_from above is UNCHANGED (precedence is preserved).
+        # Here we only ADD diagnostic metadata: who else looks like a plausible
+        # original sender, and whether that disagreement should be surfaced.
+        chosen_addr = (parse_from_address(result["original_from"]).get("address")
+                       or "").lower()
+        chosen_name = parse_from_address(result["original_from"]).get("display_name") or ""
+        candidates: list[dict] = []
+        if result["original_from"]:
+            candidates.append({"address": chosen_addr or result["original_from"],
+                               "name": chosen_name, "kind": divider_kind})
+
+        conflict_others: list[str] = []
+        conflict_reason = None
+
+        # (i) A genuine client attribution sits ABOVE the divider. Any inline
+        # match there with a DIFFERENT address is a conflicting candidate
+        # (likely the real sender, with a fake forward block planted below).
+        # Do NOT scan below the divider — forwarded reply threads legitimately
+        # contain "On ... wrote:" lines and must not raise false alarms.
+        above_text = "\n".join(lines[:divider_idx])
+        for cand in _scan_inline_candidates(above_text):
+            ca = cand["address"].lower()
+            if ca and ca != chosen_addr:
+                if ca not in {c["address"].lower() for c in candidates}:
+                    candidates.append(cand)
+                if ca not in conflict_others:
+                    conflict_others.append(cand["address"])
+
+        # (ii) The From: header the parser used may belong to a DEEPER nested
+        # block — a second divider occurs after the chosen one and the From:
+        # line we extracted lies beyond it. Keep today's extraction, but flag.
+        if from_match:
+            next_div_offset = _find_next_divider_offset(lines[divider_idx + 1:])
+            if next_div_offset is not None:
+                from_line_offset = _find_first_from_offset(lines[divider_idx + 1:])
+                if (from_line_offset is not None
+                        and from_line_offset > next_div_offset):
+                    conflict_reason = "from-beyond-next-divider"
+
+        result["_candidates"] = candidates
+        if conflict_others or conflict_reason:
+            result["_sender_conflict"] = {
+                "chosen": result["original_from"],
+                "others": conflict_others,
+                "reason": conflict_reason or "attribution-above-divider",
+            }
+        # ---------------------------------------------------------------------
         return result
 
     # No explicit forward divider. Try inline-reply-quote attribution patterns.
@@ -1359,12 +1604,17 @@ def parse_forwarded_email(plain_body: str, html_body: str = "",
     if inline_match:
         result["_divider_kind"] = "inline-quote-on-wrote"
         name = inline_match.group(1).strip().strip('"').strip("'").strip()
+        name = _strip_date_fragment(name)  # M7
         addr = inline_match.group(2).strip()
         result["original_from"] = f'{name} <{addr}>' if name else addr
         explanation = body[:inline_match.start()].strip()
         if explanation:
             result["user_explanation"] = explanation
         result["original_body"] = body[inline_match.end():].strip()[:1000]
+        # C2a (iii): collect subsequent inline senders positionally as fallback
+        # candidates for the owner-skip resolver. No conflict surfaced here —
+        # reply chains legitimately contain several "On ... wrote:" lines.
+        result["_candidates"] = _inline_candidates(result["original_from"], body)
         return result
 
     # Fallback 1: "On <date>, bare@address.com wrote:" — no angle brackets,
@@ -1381,6 +1631,7 @@ def parse_forwarded_email(plain_body: str, html_body: str = "",
         if explanation:
             result["user_explanation"] = explanation
         result["original_body"] = body[bare_inline_match.end():].strip()[:1000]
+        result["_candidates"] = _inline_candidates(result["original_from"], body)
         return result
 
     # Fallback 2a: wrapped-date inline attribution. Some iOS Mail locales put
@@ -1396,6 +1647,7 @@ def parse_forwarded_email(plain_body: str, html_body: str = "",
     if wrapped_match:
         result["_divider_kind"] = "inline-quote-wrapped-date"
         name = wrapped_match.group(2).strip().strip('"').strip("'").strip()
+        name = _strip_date_fragment(name)  # M7
         # Guard: name must not contain a newline (if it does, the greedy match
         # ran away into a paragraph). Only accept if name is clean.
         if "\n" not in name and len(name) <= 80:
@@ -1405,6 +1657,7 @@ def parse_forwarded_email(plain_body: str, html_body: str = "",
             if explanation:
                 result["user_explanation"] = explanation
             result["original_body"] = body[wrapped_match.end():].strip()[:1000]
+            result["_candidates"] = _inline_candidates(result["original_from"], body)
             return result
 
     # Last resort: "Jane Doe <jane@example.com> wrote:" without the "On ..." prefix
@@ -1414,6 +1667,7 @@ def parse_forwarded_email(plain_body: str, html_body: str = "",
         body, re.MULTILINE)
     if short_inline:
         name = short_inline.group(1).strip().strip('"').strip("'").strip()
+        name = _strip_date_fragment(name)  # M7 (no-op for clean comma-surnames)
         # Guard against matching unrelated text — require the name looks like
         # a display name (<=80 chars, no newlines in the captured portion).
         if name and "\n" not in name and len(name) <= 80:
@@ -1424,6 +1678,7 @@ def parse_forwarded_email(plain_body: str, html_body: str = "",
             if explanation:
                 result["user_explanation"] = explanation
             result["original_body"] = body[short_inline.end():].strip()[:1000]
+            result["_candidates"] = _inline_candidates(result["original_from"], body)
             return result
 
     # No divider and no attribution line — treat the whole body as the user's
@@ -1438,12 +1693,28 @@ def strip_fwd_prefix(subject: str) -> str:
 
     Handles: "Fwd: Fw: Fwd: Whitelist" -> "Whitelist"
     Case-insensitive, tolerant of extra whitespace.
+
+    M5: once at least one Fwd:/Fw: has been stripped, subsequent iterations
+    ALSO strip a leading "Re:" — so "Fwd: Re: Blacklist All" -> "Blacklist All"
+    and "Fwd: Fwd: Re: X" works. A bare "Re: Blacklist All" with NO Fwd: prefix
+    is left untouched (only forwarded commands shed their reply prefix).
     """
     s = (subject or "").strip()
+    stripped_any_fwd = False
     while True:
-        m = re.match(r'^(?:fwd|fw):\s*', s, re.IGNORECASE)
+        # First iteration (and any iteration before a Fwd:/Fw: is seen) only
+        # strips Fwd:/Fw:. After a Fwd:/Fw: has been removed, also shed Re:.
+        if stripped_any_fwd:
+            pattern = r'^(?:fwd|fw|re):\s*'
+        else:
+            pattern = r'^(?:fwd|fw):\s*'
+        m = re.match(pattern, s, re.IGNORECASE)
         if not m:
             break
+        # Track whether THIS strip was a Fwd:/Fw: (not a Re:) so a leading Re:
+        # never on its own enables Re:-stripping.
+        if re.match(r'^(?:fwd|fw):\s*', s, re.IGNORECASE):
+            stripped_any_fwd = True
         s = s[m.end():].strip()
     return s
 
@@ -1494,10 +1765,71 @@ def detect_email_command(subject: str) -> str:
 
     # Fwd:-prefixed forward-parsing commands
     stripped = stripped_prefix.lower()
+
+    # Colon-form direct commands: "Whitelist: x" / "Blacklist: x" carry the
+    # entry inline in the subject. Accept these whether or not there was a Fwd:
+    # prefix. The \S after the colon means an EMPTY payload ("Whitelist:") does
+    # NOT match here and falls through to the table below (behaving as today).
+    # "Whitelist domain: x" can't match this regex (a space precedes the colon),
+    # so it still hits the Whitelist Domain table entry.
+    colon_m = re.match(r'(whitelist|blacklist)\s*:\s*\S', stripped)
+    if colon_m:
+        return "Direct Whitelist" if colon_m.group(1) == "whitelist" else "Direct Blacklist"
+
     for canonical, pattern in EMAIL_COMMANDS:
-        if stripped.startswith(pattern):
+        # M6: anchored / boundary match — the pattern only counts when the next
+        # character after it is NOT an alphanumeric. This stops "blacklist
+        # allister" from matching "blacklist all" and "not spammy at all" from
+        # matching "not spam", while still accepting "blacklist all.",
+        # "blacklist all - the bank one", and the exact "blacklist all".
+        if re.match(re.escape(pattern) + r'(?![a-z0-9])', stripped):
             return canonical
     return None
+
+
+# Bare-domain shape — the same body parse_list_body accepts once a leading
+# "@" is added (mirror of parse_list_body's domain_re, minus the @ anchor).
+_BARE_DOMAIN_RE = re.compile(r'^[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$')
+
+
+# (c) 2026 STR Solutions, LLC. All rights reserved.
+def _subject_payload_line(subject: str) -> str:
+    """Return the text AFTER the first colon of the Fwd-stripped subject.
+
+    Used by the colon-form Direct Whitelist / Direct Blacklist handlers to pull
+    the inline entry ("Whitelist: domain.com" -> "@domain.com") out of the
+    subject so it can be parsed alongside the body. Returns "" when there is no
+    colon or nothing follows it.
+
+    Bug-1 fix (SUBJECT PAYLOAD ONLY): parse_list_body accepts email addresses
+    and "@domain" entries, but NOT a bare "domain.com" token (it lands in
+    'invalid' and never persists). So "Whitelist: domain.com" silently did
+    nothing. When the payload is a bare domain (looks like a domain, has a dot,
+    no "@"), prepend the "@" so parse_list_body routes it to domains. Addresses
+    (which contain "@") and non-domains (no dot) are returned untouched. Body
+    parsing is NOT affected — only this subject-extracted token is normalized.
+    """
+    stripped = strip_fwd_prefix(subject or "")
+    if ":" not in stripped:
+        return ""
+    payload = stripped.split(":", 1)[1].strip()
+    if payload and "@" not in payload and _BARE_DOMAIN_RE.match(payload):
+        return "@" + payload
+    return payload
+
+
+# (c) 2026 STR Solutions, LLC. All rights reserved.
+def _prepend_subject_payload(subject: str, body_text: str) -> str:
+    """Prepend the colon-form subject payload as its own line to the body text.
+
+    So a subject-only command ("Whitelist: domain.com" with an empty body) and a
+    body-list command both feed entries into parse_list_body. A blank payload
+    leaves the body unchanged.
+    """
+    payload = _subject_payload_line(subject)
+    if not payload:
+        return body_text or ""
+    return payload + "\n" + (body_text or "")
 
 
 # (c) 2026 STR Solutions, LLC. All rights reserved.
@@ -1697,6 +2029,125 @@ def _owner_identities(config: dict) -> set[str]:
         if val:
             identities.add(val)
     return identities
+
+
+def _resolve_false_positive_sender(fwd_data: dict) -> str:
+    """Resolve the original sender address for the False Positive command.
+
+    DELIBERATELY EXEMPT from the C2b own-identity guard: a False Positive is the
+    owner saying "this legit mail was wrongly junked", and that legit mail can
+    be the owner's OWN self-sent mail (e.g. a receipt they BCC'd themselves).
+    So we take the forwarded original sender at face value via
+    parse_from_address and must NEVER route through _resolve_spam_sender (which
+    would skip the owner's own address). This function is the single seam the
+    FP handler calls, so the "FP never calls the resolver" rule is unit-pinned.
+
+    Returns the lowercased bare address, or "" when none can be parsed.
+    """
+    return parse_from_address(fwd_data.get("original_from", "") or "").get(
+        "address") or ""
+
+
+def _resolve_spam_sender(fwd_data: dict, account: dict, config: dict) -> dict:
+    """C2b own-identity guard for the spam-sender commands (Blacklist All /
+    Address / Name, SPAM Example).
+
+    Walk fwd_data["_candidates"] in order and return the first candidate whose
+    address is NOT one of the owner's identities (the configured owner identity
+    set plus the polled account's own username). This stops MailWarden from
+    blacklisting the OWNER when a spammer disguised mail as coming from them and
+    the owner's address ends up as the parsed sender — MailWarden already checks
+    for from-spoofing during classification.
+
+    Returns:
+        {
+          "address": <str|None>,   # resolved non-owner address (lowercased), or
+                                   # None when only owner identities were found
+          "name":    <str>,        # display name of the resolved candidate
+          "skipped": [<addr>,...], # owner identities skipped on the way down
+          "refused": <bool>,       # True when nothing non-owner remained
+        }
+
+    Falls back to original_from when _candidates is empty (e.g. the rfc822
+    attachment path, which is authoritative and never produces candidates).
+    """
+    owners = set(_owner_identities(config))
+    acct_user = (account.get("username", "") or "").strip().lower()
+    if acct_user:
+        owners.add(acct_user)
+
+    candidates = list(fwd_data.get("_candidates") or [])
+    if not candidates:
+        # No candidate list (rfc822 path or unparsed) — fall back to the
+        # single parsed sender so the resolver still works there.
+        parsed = parse_from_address(fwd_data.get("original_from", ""))
+        addr = parsed.get("address")
+        if addr:
+            candidates = [{"address": addr,
+                           "name": parsed.get("display_name") or "",
+                           "kind": fwd_data.get("_divider_kind", "none")}]
+
+    skipped: list[str] = []
+    for cand in candidates:
+        addr = (cand.get("address") or "").strip().lower()
+        if not addr:
+            continue
+        if addr in owners:
+            skipped.append(addr)
+            continue
+        return {"address": addr, "name": cand.get("name") or "",
+                "skipped": skipped, "refused": False}
+
+    # Nothing non-owner remained.
+    return {"address": None, "name": "", "skipped": skipped, "refused": True}
+
+
+def _sender_conflict_warning(conflict: dict, with_undo: bool) -> str:
+    """C2a: build the heads-up paragraph appended to a command's confirmation
+    reply when parse_forwarded_email surfaced more than one possible original
+    sender. *conflict* is fwd_data["_sender_conflict"].
+
+    with_undo=True  -> blacklist-family copy (includes the undo instruction).
+    with_undo=False -> non-blacklist copy (drops the undo sentence, which does
+                       not apply to Whitelist / False Positive / Remove).
+    """
+    chosen = parse_from_address(conflict.get("chosen", "")).get("address") \
+        or conflict.get("chosen", "")
+    others = conflict.get("others") or []
+    other = others[0] if others else "another address"
+    text = (
+        "\n\nHeads-up: this forwarded message contained more than one possible "
+        f"original sender. I used {chosen}, but also found {other} deeper in the "
+        "message — spammers sometimes plant a fake one there."
+    )
+    if with_undo:
+        text += (
+            " If I picked the wrong one, forward this back with "
+            "'Remove from Blacklist'."
+        )
+    return text
+
+
+def _owner_skip_note(used_addr: str) -> str:
+    """C2b: one-line note appended to a spam-sender command's confirmation when
+    the owner's OWN address was found in the forward and skipped in favor of a
+    non-owner sender. *used_addr* is the address actually acted on."""
+    return (
+        "\n\nNote: your own address also appeared in this forwarded message. "
+        f"I skipped it (I won't blacklist you) and used {used_addr} instead."
+    )
+
+
+def _owner_only_refusal_body() -> str:
+    """C2b: the verbatim approved body for the refusal reply sent when the ONLY
+    sender found in a forwarded spam-command is the owner's own address."""
+    return (
+        "This command wasn't applied: the only sender I could find in the "
+        "forwarded message is your own address, and I won't blacklist you. "
+        "Spammers sometimes disguise mail as coming from you — MailWarden "
+        "already checks for that. Forwarding the spam as an attachment usually "
+        "fixes this."
+    )
 
 
 def _command_sender_is_owner(from_email: str, account: dict,
@@ -3675,8 +4126,8 @@ def run_filter(force: bool = False):
                             f"(X-MailWarden-System: 1): {msg_data.get('subject','')[:60]}"
                         )
                         mark_uid_seen(conn, uid, logger)
-                        account_processed.add(msg_id)
-                        processed["ids"][account_name].append([msg_id, datetime.now().isoformat()])
+                        _record_processed(processed, account_name,
+                                          account_processed, msg_id)
                         continue
 
                     # Construct from_header_raw for use in all detection branches
@@ -3711,6 +4162,18 @@ def run_filter(force: bool = False):
                             "authentication (S1 auth gate).",
                             command, msg_data.get("from_email", ""))
                         _notify_unverified_command(config, account, logger)
+                        # Hardening: record the rejection itself as processed so
+                        # a processed_ids reset can't make us resend the "command
+                        # not verified" notice. mark_uid_seen pairs with the
+                        # processed_ids entry exactly as the success path does.
+                        # The message STILL flows to normal classification below
+                        # (the already-processed skip check at the top of the
+                        # loop already ran for this message, so this add cannot
+                        # skip it); the 5550 recording is guarded against a
+                        # double-append of the same msg_id.
+                        mark_uid_seen(conn, uid, logger)
+                        _record_processed(processed, account_name,
+                                          account_processed, msg_id)
                         command = None
 
                     if command:
@@ -3737,6 +4200,13 @@ def run_filter(force: bool = False):
                         orig_parsed = parse_from_address(fwd_data.get("original_from", ""))
                         orig_addr = orig_parsed.get("address")
                         orig_name = orig_parsed.get("display_name")
+
+                        # C2a: surface a multi-sender conflict in the reply (no
+                        # undo sentence — this command is itself the undo).
+                        _conflict = fwd_data.get("_sender_conflict")
+                        _conflict_note = (
+                            _sender_conflict_warning(_conflict, with_undo=False)
+                            if _conflict else "")
 
                         # Remove from blacklist.json — locked read-modify-write
                         # so a Dashboard edit or concurrent command can't lose
@@ -3780,7 +4250,8 @@ def run_filter(force: bool = False):
                                     f"Future emails from this sender will be evaluated by the spam classifier.\n\n"
                                     f"To re-add: forward any email from this sender to yourself with\n"
                                     f"the subject line \"Fwd: Blacklist All\" (or \"Blacklist Address\"\n"
-                                    f"or \"Blacklist Name\" for narrower blocking).",
+                                    f"or \"Blacklist Name\" for narrower blocking)."
+                                    + _conflict_note,
                                     logger,
                                     to_addr=account.get("username", ""),
                                 )
@@ -3794,14 +4265,14 @@ def run_filter(force: bool = False):
                                     f"Blacklist Removal — Not Found",
                                     f"Neither the address ({orig_addr or 'none'}) nor the display name "
                                     f"({orig_name or 'none'}) was found in the blacklist. No changes were made.\n\n"
-                                    f"Current blacklist: {bl_totals[0]} addresses | {bl_totals[1]} display names",
+                                    f"Current blacklist: {bl_totals[0]} addresses | {bl_totals[1]} display names"
+                                    + _conflict_note,
                                     logger,
                                     to_addr=account.get("username", ""),
                                 )
 
-                        account_processed.add(msg_id)
-                        now_iso = datetime.now().isoformat()
-                        processed["ids"][account_name].append([msg_id, now_iso])
+                        _record_processed(processed, account_name,
+                                          account_processed, msg_id)
                         total_evaluated += 1
                         continue
 
@@ -3821,7 +4292,11 @@ def run_filter(force: bool = False):
                             fwd_data.get("original_subject", "")[:40])
 
                         # Look up original decision
-                        orig_from_addr = parse_from_address(fwd_data["original_from"]).get("address") or ""
+                        # FP is exempt from the C2b own-identity guard — resolve
+                        # the original sender directly (never via
+                        # _resolve_spam_sender), so a self-sent legit email
+                        # forwarded as a False Positive still resolves.
+                        orig_from_addr = _resolve_false_positive_sender(fwd_data)
                         decision_entry = lookup_decision(orig_from_addr, fwd_data["original_subject"])
                         signals_fired = decision_entry["signals"] if decision_entry else "Unknown"
                         confidence = decision_entry["confidence"] if decision_entry else "Unknown"
@@ -3944,6 +4419,13 @@ This proposal expires in 7 days.
 Conversation ID: {sfid}
 ========================================"""
 
+                            # C2a: surface a multi-sender conflict (non-blacklist
+                            # copy — no undo sentence).
+                            _fp_conflict = fwd_data.get("_sender_conflict")
+                            if _fp_conflict:
+                                email_body += _sender_conflict_warning(
+                                    _fp_conflict, with_undo=False)
+
                             email_subject = f"Re: False Positive Analysis [{sfid}] — {fwd_data['original_subject'][:50]}"
                             send_email(config, email_subject, email_body, logger,
                                        to_addr=account.get("username", ""))
@@ -3952,43 +4434,32 @@ Conversation ID: {sfid}
                             logger.error(f"  False positive analysis failed: {e}")
 
                         # Mark as processed regardless
-                        account_processed.add(msg_id)
-                        now_iso = datetime.now().isoformat()
-                        processed["ids"][account_name].append([msg_id, now_iso])
+                        _record_processed(processed, account_name,
+                                          account_processed, msg_id)
                         total_evaluated += 1
                         continue
 
                     # --- Command: Direct Whitelist (subject="Whitelist", body contains addresses) ---
                     elif command == "Direct Whitelist":
                         logger.info(f"  DIRECT WHITELIST command: {msg_data['subject'][:60]}")
-                        raw_body = msg_data.get("plain_text_body", "")
+                        # Colon-form: "Whitelist: x" carries the entry inline in
+                        # the subject. Prepend that payload to the body so both
+                        # the subject entry and any body entries are parsed.
+                        raw_body = _prepend_subject_payload(
+                            msg_data.get("subject", ""),
+                            msg_data.get("plain_text_body", ""))
                         parsed_entries = parse_list_body(raw_body)
 
                         # Locked read-modify-write so a Dashboard edit or a
                         # concurrent command can't lose these additions (G3/R5).
                         with file_lock.locked(WHITELIST_PATH):
                             wl_data = load_whitelist(logger)
-                            existing_addrs = {a.lower() for a in wl_data.get("addresses", [])}
-                            existing_domains = {d.lower() for d in wl_data.get("domains", [])}
-
-                            added_addrs: list = []
-                            added_domains: list = []
-                            already_addrs: list = []
-                            already_domains: list = []
-
-                            for addr in parsed_entries["addresses"]:
-                                if addr in existing_addrs:
-                                    already_addrs.append(addr)
-                                else:
-                                    wl_data.setdefault("addresses", []).append(addr)
-                                    added_addrs.append(addr)
-
-                            for domain in parsed_entries["domains"]:
-                                if domain in existing_domains:
-                                    already_domains.append(domain)
-                                else:
-                                    wl_data.setdefault("domains", []).append(domain)
-                                    added_domains.append(domain)
+                            _summary = _apply_parsed_list_entries(
+                                wl_data, parsed_entries)
+                            added_addrs = _summary["added_addrs"]
+                            added_domains = _summary["added_domains"]
+                            already_addrs = _summary["already_addrs"]
+                            already_domains = _summary["already_domains"]
 
                             if added_addrs or added_domains:
                                 save_whitelist(wl_data)
@@ -4025,42 +4496,32 @@ Conversation ID: {sfid}
                             logger,
                             to_addr=account.get("username", ""),
                         )
-                        account_processed.add(msg_id)
-                        processed["ids"][account_name].append([msg_id, datetime.now().isoformat()])
+                        _record_processed(processed, account_name,
+                                          account_processed, msg_id)
                         total_evaluated += 1
                         continue
 
                     # --- Command: Direct Blacklist (subject="Blacklist", body contains addresses) ---
                     elif command == "Direct Blacklist":
                         logger.info(f"  DIRECT BLACKLIST command: {msg_data['subject'][:60]}")
-                        raw_body = msg_data.get("plain_text_body", "")
+                        # Colon-form: "Blacklist: x" carries the entry inline in
+                        # the subject. Prepend that payload to the body so both
+                        # the subject entry and any body entries are parsed.
+                        raw_body = _prepend_subject_payload(
+                            msg_data.get("subject", ""),
+                            msg_data.get("plain_text_body", ""))
                         parsed_entries = parse_list_body(raw_body)
 
                         # Locked read-modify-write so a Dashboard edit or a
                         # concurrent command can't lose these additions (G3/R5).
                         with file_lock.locked(BLACKLIST_PATH):
                             bl_data = load_blacklist(logger)
-                            existing_addrs = {a.lower() for a in bl_data.get("addresses", [])}
-                            existing_domains = {d.lower() for d in bl_data.get("domains", [])}
-
-                            added_addrs: list = []
-                            added_domains: list = []
-                            already_addrs: list = []
-                            already_domains: list = []
-
-                            for addr in parsed_entries["addresses"]:
-                                if addr in existing_addrs:
-                                    already_addrs.append(addr)
-                                else:
-                                    bl_data.setdefault("addresses", []).append(addr)
-                                    added_addrs.append(addr)
-
-                            for domain in parsed_entries["domains"]:
-                                if domain in existing_domains:
-                                    already_domains.append(domain)
-                                else:
-                                    bl_data.setdefault("domains", []).append(domain)
-                                    added_domains.append(domain)
+                            _summary = _apply_parsed_list_entries(
+                                bl_data, parsed_entries)
+                            added_addrs = _summary["added_addrs"]
+                            added_domains = _summary["added_domains"]
+                            already_addrs = _summary["already_addrs"]
+                            already_domains = _summary["already_domains"]
 
                             if added_addrs or added_domains:
                                 save_blacklist(bl_data)
@@ -4097,8 +4558,8 @@ Conversation ID: {sfid}
                             logger,
                             to_addr=account.get("username", ""),
                         )
-                        account_processed.add(msg_id)
-                        processed["ids"][account_name].append([msg_id, datetime.now().isoformat()])
+                        _record_processed(processed, account_name,
+                                          account_processed, msg_id)
                         total_evaluated += 1
                         continue
 
@@ -4119,6 +4580,13 @@ Conversation ID: {sfid}
                         parsed_from = parse_from_address(fwd_data.get("original_from", ""))
                         orig_addr = parsed_from.get("address")
 
+                        # C2a: surface a multi-sender conflict on the confirmation
+                        # (non-blacklist copy — no undo sentence).
+                        _wl_conflict = fwd_data.get("_sender_conflict")
+                        _wl_conflict_note = (
+                            _sender_conflict_warning(_wl_conflict, with_undo=False)
+                            if _wl_conflict else "")
+
                         if not orig_addr:
                             # Only reply when a forward structure was actually detected
                             # (divider != "none") but the address was still unparseable.
@@ -4131,8 +4599,8 @@ Conversation ID: {sfid}
                                     "  [WHITELIST] No forward structure found and no address — "
                                     "skipping silently (no reply sent) to prevent loop"
                                 )
-                                account_processed.add(msg_id)
-                                processed["ids"][account_name].append([msg_id, datetime.now().isoformat()])
+                                _record_processed(processed, account_name,
+                                                  account_processed, msg_id)
                                 total_evaluated += 1
                                 continue
                             # TODO: final copy pending PM approval
@@ -4183,11 +4651,12 @@ Conversation ID: {sfid}
                                         f"entirely and land in your inbox."
                                     )
                                     logger.info(f"  [WHITELIST] Added address: {orig_addr}")
-                            send_email(config, f"Whitelist Confirmed — {orig_addr}", msg_out, logger,
+                            send_email(config, f"Whitelist Confirmed — {orig_addr}",
+                                       msg_out + _wl_conflict_note, logger,
                                        to_addr=account.get("username", ""))
 
-                        account_processed.add(msg_id)
-                        processed["ids"][account_name].append([msg_id, datetime.now().isoformat()])
+                        _record_processed(processed, account_name,
+                                          account_processed, msg_id)
                         total_evaluated += 1
                         continue
 
@@ -4209,6 +4678,13 @@ Conversation ID: {sfid}
                         orig_addr = parsed_from.get("address")
                         domain = extract_domain(orig_addr) if orig_addr else None
 
+                        # C2a: surface a multi-sender conflict on the confirmation
+                        # (non-blacklist copy — no undo sentence).
+                        _wld_conflict = fwd_data.get("_sender_conflict")
+                        _wld_conflict_note = (
+                            _sender_conflict_warning(_wld_conflict, with_undo=False)
+                            if _wld_conflict else "")
+
                         if not domain:
                             # Same silent-skip rule as Whitelist: only reply when a
                             # forward structure was detected but the address/domain
@@ -4219,8 +4695,8 @@ Conversation ID: {sfid}
                                     "  [WHITELIST DOMAIN] No forward structure found — "
                                     "skipping silently to prevent loop"
                                 )
-                                account_processed.add(msg_id)
-                                processed["ids"][account_name].append([msg_id, datetime.now().isoformat()])
+                                _record_processed(processed, account_name,
+                                                  account_processed, msg_id)
                                 total_evaluated += 1
                                 continue
                             # TODO: final copy pending PM approval
@@ -4267,11 +4743,12 @@ Conversation ID: {sfid}
                                         f"the spam classifier and land in your inbox."
                                     )
                                     logger.info(f"  [WHITELIST] Added domain: {domain}")
-                            send_email(config, f"Whitelist Domain Confirmed — {domain}", msg_out, logger,
+                            send_email(config, f"Whitelist Domain Confirmed — {domain}",
+                                       msg_out + _wld_conflict_note, logger,
                                        to_addr=account.get("username", ""))
 
-                        account_processed.add(msg_id)
-                        processed["ids"][account_name].append([msg_id, datetime.now().isoformat()])
+                        _record_processed(processed, account_name,
+                                          account_processed, msg_id)
                         total_evaluated += 1
                         continue
 
@@ -4293,6 +4770,42 @@ Conversation ID: {sfid}
                         orig_addr = parsed_from.get("address")
                         orig_name = parsed_from.get("display_name")
 
+                        # C2b: own-identity guard. Walk the candidate senders and
+                        # use the first NON-owner one, so a spammer who disguised
+                        # mail as coming from the owner can't trick MailWarden into
+                        # blacklisting the owner. Use the resolved sender's address
+                        # AND display name (they come from the same candidate).
+                        _spam = _resolve_spam_sender(fwd_data, account, config)
+                        if _spam["refused"]:
+                            # The only sender found is the owner — refuse and use
+                            # the standard could-not-parse plumbing to record/skip.
+                            logger.info(
+                                "  [BLACKLIST ALL] Refused — only candidate is the "
+                                "owner's own address (C2b).")
+                            send_email(
+                                config,
+                                "Blacklist — Not Applied",
+                                _owner_only_refusal_body(),
+                                logger,
+                                to_addr=account.get("username", ""),
+                            )
+                            _record_processed(processed, account_name,
+                                              account_processed, msg_id)
+                            total_evaluated += 1
+                            continue
+                        if _spam["address"]:
+                            orig_addr = _spam["address"]
+                            orig_name = _spam["name"] or orig_name
+                        _owner_skip_note_txt = (
+                            _owner_skip_note(_spam["address"])
+                            if _spam["skipped"] else "")
+                        # C2a: multi-sender conflict warning (blacklist copy — keep
+                        # the undo instruction).
+                        _bl_conflict = fwd_data.get("_sender_conflict")
+                        _bl_conflict_note = (
+                            _sender_conflict_warning(_bl_conflict, with_undo=True)
+                            if _bl_conflict else "")
+
                         # Without either identifier there's nothing we can block.
                         # Tell the user clearly — the old fallback message collided
                         # with the "already listed" reply and looked like a bug.
@@ -4306,8 +4819,8 @@ Conversation ID: {sfid}
                                     "  [BLACKLIST ALL] No forward structure found — "
                                     "skipping silently to prevent loop"
                                 )
-                                account_processed.add(msg_id)
-                                processed["ids"][account_name].append([msg_id, datetime.now().isoformat()])
+                                _record_processed(processed, account_name,
+                                                  account_processed, msg_id)
                                 total_evaluated += 1
                                 continue
                             # TODO: final copy pending PM approval
@@ -4324,8 +4837,8 @@ Conversation ID: {sfid}
                                 logger,
                                 to_addr=account.get("username", ""),
                             )
-                            account_processed.add(msg_id)
-                            processed["ids"][account_name].append([msg_id, datetime.now().isoformat()])
+                            _record_processed(processed, account_name,
+                                              account_processed, msg_id)
                             total_evaluated += 1
                             continue
 
@@ -4387,14 +4900,15 @@ Conversation ID: {sfid}
                             config,
                             f"Blacklist Confirmed — {orig_name or orig_addr or 'sender'}",
                             "\n".join(lines_out) + "\n\nFuture emails from this sender will be moved to Junk immediately.\n\n"
-                            "To remove: forward any email from them with subject \"Fwd: Remove from Blacklist\".",
+                            "To remove: forward any email from them with subject \"Fwd: Remove from Blacklist\"."
+                            + _owner_skip_note_txt + _bl_conflict_note,
                             logger,
                             to_addr=account.get("username", ""),
                         )
                         logger.info(f"  [BLACKLIST ALL] addr_added={addr_added} name_added={name_added} skipped={skipped_name}")
 
-                        account_processed.add(msg_id)
-                        processed["ids"][account_name].append([msg_id, datetime.now().isoformat()])
+                        _record_processed(processed, account_name,
+                                          account_processed, msg_id)
                         total_evaluated += 1
                         continue
 
@@ -4415,6 +4929,34 @@ Conversation ID: {sfid}
                         parsed_from = parse_from_address(fwd_data.get("original_from", ""))
                         orig_addr = parsed_from.get("address")
 
+                        # C2b: own-identity guard — use the first non-owner sender.
+                        _spam = _resolve_spam_sender(fwd_data, account, config)
+                        if _spam["refused"]:
+                            logger.info(
+                                "  [BLACKLIST ADDRESS] Refused — only candidate is "
+                                "the owner's own address (C2b).")
+                            send_email(
+                                config,
+                                "Blacklist — Not Applied",
+                                _owner_only_refusal_body(),
+                                logger,
+                                to_addr=account.get("username", ""),
+                            )
+                            _record_processed(processed, account_name,
+                                              account_processed, msg_id)
+                            total_evaluated += 1
+                            continue
+                        if _spam["address"]:
+                            orig_addr = _spam["address"]
+                        _owner_skip_note_txt = (
+                            _owner_skip_note(_spam["address"])
+                            if _spam["skipped"] else "")
+                        # C2a: multi-sender conflict warning (blacklist copy).
+                        _bla_conflict = fwd_data.get("_sender_conflict")
+                        _bla_conflict_note = (
+                            _sender_conflict_warning(_bla_conflict, with_undo=True)
+                            if _bla_conflict else "")
+
                         if not orig_addr:
                             _fwd_detected_bla = fwd_data.get("_divider_kind", "none") != "none"
                             if not _fwd_detected_bla:
@@ -4422,8 +4964,8 @@ Conversation ID: {sfid}
                                     "  [BLACKLIST ADDRESS] No forward structure found — "
                                     "skipping silently to prevent loop"
                                 )
-                                account_processed.add(msg_id)
-                                processed["ids"][account_name].append([msg_id, datetime.now().isoformat()])
+                                _record_processed(processed, account_name,
+                                                  account_processed, msg_id)
                                 total_evaluated += 1
                                 continue
                             # TODO: final copy pending PM approval
@@ -4459,11 +5001,13 @@ Conversation ID: {sfid}
                                         f"To remove: forward any email from them with subject \"Fwd: Remove from Blacklist\"."
                                     )
                                     logger.info(f"  [BLACKLIST] Added address: {orig_addr}")
-                            send_email(config, f"Blacklist Address Confirmed — {orig_addr}", msg_out, logger,
+                            send_email(config, f"Blacklist Address Confirmed — {orig_addr}",
+                                       msg_out + _owner_skip_note_txt + _bla_conflict_note,
+                                       logger,
                                        to_addr=account.get("username", ""))
 
-                        account_processed.add(msg_id)
-                        processed["ids"][account_name].append([msg_id, datetime.now().isoformat()])
+                        _record_processed(processed, account_name,
+                                          account_processed, msg_id)
                         total_evaluated += 1
                         continue
 
@@ -4484,6 +5028,37 @@ Conversation ID: {sfid}
                         parsed_from = parse_from_address(fwd_data.get("original_from", ""))
                         orig_name = parsed_from.get("display_name")
 
+                        # C2b: own-identity guard. Walk candidates by address and
+                        # use the first NON-owner candidate's DISPLAY NAME, so the
+                        # owner's own name (when they appear as a spoofed sender)
+                        # is never blacklisted.
+                        _spam = _resolve_spam_sender(fwd_data, account, config)
+                        if _spam["refused"]:
+                            logger.info(
+                                "  [BLACKLIST NAME] Refused — only candidate is the "
+                                "owner's own address (C2b).")
+                            send_email(
+                                config,
+                                "Blacklist — Not Applied",
+                                _owner_only_refusal_body(),
+                                logger,
+                                to_addr=account.get("username", ""),
+                            )
+                            _record_processed(processed, account_name,
+                                              account_processed, msg_id)
+                            total_evaluated += 1
+                            continue
+                        if _spam["name"]:
+                            orig_name = _spam["name"]
+                        _owner_skip_note_txt = (
+                            _owner_skip_note(_spam["address"])
+                            if _spam["skipped"] else "")
+                        # C2a: multi-sender conflict warning (blacklist copy).
+                        _bln_conflict = fwd_data.get("_sender_conflict")
+                        _bln_conflict_note = (
+                            _sender_conflict_warning(_bln_conflict, with_undo=True)
+                            if _bln_conflict else "")
+
                         # Load skip_names to warn user
                         skip_names_set = set()
                         try:
@@ -4503,8 +5078,8 @@ Conversation ID: {sfid}
                                     "  [BLACKLIST NAME] No forward structure found — "
                                     "skipping silently to prevent loop"
                                 )
-                                account_processed.add(msg_id)
-                                processed["ids"][account_name].append([msg_id, datetime.now().isoformat()])
+                                _record_processed(processed, account_name,
+                                                  account_processed, msg_id)
                                 total_evaluated += 1
                                 continue
                             # TODO: final copy pending PM approval
@@ -4552,11 +5127,13 @@ Conversation ID: {sfid}
                                         f"and mailing lists that rotate addresses."
                                     )
                                     logger.info(f"  [BLACKLIST] Added display name: {orig_name}")
-                            send_email(config, f"Blacklist Name Confirmed — {orig_name}", msg_out, logger,
+                            send_email(config, f"Blacklist Name Confirmed — {orig_name}",
+                                       msg_out + _owner_skip_note_txt + _bln_conflict_note,
+                                       logger,
                                        to_addr=account.get("username", ""))
 
-                        account_processed.add(msg_id)
-                        processed["ids"][account_name].append([msg_id, datetime.now().isoformat()])
+                        _record_processed(processed, account_name,
+                                          account_processed, msg_id)
                         total_evaluated += 1
                         continue
 
@@ -4574,6 +5151,40 @@ Conversation ID: {sfid}
                             fwd_data.get("_divider_kind"),
                             fwd_data.get("original_from", ""),
                             fwd_data.get("original_subject", "")[:40])
+
+                        # C2b: own-identity guard. Train on the first NON-owner
+                        # sender so the learner never builds a "spam" pattern keyed
+                        # on the owner's own address (a spammer spoofing the owner).
+                        _spam = _resolve_spam_sender(fwd_data, account, config)
+                        if _spam["refused"]:
+                            logger.info(
+                                "  [SPAM EXAMPLE] Refused — only candidate is the "
+                                "owner's own address (C2b).")
+                            send_email(
+                                config,
+                                "SPAM Example — Not Applied",
+                                _owner_only_refusal_body(),
+                                logger,
+                                to_addr=account.get("username", ""),
+                            )
+                            _record_processed(processed, account_name,
+                                              account_processed, msg_id)
+                            total_evaluated += 1
+                            continue
+                        # Rewrite original_from to the resolved non-owner sender so
+                        # the synthesized .eml is keyed on the actual spammer.
+                        if _spam["address"]:
+                            _resolved_from = (f'{_spam["name"]} <{_spam["address"]}>'
+                                              if _spam["name"] else _spam["address"])
+                            fwd_data["original_from"] = _resolved_from
+                        _owner_skip_note_txt = (
+                            _owner_skip_note(_spam["address"])
+                            if _spam["skipped"] else "")
+                        # C2a: multi-sender conflict warning (blacklist copy).
+                        _se_conflict = fwd_data.get("_sender_conflict")
+                        _se_conflict_note = (
+                            _sender_conflict_warning(_se_conflict, with_undo=True)
+                            if _se_conflict else "")
 
                         # Resolve examples folder from config, with fallback
                         learner_cfg = config.get("signal_learner", {})
@@ -4606,10 +5217,12 @@ Conversation ID: {sfid}
                                 f"Your email was still processed — this only affects the training system."
                             )
 
-                        send_email(config, "SPAM Example Received", msg_out, logger,
-                                       to_addr=account.get("username", ""))
-                        account_processed.add(msg_id)
-                        processed["ids"][account_name].append([msg_id, datetime.now().isoformat()])
+                        send_email(config, "SPAM Example Received",
+                                   msg_out + _owner_skip_note_txt + _se_conflict_note,
+                                   logger,
+                                   to_addr=account.get("username", ""))
+                        _record_processed(processed, account_name,
+                                          account_processed, msg_id)
                         total_evaluated += 1
                         continue
 
@@ -4637,6 +5250,14 @@ Conversation ID: {sfid}
                             "%r failed authentication (S2 auth gate).",
                             msg_data.get("from_email", ""))
                         _notify_unverified_command(config, account, logger)
+                        # Hardening (same rationale as the subject-command auth
+                        # rejection above): record the rejection itself as
+                        # processed so a processed_ids reset can't resend the
+                        # notice. The message still flows to classification; the
+                        # 5550 recording is guarded against a double-append.
+                        mark_uid_seen(conn, uid, logger)
+                        _record_processed(processed, account_name,
+                                          account_processed, msg_id)
                         sfid_match = None
                     if sfid_match:
                         sfid = f"SFID-{sfid_match.group(1)}"
@@ -4658,9 +5279,8 @@ Conversation ID: {sfid}
                         )
                         if is_our_own_email:
                             logger.debug(f"  Skipping own SFID email: {sfid}")
-                            account_processed.add(msg_id)
-                            now_iso = datetime.now().isoformat()
-                            processed["ids"][account_name].append([msg_id, now_iso])
+                            _record_processed(processed, account_name,
+                                              account_processed, msg_id)
                             continue
 
                         logger.info(f"  SFID reply detected: {sfid}")
@@ -4684,9 +5304,8 @@ Conversation ID: {sfid}
                                 resolved_body,
                                 logger,
                                 to_addr=account.get("username", ""))
-                            account_processed.add(msg_id)
-                            now_iso = datetime.now().isoformat()
-                            processed["ids"][account_name].append([msg_id, now_iso])
+                            _record_processed(processed, account_name,
+                                              account_processed, msg_id)
                             total_evaluated += 1
                             continue
 
@@ -4700,9 +5319,8 @@ Conversation ID: {sfid}
                                 f"To revisit, forward the original email again with 'Fwd: False Positive' subject.",
                                 logger,
                                 to_addr=account.get("username", ""))
-                            account_processed.add(msg_id)
-                            now_iso = datetime.now().isoformat()
-                            processed["ids"][account_name].append([msg_id, now_iso])
+                            _record_processed(processed, account_name,
+                                              account_processed, msg_id)
                             total_evaluated += 1
                             continue
 
@@ -4751,9 +5369,8 @@ Conversation ID: {sfid}
                                 f"[{sfid}] Revised refinement — {ref.get('headline', '')[:60]}",
                                 revised_body, logger,
                                 to_addr=account.get("username", ""))
-                            account_processed.add(msg_id)
-                            processed["ids"][account_name].append(
-                                [msg_id, datetime.now().isoformat()])
+                            _record_processed(processed, account_name,
+                                              account_processed, msg_id)
                             total_evaluated += 1
                             continue
                         if conv_kind == "spam_example_proposal" and lowered.startswith("narrow:"):
@@ -4785,9 +5402,8 @@ Conversation ID: {sfid}
                                 f"[{sfid}] Revised refinement — {ref.get('headline', '')[:60]}",
                                 revised_body, logger,
                                 to_addr=account.get("username", ""))
-                            account_processed.add(msg_id)
-                            processed["ids"][account_name].append(
-                                [msg_id, datetime.now().isoformat()])
+                            _record_processed(processed, account_name,
+                                              account_processed, msg_id)
                             total_evaluated += 1
                             continue
 
@@ -4973,9 +5589,8 @@ USER'S FOLLOW-UP:
                             except Exception as e:
                                 logger.error(f"  Follow-up API call failed: {e}")
 
-                        account_processed.add(msg_id)
-                        now_iso = datetime.now().isoformat()
-                        processed["ids"][account_name].append([msg_id, now_iso])
+                        _record_processed(processed, account_name,
+                                          account_processed, msg_id)
                         total_evaluated += 1
                         continue
 
@@ -4990,9 +5605,8 @@ USER'S FOLLOW-UP:
                         wl_result = {"decision": "WHITELISTED", "confidence": 0.0, "signals_hit": []}
                         action = f"No action taken — passed through (matched: {wl_addr_match})"
                         log_decision(account_name, msg_data, wl_result, action)
-                        account_processed.add(msg_id)
-                        now_iso = datetime.now().isoformat()
-                        processed["ids"][account_name].append([msg_id, now_iso])
+                        _record_processed(processed, account_name,
+                                          account_processed, msg_id)
                         total_evaluated += 1
                         continue
 
@@ -5021,9 +5635,8 @@ USER'S FOLLOW-UP:
                             if "FAILED" in action or "DELETE FAILED" in action:
                                 total_errors += 1
                         log_decision(account_name, msg_data, bl_result, action)
-                        account_processed.add(msg_id)
-                        now_iso = datetime.now().isoformat()
-                        processed["ids"][account_name].append([msg_id, now_iso])
+                        _record_processed(processed, account_name,
+                                          account_processed, msg_id)
                         total_evaluated += 1
                         continue
 
@@ -5062,9 +5675,8 @@ USER'S FOLLOW-UP:
                                 action = action + " (subject-keyword)"
                         log_decision(account_name, msg_data, kw_result, action)
                         record_pre_classifier_skip(token_usage, delta=token_delta)
-                        account_processed.add(msg_id)
-                        now_iso = datetime.now().isoformat()
-                        processed["ids"][account_name].append([msg_id, now_iso])
+                        _record_processed(processed, account_name,
+                                          account_processed, msg_id)
                         total_evaluated += 1
                         continue
 
@@ -5078,9 +5690,8 @@ USER'S FOLLOW-UP:
                         wl_result = {"decision": "WHITELISTED", "confidence": 0.0, "signals_hit": []}
                         action = f"No action taken — passed through (matched: {wl_match})"
                         log_decision(account_name, msg_data, wl_result, action)
-                        account_processed.add(msg_id)
-                        now_iso = datetime.now().isoformat()
-                        processed["ids"][account_name].append([msg_id, now_iso])
+                        _record_processed(processed, account_name,
+                                          account_processed, msg_id)
                         total_evaluated += 1
                         continue
 
@@ -5131,9 +5742,8 @@ USER'S FOLLOW-UP:
                             action = action + " (pre-classifier)"
                         log_decision(account_name, msg_data, pre_decision, action)
                         record_pre_classifier_skip(token_usage, delta=token_delta)
-                        account_processed.add(msg_id)
-                        now_iso = datetime.now().isoformat()
-                        processed["ids"][account_name].append([msg_id, now_iso])
+                        _record_processed(processed, account_name,
+                                          account_processed, msg_id)
                         total_evaluated += 1
                         continue
 
@@ -5217,10 +5827,14 @@ USER'S FOLLOW-UP:
                     # after the user flips dry-run off.
                     verdict = (result or {}).get("decision", "").lower()
                     cache_this = (not dry_run) or (verdict != "spam")
+                    # Guard against a double-append: an auth-rejected command
+                    # (or a whitelisted/pass-through path) already recorded this
+                    # msg_id before falling through to classification. Keep the
+                    # dry-run cache_this gate; _record_processed is idempotent
+                    # (no-op if msg_id already recorded for this account).
                     if cache_this:
-                        account_processed.add(msg_id)
-                        now_iso = datetime.now().isoformat()
-                        processed["ids"][account_name].append([msg_id, now_iso])
+                        _record_processed(processed, account_name,
+                                          account_processed, msg_id)
 
                 # Break out of folder loop if max reached
                 if total_evaluated >= max_per_run:

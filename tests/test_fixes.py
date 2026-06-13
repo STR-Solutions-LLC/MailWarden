@@ -1864,3 +1864,538 @@ def test_resolved_reply_none_conv_says_not_found():
 def test_resolved_reply_awaiting_falls_through():
     assert spam_filter._resolved_sfid_reply(
         {"status": "awaiting_reply", "resolution": None}, "SFID-X") is None
+
+
+# ---------------------------------------------------------------------------
+# C2 — forward-parsing safety (Session 3)
+#
+# C2a: candidate collection + sender-conflict surfacing in parse_forwarded_email.
+#   The chosen original_from is UNCHANGED from today (precedence is preserved).
+#   What's new: _candidates (ordered) and _sender_conflict metadata so the
+#   handlers can warn the owner when a forward contains more than one plausible
+#   original sender (a spammer planting a fake forward block under a genuine
+#   client attribution, or a From: line that belongs to a deeper nested block).
+# ---------------------------------------------------------------------------
+
+def test_c2a_fake_divider_below_real_attribution_flags_conflict():
+    # A genuine client attribution ("On ... wrote:") sits at the top; a fake
+    # "Begin forwarded message:" block is planted BELOW it carrying a spammer's
+    # From: header. The divider wins original_from (precedence unchanged), but
+    # the inline address above the divider is surfaced as a conflict.
+    body = (
+        "On Mon, Apr 19, 2026 at 10:00 AM, Real Person <real@client.com> wrote:\n"
+        "\n"
+        "Begin forwarded message:\n"
+        "From: Spammer <spammer@evil.com>\n"
+        "Subject: You won\n"
+        "Date: Mon, 19 Apr 2026 09:00:00 -0700\n"
+        "\n"
+        "claim your prize\n"
+    )
+    fwd = spam_filter.parse_forwarded_email(body, "")
+    # Precedence unchanged: the divider's From: header is original_from.
+    assert parse_addr(fwd["original_from"]) == "spammer@evil.com"
+    conflict = fwd.get("_sender_conflict")
+    assert conflict is not None
+    assert parse_addr_lower(conflict["chosen"]) == "spammer@evil.com"
+    assert "real@client.com" in [a.lower() for a in conflict["others"]]
+
+
+def test_c2a_normal_apple_mail_forward_no_conflict():
+    # A clean Apple-Mail forward with a single sender: no conflict at all.
+    body = (
+        "Please block this one.\n"
+        "\n"
+        "Begin forwarded message:\n"
+        "From: Spammer <spammer@evil.com>\n"
+        "Subject: You won\n"
+        "Date: Mon, 19 Apr 2026 09:00:00 -0700\n"
+        "\n"
+        "claim your prize\n"
+    )
+    fwd = spam_filter.parse_forwarded_email(body, "")
+    assert parse_addr(fwd["original_from"]) == "spammer@evil.com"
+    assert fwd.get("_sender_conflict") is None
+
+
+def test_c2a_reply_quotes_below_divider_no_noise():
+    # A real forwarded message whose forwarded CONTENT contains reply-thread
+    # "On ... X wrote:" lines BELOW the divider must NOT generate a conflict.
+    # Scanning below the divider for inline matches would create false alarms
+    # on every legitimate forwarded reply chain.
+    body = (
+        "Block this please.\n"
+        "\n"
+        "Begin forwarded message:\n"
+        "From: Spammer <spammer@evil.com>\n"
+        "Subject: Re: thread\n"
+        "Date: Mon, 19 Apr 2026 09:00:00 -0700\n"
+        "\n"
+        "Thanks!\n"
+        "\n"
+        "On Sun, Apr 18, 2026 at 8:00 AM, Colleague <colleague@work.com> wrote:\n"
+        "> earlier message in the thread\n"
+    )
+    fwd = spam_filter.parse_forwarded_email(body, "")
+    assert parse_addr(fwd["original_from"]) == "spammer@evil.com"
+    assert fwd.get("_sender_conflict") is None
+
+
+def test_c2a_from_beyond_next_divider_flagged():
+    # The From: line the parser used lies BEYOND a second divider that occurs
+    # after the chosen one — i.e. it belongs to a deeper nested forward block.
+    # Keep today's extraction but flag the conflict with that reason.
+    body = (
+        "Block this.\n"
+        "\n"
+        "Begin forwarded message:\n"
+        "Subject: outer (no From here)\n"
+        "Date: Mon, 19 Apr 2026 09:00:00 -0700\n"
+        "\n"
+        "----- Forwarded message -----\n"
+        "From: Deep Sender <deep@evil.com>\n"
+        "Subject: inner\n"
+        "\n"
+        "inner body\n"
+    )
+    fwd = spam_filter.parse_forwarded_email(body, "")
+    # Today's extraction is preserved: first From: match wins (the deep one).
+    assert parse_addr(fwd["original_from"]) == "deep@evil.com"
+    conflict = fwd.get("_sender_conflict")
+    assert conflict is not None
+    assert conflict["reason"] == "from-beyond-next-divider"
+
+
+def test_c2a_candidates_key_present_and_ordered():
+    # _candidates is additive and starts with the chosen sender.
+    body = (
+        "On Mon, Apr 19, 2026 at 10:00 AM, Real Person <real@client.com> wrote:\n"
+        "\n"
+        "Begin forwarded message:\n"
+        "From: Spammer <spammer@evil.com>\n"
+        "Subject: You won\n"
+        "\n"
+        "prize\n"
+    )
+    fwd = spam_filter.parse_forwarded_email(body, "")
+    cands = fwd.get("_candidates")
+    assert isinstance(cands, list) and cands
+    assert parse_addr_lower(cands[0]["address"]) == "spammer@evil.com"
+    addrs = [c["address"].lower() for c in cands]
+    assert "real@client.com" in addrs
+
+
+# ---------------------------------------------------------------------------
+# C2b — own-identity guard for spam-sender commands (Blacklist All / Address /
+# Name, SPAM Example). _resolve_spam_sender walks _candidates and skips the
+# owner's own identities so MailWarden never blacklists the owner because a
+# spammer disguised mail as coming from them. False Positive / Whitelist /
+# Whitelist Domain / Remove-from-Blacklist are DELIBERATELY exempt.
+# ---------------------------------------------------------------------------
+
+def _account_main():
+    return {"username": "main@example.com"}
+
+
+def test_c2b_owner_only_candidate_refuses():
+    # The only sender found is the owner's own address.
+    cfg = _cfg(accounts=[{"username": "main@example.com", "enabled": True}])
+    fwd = {
+        "original_from": "Me <main@example.com>",
+        "_candidates": [{"address": "main@example.com", "name": "Me",
+                         "kind": "apple-mail"}],
+    }
+    res = spam_filter._resolve_spam_sender(fwd, _account_main(), cfg)
+    assert res["refused"] is True
+    assert res["address"] in (None, "")
+
+
+def test_c2b_owner_first_spammer_deeper_resolves_spammer():
+    # Owner's own address is candidate #1; a non-owner spammer is deeper.
+    # The resolver skips the owner and uses the spammer, reporting the skip.
+    cfg = _cfg(accounts=[{"username": "main@example.com", "enabled": True}])
+    fwd = {
+        "original_from": "Me <main@example.com>",
+        "_candidates": [
+            {"address": "main@example.com", "name": "Me", "kind": "inline"},
+            {"address": "spammer@evil.com", "name": "Spammer", "kind": "apple-mail"},
+        ],
+    }
+    res = spam_filter._resolve_spam_sender(fwd, _account_main(), cfg)
+    assert res["refused"] is False
+    assert res["address"] == "spammer@evil.com"
+    assert "main@example.com" in [a.lower() for a in res["skipped"]]
+
+
+def test_c2b_non_owner_first_used_directly():
+    cfg = _cfg(accounts=[{"username": "main@example.com", "enabled": True}])
+    fwd = {
+        "original_from": "Spammer <spammer@evil.com>",
+        "_candidates": [{"address": "spammer@evil.com", "name": "Spammer",
+                         "kind": "apple-mail"}],
+    }
+    res = spam_filter._resolve_spam_sender(fwd, _account_main(), cfg)
+    assert res["refused"] is False
+    assert res["address"] == "spammer@evil.com"
+    assert res["skipped"] == []
+
+
+def test_c2b_false_positive_exemption_owner_address_usable():
+    # The exemption is at the handler layer: parse_from_address(original_from)
+    # is used directly for False Positive, so the owner's OWN address still
+    # resolves to a usable address (forwarding your own self-sent mail as a
+    # False Positive must keep working).
+    fwd = {"original_from": "Me <main@example.com>"}
+    addr = utils.parse_from_address(fwd["original_from"]).get("address")
+    assert addr == "main@example.com"
+
+
+# ---------------------------------------------------------------------------
+# M5 — "Fwd: Re:" recognition. Once at least one Fwd:/Fw: has been stripped,
+# subsequent iterations also strip a leading "Re:". A bare "Re:" with no Fwd:
+# stays unrecognized (today's behavior, pinned).
+# ---------------------------------------------------------------------------
+
+def test_m5_fwd_re_blacklist_all_recognized():
+    assert spam_filter.detect_email_command("Fwd: Re: Blacklist All") == "Blacklist All"
+
+
+def test_m5_bare_re_blacklist_all_unrecognized():
+    assert spam_filter.detect_email_command("Re: Blacklist All") is None
+
+
+def test_m5_fwd_fwd_re_blacklist_address_recognized():
+    assert spam_filter.detect_email_command(
+        "Fwd: Fwd: Re: Blacklist Address") == "Blacklist Address"
+
+
+def test_m5_strip_fwd_prefix_drops_re_after_fwd():
+    assert spam_filter.strip_fwd_prefix("Fwd: Re: Blacklist All") == "Blacklist All"
+
+
+def test_m5_strip_fwd_prefix_bare_re_preserved():
+    assert spam_filter.strip_fwd_prefix("Re: Blacklist All") == "Re: Blacklist All"
+
+
+# ---------------------------------------------------------------------------
+# M6 — anchored command matching. A command pattern only matches when the next
+# character after it is a word boundary (not [a-z0-9]). "Blacklist Allister"
+# no longer triggers "Blacklist All", "not spammy at all" no longer triggers
+# "not spam", "Whitelisting" no longer triggers "whitelist".
+# ---------------------------------------------------------------------------
+
+def test_m6_blacklist_allister_does_not_match():
+    assert spam_filter.detect_email_command(
+        "Blacklist Allister Group quarterly update") is None
+
+
+def test_m6_not_spammy_at_all_does_not_match():
+    assert spam_filter.detect_email_command("not spammy at all") is None
+
+
+def test_m6_blacklist_all_period_matches():
+    assert spam_filter.detect_email_command("Blacklist All.") == "Blacklist All"
+
+
+def test_m6_blacklist_all_dash_suffix_matches():
+    assert spam_filter.detect_email_command(
+        "Blacklist All - the bank one") == "Blacklist All"
+
+
+def test_m6_blacklist_all_exact_matches():
+    assert spam_filter.detect_email_command("Blacklist All") == "Blacklist All"
+
+
+def test_m6_whitelisting_does_not_match():
+    assert spam_filter.detect_email_command("Whitelisting tips") is None
+
+
+# ---------------------------------------------------------------------------
+# M7 — date-fragment cleanup of inline display names. Inline attribution names
+# must not absorb the trailing date fragment when the regex over-captures.
+# A clean "Doe, Jane <...> wrote:" (short-inline, no date) is preserved intact.
+# ---------------------------------------------------------------------------
+
+def test_m7_primary_inline_name_strips_date_fragment():
+    body = ("On Mon, Apr 19, 2026 at 10:23 AM, Jane Doe <jane@spam.com> wrote:\n"
+            "> quoted text\n")
+    fwd = spam_filter.parse_forwarded_email(body, "")
+    parsed = utils.parse_from_address(fwd["original_from"])
+    assert parsed["display_name"] == "Jane Doe"
+    assert parsed["address"] == "jane@spam.com"
+
+
+def test_m7_wrapped_date_inline_name_cleaned():
+    # Wrapped-date variant: the date spans two lines, forcing the wrapped-date
+    # DOTALL pass. The display name must still come out clean.
+    body = ("On Mon, Apr 19, 2026\n"
+            "at 10:23 AM, Jane Doe <jane@spam.com> wrote:\n"
+            "> quoted text\n")
+    fwd = spam_filter.parse_forwarded_email(body, "")
+    parsed = utils.parse_from_address(fwd["original_from"])
+    assert parsed["display_name"] == "Jane Doe"
+    assert parsed["address"] == "jane@spam.com"
+
+
+def test_m7_short_inline_comma_name_preserved():
+    # Clean "Doe, Jane <...> wrote:" via short-inline (no date) must be kept.
+    body = "Doe, Jane <d@x.com> wrote:\n> quoted\n"
+    fwd = spam_filter.parse_forwarded_email(body, "")
+    parsed = utils.parse_from_address(fwd["original_from"])
+    assert parsed["display_name"] == "Doe, Jane"
+    assert parsed["address"] == "d@x.com"
+
+
+def test_m7_bare_address_inline_unaffected():
+    body = ("On Mon, Apr 19, 2026 at 10:23 AM, noreply@automated.io wrote:\n"
+            "> quoted\n")
+    fwd = spam_filter.parse_forwarded_email(body, "")
+    assert fwd["original_from"] == "noreply@automated.io"
+
+
+def test_m7_strip_date_fragment_helper_basic():
+    # Direct unit test of the helper.
+    assert spam_filter._strip_date_fragment(
+        "Mon, Apr 19, 2026 at 10:23 AM, Jane Doe") == "Jane Doe"
+    # No date-ish prefix: unchanged.
+    assert spam_filter._strip_date_fragment("Doe, Jane") == "Doe, Jane"
+    # No comma at all: unchanged.
+    assert spam_filter._strip_date_fragment("Jane Doe") == "Jane Doe"
+
+
+# ---------------------------------------------------------------------------
+# Colon-form direct commands — "Whitelist: x" / "Blacklist: x" are accepted as
+# Direct Whitelist / Direct Blacklist, with or without a Fwd: prefix. Empty
+# payloads fall through to the table. "Whitelist domain: x" still hits the
+# Whitelist Domain table entry, not the colon branch.
+# ---------------------------------------------------------------------------
+
+def test_colon_whitelist_domain_value_is_direct_whitelist():
+    assert spam_filter.detect_email_command(
+        "Whitelist: domain.com") == "Direct Whitelist"
+
+
+def test_colon_blacklist_address_value_is_direct_blacklist():
+    assert spam_filter.detect_email_command(
+        "Blacklist: bad@spam.com") == "Direct Blacklist"
+
+
+def test_colon_fwd_whitelist_value_is_direct_whitelist():
+    assert spam_filter.detect_email_command(
+        "Fwd: Whitelist: domain.com") == "Direct Whitelist"
+
+
+def test_colon_whitelist_domain_colon_still_whitelist_domain():
+    # "Whitelist domain: x.com" must hit Whitelist Domain, NOT the colon branch.
+    assert spam_filter.detect_email_command(
+        "Whitelist domain: x.com") == "Whitelist Domain"
+
+
+def test_colon_empty_payload_falls_through_to_table():
+    # "Whitelist:" with no value behaves as today (table-matched "Whitelist").
+    assert spam_filter.detect_email_command("Whitelist:") == "Whitelist"
+
+
+def test_colon_subject_payload_reaches_parse_list_body():
+    # Handler-level: the subject payload after the first colon is prepended to
+    # the body before parse_list_body, so a subject-only colon command works.
+    # parse_list_body accepts bare addresses and @domain entries (leading @
+    # required), so the payload is written to match those forms.
+    payload_line = spam_filter._subject_payload_line("Whitelist: @domain.com")
+    assert payload_line == "@domain.com"
+    combined = spam_filter._prepend_subject_payload(
+        "Whitelist: @domain.com", "extra@body.com\n")
+    parsed = spam_filter.parse_list_body(combined)
+    assert "domain.com" in parsed["domains"]
+    assert "extra@body.com" in parsed["addresses"]
+
+
+# ---------------------------------------------------------------------------
+# Hardening — the auth-rejection path records the email as processed using the
+# same mechanism the success path uses, so a processed_ids reset cannot cause a
+# duplicate "command not verified" notice. The normal recording at 5220 must
+# not double-append the same msg_id.
+# ---------------------------------------------------------------------------
+
+def test_hardening_record_processed_appends_once():
+    processed = {"ids": {"acct": []}}
+    seen = set()
+    spam_filter._record_processed(processed, "acct", seen, "<id-1>")
+    assert "<id-1>" in seen
+    assert [e[0] for e in processed["ids"]["acct"]] == ["<id-1>"]
+
+
+def test_hardening_record_processed_no_double_append():
+    processed = {"ids": {"acct": [["<id-1>", "2026-01-01T00:00:00"]]}}
+    seen = {"<id-1>"}
+    # Already recorded — must not append a second entry.
+    spam_filter._record_processed(processed, "acct", seen, "<id-1>")
+    assert [e[0] for e in processed["ids"]["acct"]] == ["<id-1>"]
+
+
+def test_hardening_record_processed_creates_account_list():
+    processed = {"ids": {}}
+    seen = set()
+    spam_filter._record_processed(processed, "newacct", seen, "<id-9>")
+    assert [e[0] for e in processed["ids"]["newacct"]] == ["<id-9>"]
+
+
+# Helpers for C2 tests — parse an original_from header to its bare address.
+def parse_addr(header_value):
+    return (utils.parse_from_address(header_value).get("address") or "")
+
+
+def parse_addr_lower(header_value):
+    a = utils.parse_from_address(header_value).get("address")
+    return (a or "").lower()
+
+
+# ===========================================================================
+# Session 3 live-verification fixes
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Bug 1 — colon-form "Whitelist: domain.com" must persist a bare domain.
+#
+# parse_list_body only accepts bare email addresses and @domain entries; a
+# bare "domain.com" lands in "invalid". The fix normalizes a bare-domain
+# SUBJECT payload into the @domain form parse_list_body already accepts, in
+# the subject-payload seam ONLY — body parsing stays byte-identical.
+#
+# Persistence is asserted against the real store-apply helper the Direct
+# Whitelist / Direct Blacklist handlers use (_apply_parsed_list_entries),
+# so these pin actual persistence into the store dict, not a copy of it.
+# ---------------------------------------------------------------------------
+
+def _wl_store():
+    return {"addresses": [], "domains": []}
+
+
+def test_bug1_subject_whitelist_bare_domain_persists():
+    # Subject "Whitelist: example-test.com", empty body -> the domain must end
+    # up in the whitelist store's domains list (bare, @ stripped).
+    raw_body = spam_filter._prepend_subject_payload(
+        "Whitelist: example-test.com", "")
+    parsed = spam_filter.parse_list_body(raw_body)
+    store = _wl_store()
+    spam_filter._apply_parsed_list_entries(store, parsed)
+    assert "example-test.com" in store["domains"]
+    assert parsed["invalid"] == []
+
+
+def test_bug1_subject_blacklist_address_persists():
+    # Subject "Blacklist: bad-actor@example-test.com" -> the ADDRESS must end
+    # up in the blacklist store's addresses list (addresses are unaffected by
+    # the bare-domain normalization).
+    raw_body = spam_filter._prepend_subject_payload(
+        "Blacklist: bad-actor@example-test.com", "")
+    parsed = spam_filter.parse_list_body(raw_body)
+    store = _wl_store()
+    spam_filter._apply_parsed_list_entries(store, parsed)
+    assert "bad-actor@example-test.com" in store["addresses"]
+    assert parsed["invalid"] == []
+
+
+def test_bug1_subject_blacklist_bare_domain_persists():
+    # Direct Blacklist supports domain entries today (the handler iterates
+    # parsed["domains"]), so the same subject-payload normalization applies:
+    # "Blacklist: spammy-test.com" must persist as a bare domain.
+    raw_body = spam_filter._prepend_subject_payload(
+        "Blacklist: spammy-test.com", "")
+    parsed = spam_filter.parse_list_body(raw_body)
+    store = _wl_store()
+    spam_filter._apply_parsed_list_entries(store, parsed)
+    assert "spammy-test.com" in store["domains"]
+
+
+def test_bug1_body_bare_domain_still_invalid_regression():
+    # REGRESSION PIN: a bare domain in the BODY (not the subject payload) must
+    # behave exactly as before the fix — it is NOT normalized, so it lands in
+    # "invalid" and never persists. Body parsing must stay byte-identical.
+    parsed = spam_filter.parse_list_body("example-test.com\n")
+    assert parsed["domains"] == []
+    assert parsed["addresses"] == []
+    assert "example-test.com" in parsed["invalid"]
+
+
+def test_bug1_body_at_domain_still_persists_regression():
+    # REGRESSION PIN: the @domain BODY form keeps working unchanged, with the
+    # same content as a subject command would carry.
+    parsed = spam_filter.parse_list_body("@example-test.com\n")
+    store = _wl_store()
+    spam_filter._apply_parsed_list_entries(store, parsed)
+    assert "example-test.com" in store["domains"]
+    assert parsed["invalid"] == []
+
+
+def test_bug1_subject_payload_only_normalizes_bare_domains():
+    # A subject payload that is an address is NOT turned into a domain; a
+    # payload with no dot (not a domain) is left for parse_list_body to reject.
+    assert spam_filter._subject_payload_line(
+        "Whitelist: user@host-test.com") == "user@host-test.com"
+    assert spam_filter._subject_payload_line(
+        "Whitelist: notadomain") == "notadomain"
+    # Bare domain gets the @ prefix so parse_list_body routes it to domains.
+    assert spam_filter._subject_payload_line(
+        "Whitelist: example-test.com") == "@example-test.com"
+
+
+# ---------------------------------------------------------------------------
+# Bug 2 — a single msg_id must be recorded in processed_ids exactly once per
+# run, even when the auth-rejection path records it and the message then falls
+# through to a whitelisted/pass-through path that also records it.
+# ---------------------------------------------------------------------------
+
+def test_bug2_rejection_then_whitelist_records_once():
+    # Simulate the live double-record: auth-rejection records the id, then the
+    # whitelisted/pass-through path records the SAME id. Routed through
+    # _record_processed, the second call is a no-op.
+    processed = {"ids": {}}
+    account_processed = set()
+    msg_id = "<forged-1>"
+    # Auth-rejection path (mark seen + record).
+    spam_filter._record_processed(processed, "acct", account_processed, msg_id)
+    # Whitelisted/pass-through path records the same id again.
+    spam_filter._record_processed(processed, "acct", account_processed, msg_id)
+    ids = [e[0] for e in processed["ids"]["acct"]]
+    assert ids == [msg_id]  # exactly ONE entry
+
+
+def test_bug2_two_distinct_ids_record_twice():
+    # REGRESSION PIN: two DIFFERENT msg_ids still each record once -> two
+    # entries. The idempotency is per-id, not a blanket suppression.
+    processed = {"ids": {}}
+    account_processed = set()
+    spam_filter._record_processed(processed, "acct", account_processed, "<a>")
+    spam_filter._record_processed(processed, "acct", account_processed, "<b>")
+    ids = [e[0] for e in processed["ids"]["acct"]]
+    assert ids == ["<a>", "<b>"]
+
+
+# ---------------------------------------------------------------------------
+# Item 3 — the False Positive handler resolves the original sender via
+# parse_from_address, and must NEVER call _resolve_spam_sender (the C2b
+# own-identity guard is deliberately exempt for False Positive, so forwarding
+# your OWN self-sent mail as a false positive keeps working).
+# ---------------------------------------------------------------------------
+
+def test_item3_false_positive_does_not_call_resolver(monkeypatch):
+    # Hard pin: if the FP path ever routes through _resolve_spam_sender, this
+    # raises. The owner's own address must still resolve.
+    monkeypatch.setattr(
+        spam_filter, "_resolve_spam_sender",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("FP must not call resolver")))
+    fwd_data = {"original_from": "Me <main@example.com>",
+                "original_subject": "Receipt"}
+    addr = spam_filter._resolve_false_positive_sender(fwd_data)
+    assert addr == "main@example.com"
+
+
+def test_item3_false_positive_resolver_handles_missing_from(monkeypatch):
+    # No original_from -> empty string, still without touching the resolver.
+    monkeypatch.setattr(
+        spam_filter, "_resolve_spam_sender",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("FP must not call resolver")))
+    assert spam_filter._resolve_false_positive_sender({}) == ""
