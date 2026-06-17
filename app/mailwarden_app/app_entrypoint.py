@@ -50,7 +50,7 @@ def _cli_status() -> int:
     print(f"  dry_run:            {filt.get('dry_run', True)}")
     print(f"  max_emails_per_run: {filt.get('max_emails_per_run', 100)}")
     print(f"  model:              {cfg.get('anthropic', {}).get('model', '(unset)')}")
-    print(f"  threshold:          {cfg.get('anthropic', {}).get('confidence_threshold', 0.85)}")
+    print(f"  threshold:          {cfg.get('filter', {}).get('confidence_threshold', 0.85)}")
     print(f"  accounts ({len(accounts)}):")
     for a in accounts:
         print(f"    - name={a.get('name','?')} user={a.get('username','?')} "

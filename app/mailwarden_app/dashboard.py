@@ -1085,11 +1085,19 @@ class HomeTab(ttk.Frame):
         # timestamp advances. The Dashboard's 60s _periodic_refresh remains the
         # backstop so the label is never permanently stale.
         baseline = _last_filter_run()
-        self._start_run_now_poll(baseline, deadline_ticks=15)
-        messagebox.showinfo("Running",
-                             "Filter started. Come back in a minute to see updated stats.")
 
-    def _start_run_now_poll(self, baseline, deadline_ticks: int):
+        def _on_run_complete(ran: bool) -> None:
+            if ran:
+                messagebox.showinfo("Filter Complete", "Filter ran — stats updated.")
+            else:
+                messagebox.showinfo(
+                    "Filter Busy",
+                    "Run requested, but the filter may have been skipped —\n"
+                    "another run may have been in progress. Stats unchanged.",
+                )
+        self._start_run_now_poll(baseline, deadline_ticks=15, on_done=_on_run_complete)
+
+    def _start_run_now_poll(self, baseline, deadline_ticks: int, on_done=None):
         """Poll _last_filter_run() every 2s up to deadline_ticks times, calling
         refresh() each tick, and stop early once the run timestamp advances past
         baseline. Guarded against teardown: any pending poll is cancelled on
@@ -1111,6 +1119,8 @@ class HomeTab(ttk.Frame):
             advanced = current is not None and (
                 baseline is None or current > baseline)
             if advanced or remaining <= 0:
+                if on_done is not None:
+                    on_done(advanced)
                 return
             try:
                 self._run_now_poll_after = self.after(
@@ -3309,7 +3319,7 @@ class SettingsTab(ttk.Frame):
             # stays correct even if MODEL_CHOICES order changes.
             self._model_var.set(
                 next(l for l, v in MODEL_CHOICES if v == default_model))
-        self._threshold_var.set(config.get("anthropic", {}).get("confidence_threshold", 0.85))
+        self._threshold_var.set(config.get("filter", {}).get("confidence_threshold", 0.85))
         self._threshold_label.config(text=f"{self._threshold_var.get():.2f}")
         self._maxrun_var.set(config.get("filter", {}).get("max_emails_per_run", 100))
         self._menubar_var.set(config.get("ui", {}).get("menu_bar_enabled", True))
@@ -3341,7 +3351,7 @@ class SettingsTab(ttk.Frame):
             config.setdefault("anthropic", {})["api_key"] = api_key
             if model_value is not None:
                 config["anthropic"]["model"] = model_value
-            config["anthropic"]["confidence_threshold"] = threshold
+            config.setdefault("filter", {})["confidence_threshold"] = threshold
             config.setdefault("filter", {})["max_emails_per_run"] = max_per_run
         config_io.update_config(_apply)
         self._api_status.config(text="Saved.")

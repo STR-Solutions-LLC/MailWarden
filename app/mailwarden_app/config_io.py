@@ -61,7 +61,6 @@ DEFAULT_CONFIG: dict = {
     "anthropic": {
         "api_key": "",
         "model": "claude-haiku-4-5-20251001",
-        "confidence_threshold": 0.85,
     },
     "filter": {
         "dry_run": True,
@@ -73,6 +72,7 @@ DEFAULT_CONFIG: dict = {
         # than interval_minutes after the last real run. The UI clamps this to
         # a sane range (5–360 minutes).
         "interval_minutes": 15,
+        "confidence_threshold": 0.85,
     },
     "smtp": {
         "host": "",
@@ -152,11 +152,28 @@ def smtp_config_from_account(
     }
 
 
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """Return overlay with any missing keys back-filled from base, recursively.
+
+    Existing overlay values are never overwritten — user config wins.
+    """
+    import copy
+    result = dict(overlay)
+    for key, base_val in base.items():
+        if key not in result:
+            result[key] = copy.deepcopy(base_val)
+        elif isinstance(base_val, dict) and isinstance(result[key], dict):
+            result[key] = _deep_merge(base_val, result[key])
+    return result
+
+
 def load_config() -> dict:
     """Load config.json if present, else return a deep copy of DEFAULT_CONFIG.
 
-    Migration: older configs lack per-account spam_action. Treat missing as
-    "junk" so existing behavior is preserved on upgrade.
+    Migrations applied on load:
+    - Back-fill spam_action on accounts created before this field existed.
+    - C4: move confidence_threshold from anthropic → filter block.
+    - M16: back-fill any keys added to DEFAULT_CONFIG since config was saved.
     """
     import copy
     if paths.CONFIG_PATH.exists():
@@ -166,6 +183,15 @@ def load_config() -> dict:
             # Back-fill spam_action on accounts created before this field existed.
             for acct in data.get("accounts", []):
                 acct.setdefault("spam_action", "junk")
+            # C4: migrate confidence_threshold from anthropic → filter block.
+            anthropic_block = data.get("anthropic", {})
+            filter_block = data.setdefault("filter", {})
+            if "confidence_threshold" in anthropic_block and \
+               "confidence_threshold" not in filter_block:
+                filter_block["confidence_threshold"] = \
+                    anthropic_block.pop("confidence_threshold")
+            # M16: fill in any schema keys missing from this (older) saved config.
+            data = _deep_merge(DEFAULT_CONFIG, data)
             return data
         except (json.JSONDecodeError, OSError):
             pass
