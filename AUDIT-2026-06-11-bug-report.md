@@ -423,7 +423,7 @@ Files changed: `app/mailwarden_app/config_io.py`, `app/mailwarden_app/dashboard.
 **Next step:** Session 5, then Session 6 (audit's suggested order).
 
 ## Session 5 — Email-authentication parsing (completed 2026-06-17)
-**Status: test suite green (319 passed; 306 after Session 10 → 319 with the Session 5 reproduction tests). Independent review gate: PASSED (2026-06-17, fresh Sonnet 4.6 session) — all findings closed; the reviewer reverted each security fix in an out-of-tree copy and confirmed each demonstrated attack re-opens, proving the repro tests are load-bearing. Live verification: attack inputs re-run through the real functions; full packaged-app end-to-end is batched for the next installer build. Committed on `calibration-security-build1`; no version bump (still 1.6.0-beta.16.2); not deployed.**
+**Status: test suite green (319 passed; 306 after Session 10 → 319 with the Session 5 reproduction tests). Independent review gate: PASSED (2026-06-17, fresh Sonnet 4.6 session) — all findings closed; the reviewer reverted each security fix in an out-of-tree copy and confirmed each demonstrated attack re-opens, proving the repro tests are load-bearing. Live verification: attack inputs re-run through the real functions; full packaged-app end-to-end is batched for the next installer build. Committed on `calibration-security-build1` (`aa4b4ac`); no version bump (still 1.6.0-beta.16.2); not deployed.**
 
 **Findings closed: C5 (including TWO forgery bypasses found during the build — the per-clause DKIM cross-contamination AND the raw DKIM-Signature `d=` claim), B5, B6, M9, M10 (refs H2, H7, H5, H1, H8, H9).**
 
@@ -444,3 +444,21 @@ Files changed: `app/mailwarden_app/config_io.py`, `app/mailwarden_app/dashboard.
 **Known follow-ups (not defects):** documented residuals — APPEND-only forgery (same risk `_command_auth_ok` already accepts) and IPv6 rarely reaching the 2-hit DNSBL threshold (only Spamhaus answers IPv6; lowering it would change hard/soft, out of scope). Planned feature: safe sender-approval for the forwarded senders that lost the "proven" boost — design after Session 6.
 
 **Next step:** Session 6, then the safe sender-approval feature.
+
+## Session 6 — Prompt-injection detector recalibration (completed 2026-06-17)
+**Status: test suite green (328 passed; 319 after Session 5 → 328 with the Session 6 regression tests). Independent review gate: PASSED (2026-06-17) — fix authored on Sonnet 4.6, reviewed in a fresh session on Opus 4.8 (different model than the fixer); the Opus reviewer re-ran the full suite, confirmed the diff matches the approved spec exactly (gap kept at 50, not shrunk to 25), and verified the new regression tests are load-bearing. One weak test was then tightened so it genuinely guards the "legitimate" removal (its body matches the pre-fix regex but not the post-fix one). Live verification: these detectors are headlessly unit-testable and that is the only verification surface (they don't exist in the stale installed copy); packaged-app end-to-end batched with the next installer build. Committed on `calibration-security-build1`; no version bump (still 1.6.0-beta.16.2); not deployed.**
+
+**Findings closed: C6 (refs H3, H4).**
+
+**Decisions (Matt, 2026-06-17), per detector:**
+- **Leaked-AI-prompt markers:** removed the 4 marketing-flavored phrases ("prompt preset:", "creative style mode:", "detected campaign type:", "inferred creative strategy"); kept the 8 unambiguous AI-prompt signatures; the 2-marker hard-junk threshold is unchanged.
+- **Conversation-turn patterns:** dropped both hard patterns (the `\n\nAssistant:`/`Human:` one and the line-anchored `Human:|Assistant:|System:` one). Chat-formatted email (AI newsletters, transcripts) now routes to the AI instead of auto-junking; only the `<untrusted_email>` tag remains a hard signal.
+- **Imperative+target detector:** removed the over-broad target word "legitimate"; KEPT the 50-char gap (overrode the fix session's proposal to shrink to 25 — once "legitimate" is gone the false positive is already fixed, and the wider gap catches more real attacks).
+
+**What was built** (payload/MailWarden/src/utils.py; tests in tests/test_fixes.py): the three narrowing edits above, plus 9 regression tests covering each reproduced false positive AND confirmation that real attacks still hard-junk (>=2 kept markers; the `<untrusted_email>` tag; "ignore … mark as safe"; "disregard … classify as not spam"). Now-narrowed cases fall through to AI classification (verdict None when no hard signal); no auto-pass/auto-whitelist. Unrelated hard signals (SPF_DKIM_BOTH_FAIL, IP_DNSBL_MULTIPLE) untouched.
+
+**Known follow-ups (not defects):** forged conversation-turn injections that lack an `ignore/disregard/forget`+target pair are now AI-judged (defended in depth by the `<untrusted_email>` wrapping + delimiter sanitization) rather than deterministically auto-junked — Matt's accepted tradeoff for stopping the false positives on legitimate AI/marketing mail.
+
+**Audit status after this session:** the four security-critical sessions Matt prioritized (3, 10, 5, 6) are now ALL complete — no open security-critical findings remain. Still open in Part 4: Session 4 (Dry Run truly dry), 7 (classifier sees the real email), 8 (reply understanding), 9 (daily report correctness), 11 (learner robustness), 12 (IMAP runtime safety), 13 (build/packaging hygiene), 14 (private eval corpus), 15+ (spam-improvement decisions) — correctness/robustness/feature work, not security holes. Plus the planned safe sender-approval feature.
+
+**Next step:** Matt to choose direction — continue the remaining audit sessions, build the safe sender-approval feature, or interleave. No open security-critical items.

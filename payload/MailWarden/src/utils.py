@@ -536,12 +536,8 @@ _LEAKED_AI_PROMPT_MARKERS = [
     "=== email html rules ===",
     "=== inbox-placement hidden text",
     "run seed:",
-    "prompt preset:",
-    "creative style mode:",
     "return only the complete html document",
     "you are producing html intended for common email clients",
-    "inferred creative strategy",
-    "detected campaign type:",
 ]
 
 
@@ -587,23 +583,16 @@ def check_leaked_ai_prompt(subject: str, plain_text_body: str) -> dict:
 # (a) Our own delimiter tag appearing in received content:
 #     <untrusted_email> or </untrusted_email>
 #     (We control this tag — its presence in a received email is an attack.)
-# (b) Forged AI conversation turns — Anthropic-style \n\nAssistant: / \n\nHuman:
-#     or a line beginning with Assistant:/Human:/System: at line start.
-# (c) "ignore/disregard/forget … instructions" imperative PAIRED within ~50
+# (b) "ignore/disregard/forget … instructions" imperative PAIRED within ~50
 #     chars with a classification-manipulation target.
 _HARD_INJECTION_PATTERNS = [
-    # (a) Our own delimiter tag in inbound content
+    # (a) Our own delimiter tag in inbound content — definitively an attack
     re.compile(r'<\s*/?\s*untrusted_email\s*>', re.IGNORECASE),
-
-    # (b) Anthropic-style double-newline conversation turn injection
-    re.compile(r'\n\n\s*(?:assistant|human)\s*:', re.IGNORECASE),
-    # Line-anchored conversation turn (^ with MULTILINE)
-    re.compile(r'(?:^|\n)[ \t]*(?:assistant|human|system)\s*:\s', re.IGNORECASE),
 ]
 
-# (c) Paired imperative + classification-target (within ~50 chars of each other)
+# (b) Paired imperative + classification-target (within ~50 chars of each other)
 _HARD_INJECTION_IMPERATIVE = re.compile(
-    r'(?:ignore|disregard|forget)\b.{0,50}?\b(?:not\s+spam|mark\s+as\s+safe|legitimate|whitelist|don.t\s+flag|classify\s+as)',
+    r'(?:ignore|disregard|forget)\b.{0,50}?\b(?:not\s+spam|mark\s+as\s+safe|whitelist|don.t\s+flag|classify\s+as)',
     re.IGNORECASE | re.DOTALL,
 )
 
