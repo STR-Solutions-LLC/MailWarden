@@ -896,6 +896,7 @@ def parse_decisions_24h() -> dict:
     result = {
         "evaluated": 0,
         "spam_moved": 0,
+        "spam_dry_run": 0,
         "not_spam": 0,
         "errors": 0,
         "spam_entries": [],
@@ -937,7 +938,7 @@ def parse_decisions_24h() -> dict:
         # Initialize per-account counters
         if acct_name not in result["per_account"]:
             result["per_account"][acct_name] = {
-                "evaluated": 0, "spam": 0, "not_spam": 0
+                "evaluated": 0, "spam": 0, "spam_dry_run": 0, "not_spam": 0
             }
 
         result["evaluated"] += 1
@@ -967,8 +968,13 @@ def parse_decisions_24h() -> dict:
             continue
 
         if "MOVED to" in entry or "would move to" in entry:
-            result["spam_moved"] += 1
-            result["per_account"][acct_name]["spam"] += 1
+            if "MOVED to" in entry:
+                result["spam_moved"] += 1
+                result["per_account"][acct_name]["spam"] += 1
+            elif "would move to" in entry:
+                result["spam_dry_run"] = result.get("spam_dry_run", 0) + 1
+                result["per_account"][acct_name]["spam_dry_run"] = (
+                    result["per_account"][acct_name].get("spam_dry_run", 0) + 1)
 
             # Extract details for the spam list (anchored to line start)
             from_match = re.search(r'^\s*FROM: (.+)', entry, re.MULTILINE)
@@ -983,6 +989,7 @@ def parse_decisions_24h() -> dict:
                 "confidence": conf_match.group(1) if conf_match else "?",
                 "signals": sig_match.group(1).strip() if sig_match else "",
                 "account": acct_name,
+                "dry_run": "would move to" in entry,
             }
             result["spam_entries"].append(spam_entry)
         elif "No action taken" in entry or "NOT SPAM" in entry:
@@ -1062,35 +1069,54 @@ def build_report_body(config: dict, decisions: dict, last_run: datetime,
     else:
         lines.append(f"Accounts monitored: {len(accounts)} ({acct_names})")
 
+    dry_run = config.get("filter", {}).get("dry_run", True)
+    spam_dry_run = decisions.get("spam_dry_run", 0)
+
     lines.append(f"Emails evaluated: {decisions['evaluated']}")
     lines.append(f"Spam moved to Junk: {decisions['spam_moved']}")
+    # In Dry Run, spam is detected but never moved. Always surface the count
+    # when Dry Run is on (show 0 so the mode is visible), or whenever any
+    # dry-run detections exist.
+    if dry_run or spam_dry_run > 0:
+        lines.append(f"Spam detected (Dry Run — not moved): {spam_dry_run}")
     lines.append(f"Passed through (not spam): {decisions['not_spam']}")
     lines.append(f"Errors: {decisions['errors']}")
     lines.append("")
 
-    # Spam details
-    if decisions["spam_entries"]:
-        lines.append("SPAM MOVED TO JUNK")
-        lines.append("-" * 39)
+    # Spam details — split moved vs dry-run entries so each gets its own header
+    moved_entries = [e for e in decisions["spam_entries"] if not e.get("dry_run")]
+    dry_run_entries = [e for e in decisions["spam_entries"] if e.get("dry_run")]
+    multi_acct = len(decisions["per_account"]) > 1
 
-        for i, spam in enumerate(decisions["spam_entries"], 1):
-            prefix = f"{spam['account']}: " if len(decisions["per_account"]) > 1 else ""
+    def _render_spam_list(entry_list, start_index=1):
+        for i, spam in enumerate(entry_list, start_index):
+            prefix = f"{spam['account']}: " if multi_acct else ""
             lines.append(f"{i}. {spam['time']} | {prefix}{spam['from']}")
             lines.append(f"   SUBJECT: {spam['subject']}")
-
-            # Abbreviate signal names for readability
-            signals_short = spam["signals"].lower().replace("_", " ")
             lines.append(
                 f"   CONFIDENCE: {spam['confidence']} | "
                 f"SIGNALS: {spam['signals']}"
             )
             lines.append("")
 
+    if moved_entries:
+        lines.append("SPAM MOVED TO JUNK")
+        lines.append("-" * 39)
+        _render_spam_list(moved_entries)
         lines.append("-" * 39)
         lines.append("")
         lines.append("If any of the above are NOT spam, move them back from your Junk folder.")
         lines.append("To review recent decisions, open MailWarden and view the Home tab.")
-    else:
+
+    if dry_run_entries:
+        lines.append("SPAM DETECTED — DRY RUN, NOT MOVED")
+        lines.append("-" * 39)
+        _render_spam_list(dry_run_entries)
+        lines.append("-" * 39)
+        lines.append("")
+        lines.append("To review recent decisions, open MailWarden and view the Home tab.")
+
+    if not moved_entries and not dry_run_entries:
         lines.append("No spam moved to Junk in the last 24 hours.")
 
     # API usage block — primary recipient only (gated by token_usage presence)
@@ -1368,6 +1394,7 @@ def main():
         acct_decisions = {
             "evaluated": per_acct.get("evaluated", 0),
             "spam_moved": per_acct.get("spam", 0),
+            "spam_dry_run": per_acct.get("spam_dry_run", 0),
             "not_spam": per_acct.get("not_spam", 0),
             "errors": decisions.get("errors", 0),  # runtime errors are global
             "spam_entries": [e for e in decisions.get("spam_entries", [])

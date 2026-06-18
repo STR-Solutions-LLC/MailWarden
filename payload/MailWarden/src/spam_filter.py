@@ -19,7 +19,7 @@ import smtplib
 import sys
 import tempfile
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -3964,6 +3964,113 @@ def run_review(time_window: str):
     print(f"NOT SPAM decisions in this period: {not_spam_count}")
 
 
+def _maybe_send_dry_run_reminder(config: dict, accounts: list,
+                                 logger: logging.Logger) -> None:
+    """Send a periodic reminder when Dry Run has been on for 48+ hours.
+
+    Dry Run protects nothing while it is on — no mail is moved. A user who
+    forgets they left preview mode on is silently unprotected, so this nudges
+    them: once Dry Run has been on for 48h, send a reminder, then repeat at
+    most once every 24h until they turn it off. Turning Dry Run off clears the
+    state file so the 48h clock restarts cleanly on the next toggle-on.
+
+    State lives in memory/dry_run_state.json:
+      dry_run_since      — ISO8601 of when Dry Run was first observed on
+      last_reminder_sent — ISO8601 of the last reminder actually sent
+
+    PROJECT_ROOT is read live (not captured at import) so tests can redirect
+    the state file via monkeypatch.
+    """
+    state_path = PROJECT_ROOT / "memory" / "dry_run_state.json"
+    dry_run = config.get("filter", {}).get("dry_run", True)
+    now = datetime.now(timezone.utc)
+
+    with file_lock.locked(state_path):
+        try:
+            state = json.loads(state_path.read_text()) if state_path.exists() else {}
+        except Exception:
+            state = {}
+
+        if not dry_run:
+            # Dry Run is off — clear the clock so a later toggle-on starts fresh.
+            if state_path.exists():
+                state_path.unlink()
+            return
+
+        if not state.get("dry_run_since"):
+            state["dry_run_since"] = now.isoformat()
+            _write_dry_run_state(state_path, state)
+            return  # Just started; don't send a reminder yet.
+
+        dry_run_since = datetime.fromisoformat(state["dry_run_since"])
+        last_sent_str = state.get("last_reminder_sent")
+        last_sent = datetime.fromisoformat(last_sent_str) if last_sent_str else None
+
+        should_send = (
+            (now - dry_run_since) >= timedelta(hours=48)
+            and (last_sent is None or (now - last_sent) >= timedelta(hours=24))
+        )
+        if not should_send:
+            return
+
+        elapsed = now - dry_run_since
+        days = elapsed.days
+        hours = int(elapsed.seconds / 3600)
+        if days > 0:
+            duration_str = f"{days} day{'s' if days != 1 else ''}"
+        else:
+            duration_str = f"{hours} hour{'s' if hours != 1 else ''}"
+
+        subject = ("⚠️ MailWarden is in preview mode — "
+                   "your mail is NOT being filtered")
+        body = (
+            f"MailWarden has been in Dry Run (preview) mode for {duration_str}.\n\n"
+            f"During this time, no spam has been filtered or moved. Your inbox "
+            f"is receiving all mail unfiltered.\n\n"
+            f"To start real filtering, open the MailWarden Dashboard and uncheck "
+            f"\"Dry run — classify but do not move any mail\" in the Filter "
+            f"settings.\n\n"
+            f"— MailWarden"
+        )
+
+        sent_any = False
+        for account in accounts:
+            try:
+                # send_email already stamps X-MailWarden-System: 1 and routes
+                # the reply to to_addr (the owner's own inbox).
+                send_email(
+                    config,
+                    subject,
+                    body,
+                    logger,
+                    to_addr=account.get("username", ""),
+                )
+                sent_any = True
+            except Exception as e:
+                logger.warning(
+                    f"[DRY RUN] Reminder email failed for "
+                    f"{account.get('username')}: {e}")
+
+        if sent_any:
+            state["last_reminder_sent"] = now.isoformat()
+            _write_dry_run_state(state_path, state)
+
+
+def _write_dry_run_state(state_path: Path, state: dict) -> None:
+    """Atomic write (mkstemp + os.replace) of the dry-run reminder state,
+    mirroring save_last_filter_run. Caller holds the file_lock."""
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=state_path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp_path, state_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
 # ---------------------------------------------------------------------------
 # Main filter logic
 # ---------------------------------------------------------------------------
@@ -4013,7 +4120,8 @@ def run_filter(force: bool = False):
     threshold = config.get("filter", {}).get("confidence_threshold", 0.85)
     max_per_run = config.get("filter", {}).get("max_emails_per_run", 50)
 
-    # Deliver EULA to accounts that haven't received current version
+    # Deliver EULA to accounts that haven't received current version.
+    # Fires in both live and Dry Run modes (legal requirement).
     deliver_eula_if_needed(config, logger)
 
     processed = load_processed_ids()
@@ -4024,11 +4132,18 @@ def run_filter(force: bool = False):
     # never removes; persists only when something actually changed. The whole
     # load->autoseed->save runs under the signals lock so a concurrent learner
     # save is not clobbered (C7).
-    with file_lock.locked(SIGNALS_PATH):
+    # Always LOAD signals — classification needs them, and classification is
+    # NOT suppressed in Dry Run. But the autoseed WRITE is a persistent change,
+    # so it only runs in live mode (S4). Loading without the autoseed write is
+    # read-only, so no signals lock is needed for the dry-run path.
+    if not dry_run:
+        with file_lock.locked(SIGNALS_PATH):
+            signals = load_signals()
+            if autoseed_trusted_infra(signals, config):
+                save_signals(signals)
+                logger.info("Trusted infrastructure updated from account config")
+    else:
         signals = load_signals()
-        if autoseed_trusted_infra(signals, config):
-            save_signals(signals)
-            logger.info("Trusted infrastructure updated from account config")
     whitelist = load_whitelist(logger)
     blacklist = load_blacklist(logger)
     detect_conflicts(whitelist, blacklist, logger)
@@ -4100,10 +4215,16 @@ def run_filter(force: bool = False):
             # the learner subprocess kicks off as early as possible in the
             # tick. Folder missing is silently tolerated — Dashboard will
             # prompt the user to create it.
-            try:
-                scan_train_folder(conn, account, config, logger)
-            except Exception as e:
-                logger.error(f"  Train folder scan failed: {e}")
+            #
+            # Dry Run skips this entirely (S4): scan_train_folder deletes the
+            # ingested .eml messages, writes example files, and spawns the
+            # learner — all real, persistent side effects that have no place in
+            # a passive preview run.
+            if not dry_run:
+                try:
+                    scan_train_folder(conn, account, config, logger)
+                except Exception as e:
+                    logger.error(f"  Train folder scan failed: {e}")
 
             for folder in account.get("folders_to_scan", ["INBOX"]):
                 logger.info(f"  Scanning folder: {folder}")
@@ -4168,6 +4289,21 @@ def run_filter(force: bool = False):
                     # Unified email-command detection (replaces folder-based
                     # whitelist/blacklist management). See EMAIL_COMMANDS.
                     command = detect_email_command(msg_data.get("subject", ""))
+
+                    # Dry Run defers ALL subject commands (S4). Honoring a
+                    # command marks it \\Seen, writes the whitelist/blacklist/
+                    # signals, and sends a confirmation reply — none of which
+                    # belongs in a passive preview run. Leave the message UNSEEN
+                    # and skip to the next email; the command is honored on the
+                    # first real run after the user turns Dry Run off. This bail
+                    # runs BEFORE the owner/auth checks so nothing fires (not
+                    # even the "command not verified" notice).
+                    if command and dry_run:
+                        logger.info(
+                            f"[DRY RUN] Command {command!r} in "
+                            f"{msg_data.get('subject', '')!r} — deferred "
+                            f"(left UNSEEN)")
+                        continue
 
                     # S1 (security): only honor subject commands that genuinely came
                     # from the account owner. Otherwise a third party could mail
@@ -5258,6 +5394,20 @@ Conversation ID: {sfid}
 
                     # --- Detection branch 2: Reply to analysis email ---
                     sfid_match = re.search(r'\[SFID-([A-Za-z0-9-]+)\]', msg_data.get("subject", ""))
+
+                    # Dry Run defers SFID approval replies (S4). Resolving one
+                    # marks it \\Seen, applies/rejects a learned refinement
+                    # (signals write), and sends a confirmation reply — all real
+                    # side effects. Leave it UNSEEN and skip; it is honored on
+                    # the first real run after Dry Run is turned off. Runs BEFORE
+                    # the owner/auth checks so nothing fires.
+                    if sfid_match and dry_run:
+                        logger.info(
+                            f"[DRY RUN] SFID reply in "
+                            f"{msg_data.get('subject', '')!r} — deferred "
+                            f"(left UNSEEN)")
+                        continue
+
                     if sfid_match and not _command_sender_is_owner(
                             msg_data.get("from_email", ""), account, config):
                         # S2 (security): only the account owner may approve/reject a
@@ -5887,6 +6037,16 @@ USER'S FOLLOW-UP:
 
         if total_evaluated >= max_per_run:
             break
+
+    # Dry Run safety nudge (S4): once Dry Run has been on for 48h, remind the
+    # user that no mail is being filtered (and clear the clock when it's off).
+    # Runs once per pass, after all accounts, before the final flush.
+    enabled_accounts = [a for a in config.get("accounts", [])
+                        if a.get("enabled", False)]
+    try:
+        _maybe_send_dry_run_reminder(config, enabled_accounts, logger)
+    except Exception as e:
+        logger.warning(f"[DRY RUN] reminder check failed: {e}")
 
     # Final flush of any residual progress (and a clean end-of-run save even when
     # no account reached the per-account flush, e.g. all disabled / unreachable).
