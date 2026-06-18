@@ -179,12 +179,15 @@ def test_f3_auth_mcafee_brand_mismatch():
 
 
 def test_f3_auth_nbcuni_via_arc_header():
-    # Office365 puts the verified result in ARC-Authentication-Results.
+    # SECURITY (audit C5/ARC): the verified result living ONLY in
+    # ARC-Authentication-Results must NOT grant a proven sender — ARC is
+    # forgeable and is no longer trusted. Such mail is judged on content.
     s = utils.summarize_authentication({"ARC-Authentication-Results": NBC_ARC}, "corp.example.com")
-    assert s["spf"] == "pass"
-    assert s["dkim"] == "pass"
-    assert s["dmarc"] == "pass"
-    assert "corp.example.com" in s["authenticated_domains"]
+    assert s["spf"] == "none"
+    assert s["dkim"] == "none"
+    assert s["dmarc"] == "none"
+    assert "corp.example.com" not in s["authenticated_domains"]
+    assert s["authenticated_domains"] == []
 
 
 def test_f3_auth_absent_is_none():
@@ -2399,3 +2402,152 @@ def test_item3_false_positive_resolver_handles_missing_from(monkeypatch):
         lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("FP must not call resolver")))
     assert spam_filter._resolve_false_positive_sender({}) == ""
+
+
+# ---------------------------------------------------------------------------
+# C5a — per-clause DKIM correlation. A header.d/header.i is only harvested as
+# AUTHENTICATED from a clause whose OWN dkim= result passed. A forged
+# dkim=fail clause naming a brand domain must NOT leak into proven domains.
+# ---------------------------------------------------------------------------
+
+def test_c5a_dkim_fail_domain_excluded():
+    s = utils.summarize_authentication(
+        {"Authentication-Results":
+         "mx.google.com; dkim=fail header.d=evil.ru; dkim=pass header.d=good.com"},
+        "good.com")
+    assert s["authenticated_domains"] == ["good.com"]
+    assert "evil.ru" not in s["authenticated_domains"]
+
+
+def test_c5a_dkim_fail_first_order_variant():
+    # Reversed clause order: pass clause first, fail clause second. Same result.
+    s = utils.summarize_authentication(
+        {"Authentication-Results":
+         "mx.google.com; dkim=pass header.d=good.com; dkim=fail header.d=evil.ru"},
+        "good.com")
+    assert s["authenticated_domains"] == ["good.com"]
+    assert "evil.ru" not in s["authenticated_domains"]
+
+
+# ---------------------------------------------------------------------------
+# C5b — trusted Authentication-Results selection by authserv-id, and the
+# refusal of forged ARC results to grant a proven sender.
+# ---------------------------------------------------------------------------
+
+def test_c5b_selects_trusted_authserv():
+    headers = [
+        "mx.google.com; dkim=pass header.d=good.com",
+        "evil.example; dkim=pass header.d=chase.com",
+    ]
+    # Anchor matches the FIRST header's authserv-id (google.com) -> that header.
+    assert utils.select_trusted_auth_results(headers, {"google.com"}) == \
+        "mx.google.com; dkim=pass header.d=good.com"
+    # Anchor matches NO header -> trust nothing.
+    assert utils.select_trusted_auth_results(headers, {"attacker.tld"}) == ""
+
+
+def test_c5b_forged_arc_no_proven():
+    # The verified-looking result lives ONLY in ARC-Authentication-Results and
+    # claims chase.com. ARC is dropped, so chase.com must NOT be proven.
+    s = utils.summarize_authentication(
+        {"ARC-Authentication-Results":
+         "mx.attacker; dkim=pass header.d=chase.com; "
+         "dmarc=pass header.from=chase.com; spf=pass smtp.mailfrom=chase.com"},
+        "chase.com")
+    assert "chase.com" not in s["authenticated_domains"]
+    assert s["authenticated_domains"] == []
+
+
+def test_c5_dkim_signature_claim_not_proven():
+    # SECURITY (audit C5): a forged DKIM-Signature d=chase.com plus a genuinely
+    # passing signature for a throwaway domain must NOT make chase.com proven.
+    s = utils.summarize_authentication({
+        "Authentication-Results": "mx.trusted.com; dkim=pass header.d=evil.com; "
+                                  "dkim=fail header.d=chase.com",
+        "DKIM-Signature": "v=1; a=rsa-sha256; d=chase.com; s=sel; h=from; bh=x; b=AAAA",
+    }, "chase.com")
+    assert "chase.com" not in s["authenticated_domains"]
+    assert "evil.com" in s["authenticated_domains"]          # the one that really passed
+    assert "chase.com" in s["claimed_unverified_domains"]    # still shown to AI as unproven
+
+
+# ---------------------------------------------------------------------------
+# B5 — trailing-dot (FQDN root) normalization on domains/addresses.
+# ---------------------------------------------------------------------------
+
+def test_b5_trailing_dot_extract_domain():
+    assert utils.extract_domain("a@spammer.com.") == "@spammer.com"
+
+
+def test_b5_trailing_dot_parse_from_address():
+    assert utils.parse_from_address("a@chase.com.")["address"] == "a@chase.com"
+
+
+# ---------------------------------------------------------------------------
+# B6 — spam_filter.parse_from delegates to the canonical parser, so a nested
+# display-name spoof cannot smuggle a brand address into the email slot, and a
+# display-name-only From never lands in the email slot.
+# ---------------------------------------------------------------------------
+
+def test_b6_nested_display_name_canonical():
+    name, addr = spam_filter.parse_from('"Chase <svc@chase.com>" <x@evil.ru>')
+    assert addr == "x@evil.ru"
+
+
+def test_b6_display_name_only_not_email():
+    assert spam_filter.parse_from("Marketing Team") == ("Marketing Team", "")
+
+
+# ---------------------------------------------------------------------------
+# M9 — connecting-IP extraction trusts only bracketed/parenthesized forms,
+# skips our own relays, and rejects invalid octets.
+# ---------------------------------------------------------------------------
+
+def test_m9_bracketed_ip_chosen():
+    # 8.8.8.8 is genuinely public (TEST-NET ranges are is_reserved and would be
+    # skipped). A trailing HELO/date fragment must NOT be picked.
+    hdr = "from mail.helo.example by mine.com (sender.example [8.8.8.8]); " \
+          "Mon, 1 Jan 2024 10:20:30 +0000"
+    assert utils._extract_sending_ip([hdr]) == "8.8.8.8"
+    # Invalid octet -> not a valid IP -> None.
+    assert utils._extract_sending_ip(["from x (host [999.1.2.3])"]) is None
+
+
+def test_m9_skips_own_host_ip():
+    # Topmost header's `by` is one of OUR hosts -> skipped; the real sender's
+    # connecting IP from the next header is returned instead.
+    hdrs = [
+        "from internal by mine.com (relay [1.1.1.1])",
+        "from sender.example by edge.example (sender.example [8.8.8.8])",
+    ]
+    assert utils._extract_sending_ip(hdrs, own_hosts={"mine.com"}) == "8.8.8.8"
+
+
+# ---------------------------------------------------------------------------
+# M10 — IPv6 connecting IPs are extracted; IPv6 DNSBL label construction works.
+# ---------------------------------------------------------------------------
+
+def test_m10_ipv6_extracted():
+    # 2606:4700:4700::1111 is a genuinely public IPv6 (Cloudflare).
+    assert utils._extract_sending_ip(
+        ["from x ([IPv6:2606:4700:4700::1111])"]) == "2606:4700:4700::1111"
+    # 2001:db8::/32 is the documentation range (is_reserved) -> NOT returned.
+    assert utils._extract_sending_ip(["from x ([IPv6:2001:db8::1])"]) is None
+
+
+def test_m10_ipv6_dnsbl_label_shape():
+    # The nibble-reversed label is the reverse_pointer minus the .ip6.arpa suffix
+    # (33 reversed nibbles, dot-separated). Verify the slicing locally.
+    import ipaddress
+    ip = ipaddress.ip_address("2606:4700:4700::1111")
+    label = ip.reverse_pointer[: -len(".ip6.arpa")]
+    # reverse_pointer is nibble-reversed: starts with the LAST nibble (1 from
+    # ...1111) and ends with the FIRST nibble (2 from 2606...).
+    assert label.startswith("1.")       # last nibble of ...1111
+    assert label.endswith(".2")         # first nibble of 2606...
+    assert ".ip6.arpa" not in label
+    assert len(label.split(".")) == 32  # 32 nibbles for a /128 v6 address
+    # check_ip_reputation must accept a v6 string and return the standard dict
+    # structure without raising (network result may NXDOMAIN; structure only).
+    r = utils.check_ip_reputation("2606:4700:4700::1111", timeout=0.01)
+    assert set(r.keys()) == {"signal", "detail", "hits"}

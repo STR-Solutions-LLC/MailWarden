@@ -32,7 +32,7 @@ from utils import (
     parse_from_address, extract_domain,
     check_header_signals, _extract_sending_ip,
     summarize_authentication, host_spam_verdict,
-    random_token,
+    random_token, select_trusted_auth_results,
 )
 from learn_signals import save_signals
 
@@ -2221,7 +2221,6 @@ def _command_auth_ok(msg_data: dict, from_email: str,
     # bails out and this is the layer that authenticates.)
     auth = summarize_authentication({
         "Authentication-Results": msg_data.get("auth_results", ""),
-        "ARC-Authentication-Results": msg_data.get("arc_auth_results", ""),
         "Received-SPF": msg_data.get("received_spf", ""),
         "DKIM-Signature": msg_data.get("dkim_signature", ""),
     }, from_domain=from_dom)
@@ -2889,15 +2888,19 @@ def _format_authentication_block(auth: dict, msg_data: dict) -> str:
         "trustworthy; NOT part of the email content below):",
         f"  SPF: {auth['spf']}    DKIM: {auth['dkim']}    DMARC: {auth['dmarc']}",
     ]
+    if auth.get("arc") and auth.get("arc") != "none":
+        lines.append(f"  (ARC chain verdict from your mail server: arc={auth['arc']} "
+                     f"— context only, NOT a proof of the sender.)")
     if domains:
         lines.append("  Domain(s) cryptographically PROVEN to have sent this message: "
                      + ", ".join(domains))
     else:
         lines.append("  No sending domain could be cryptographically verified "
                      "from this message.")
-    if auth.get("claimed_dkim_domain") and auth.get("dkim") != "pass":
-        lines.append(f"  (An UNVERIFIED DKIM-Signature merely CLAIMS "
-                     f"d={auth['claimed_dkim_domain']} — treat as unproven.)")
+    claimed_unverified = auth.get("claimed_unverified_domains") or []
+    if claimed_unverified:
+        lines.append("  (UNVERIFIED DKIM-Signature CLAIM(s) — a sender can write these "
+                     "freely; NOT proven: d=" + ", ".join(claimed_unverified) + ")")
     lines.append(f"  The From: address domain is: {auth.get('from_domain') or '(unknown)'}")
 
     # Upstream provider spam assessment — PRESENT-ONLY, purely factual. Emitted
@@ -2940,7 +2943,6 @@ def build_user_message(msg_data: dict) -> str:
     from_domain = raw_from_email.split('@', 1)[1] if '@' in raw_from_email else ''
     auth = summarize_authentication({
         "Authentication-Results": msg_data.get("auth_results", ""),
-        "ARC-Authentication-Results": msg_data.get("arc_auth_results", ""),
         "Received-SPF": msg_data.get("received_spf", ""),
         "DKIM-Signature": msg_data.get("dkim_signature", ""),
     }, from_domain=from_domain)
@@ -2985,15 +2987,19 @@ def decode_header_value(raw: str) -> str:
 
 
 def parse_from(from_header: str) -> tuple:
-    """Return (display_name, email_address) from a From header."""
+    """Return (display_name, email_address) from a From header.
+    Delegates to the canonical utils.parse_from_address so the lists, the AI
+    prompt, and brand-matching all see ONE canonical sender (audit B6)."""
     if not from_header:
         return ("", "")
-    decoded = decode_header_value(from_header)
-    # Pattern: "Display Name <email@domain.com>" or just "email@domain.com"
-    match = re.match(r'(.+?)\s*<([^>]+)>', decoded)
-    if match:
-        return (match.group(1).strip().strip('"'), match.group(2).strip())
-    return ("", decoded.strip())
+    r = parse_from_address(from_header)
+    addr = r.get("address") or ""
+    name = r.get("display_name") or ""
+    if not addr and not name:
+        # No valid address and no display name parsed: surface the decoded text
+        # as a DISPLAY NAME only — never as the email address.
+        name = decode_header_value(from_header).strip().strip('"')
+    return (name, addr)
 
 
 def get_plain_text_body(msg: email.message.Message) -> str:
@@ -3062,7 +3068,7 @@ def html_to_text(html: str) -> str:
     return text.strip()
 
 
-def extract_email_data(raw_email: bytes) -> dict:
+def extract_email_data(raw_email: bytes, own_hosts=None) -> dict:
     """Parse raw email bytes into a structured dict for classification."""
     msg = email.message_from_bytes(raw_email, policy=email.policy.compat32)
 
@@ -3077,8 +3083,15 @@ def extract_email_data(raw_email: bytes) -> dict:
     received_headers = [str(h) for h in (msg.get_all("Received") or [])]
 
     # Additional headers for pre-classifier
-    auth_results = str(msg.get("Authentication-Results", "") or "")
-    arc_auth_results = str(msg.get("ARC-Authentication-Results", "") or "")
+    all_auth_results = [str(h) for h in (msg.get_all("Authentication-Results") or [])]
+    # C5b: trust anchor = registrable domain of the topmost Received "by" host
+    # (the provider that delivered to us) PLUS our own mail hosts when known.
+    anchor = set(own_hosts or set())
+    if received_headers:
+        m = re.search(r'\bby\s+([^\s;()]+)', received_headers[0], re.IGNORECASE)
+        if m:
+            anchor.add(m.group(1).strip().lower().rstrip("."))
+    auth_results = select_trusted_auth_results(all_auth_results, anchor)
     received_spf = str(msg.get("Received-SPF", "") or "")
     dkim_signature = " ".join(str(h) for h in (msg.get_all("DKIM-Signature") or []))
     x_spam_score = str(msg.get("X-Spam-Score", "") or "")
@@ -3099,7 +3112,6 @@ def extract_email_data(raw_email: bytes) -> dict:
         "received_headers": received_headers,  # keep all for IP extraction
         "received_headers_first_3": received_headers[:3],
         "auth_results": auth_results,
-        "arc_auth_results": arc_auth_results,
         "received_spf": received_spf,
         "dkim_signature": dkim_signature,
         "x_spam_score": x_spam_score,
@@ -3358,7 +3370,6 @@ def classify_eml_offline(raw_email: bytes, signals: dict, *,
         if "@" in (msg_data.get("from_email", "") or "") else ""
     _auth = summarize_authentication({
         "Authentication-Results": msg_data.get("auth_results", ""),
-        "ARC-Authentication-Results": msg_data.get("arc_auth_results", ""),
         "Received-SPF": msg_data.get("received_spf", ""),
         "DKIM-Signature": msg_data.get("dkim_signature", ""),
     }, from_domain=_from_domain)
@@ -3584,13 +3595,21 @@ def scan_train_folder(conn: imaplib.IMAP4_SSL, account: dict, config: dict,
     if not uids:
         return 0
     logger.info(f"  Scanning folder: {TRAIN_FOLDER_NAME} ({len(uids)} messages)")
+    # Own-host set (M9/C5b): account's IMAP host + configured SMTP host.
+    own_hosts = set()
+    _imap_host = (account.get("imap_host", "") or "").strip().lower()
+    if _imap_host:
+        own_hosts.add(_imap_host)
+    _smtp_host = ((config.get("smtp", {}) or {}).get("host", "") or "").strip().lower()
+    if _smtp_host:
+        own_hosts.add(_smtp_host)
     processed = 0
     for uid in uids:
         try:
             raw = fetch_raw_email(conn, uid, logger)
             if raw is None:
                 continue
-            msg_data = extract_email_data(raw)
+            msg_data = extract_email_data(raw, own_hosts=own_hosts)
             fwd_data = {
                 "user_explanation": "[No explanation — dropped into "
                                       "Train MailWarden folder]",
@@ -4039,6 +4058,17 @@ def run_filter(force: bool = False):
         logger.info(f"Processing account: {account_name}")
         accounts_checked += 1
 
+        # Own-host set (M9/C5b): this account's IMAP host + configured SMTP host,
+        # lowercased. Used to anchor trusted Authentication-Results selection and
+        # to skip our own relays when extracting the sender's connecting IP.
+        own_hosts = set()
+        _imap_host = (account.get("imap_host", "") or "").strip().lower()
+        if _imap_host:
+            own_hosts.add(_imap_host)
+        _smtp_host = ((config.get("smtp", {}) or {}).get("host", "") or "").strip().lower()
+        if _smtp_host:
+            own_hosts.add(_smtp_host)
+
         # P1: build the classifier prompt PER ACCOUNT, so a learned rule scoped
         # to one inbox does not leak onto the others. Scope is keyed by the
         # account's username (email); rules with no scope are treated as "all".
@@ -4091,7 +4121,7 @@ def run_filter(force: bool = False):
                         total_errors += 1
                         continue
 
-                    msg_data = extract_email_data(raw)
+                    msg_data = extract_email_data(raw, own_hosts=own_hosts)
                     msg_id = msg_data.get("message_id", "")
 
                     # Generate synthetic ID for emails without Message-ID
@@ -5713,7 +5743,8 @@ USER'S FOLLOW-UP:
                         "Message-ID": msg_data.get("message_id", ""),
                         "Subject": msg_data.get("subject", ""),
                     }
-                    sending_ip = _extract_sending_ip(msg_data.get("received_headers", []))
+                    sending_ip = _extract_sending_ip(msg_data.get("received_headers", []),
+                                                     own_hosts=own_hosts)
                     pre_result = check_header_signals(
                         pre_headers,
                         msg_data.get("plain_text_body", ""),
@@ -5759,7 +5790,6 @@ USER'S FOLLOW-UP:
                         if "@" in (msg_data.get("from_email", "") or "") else ""
                     _msg_auth = summarize_authentication({
                         "Authentication-Results": msg_data.get("auth_results", ""),
-                        "ARC-Authentication-Results": msg_data.get("arc_auth_results", ""),
                         "Received-SPF": msg_data.get("received_spf", ""),
                         "DKIM-Signature": msg_data.get("dkim_signature", ""),
                     }, from_domain=_msg_from_domain)

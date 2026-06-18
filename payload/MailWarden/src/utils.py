@@ -8,6 +8,7 @@ import email
 import email.header
 import email.policy
 import html
+import ipaddress
 import re
 import secrets
 import smtplib
@@ -101,7 +102,7 @@ def parse_from_address(header_value: str) -> dict:
     angle_match = re.search(r'^(.*?)<([^>]+@[^>]+)>\s*$', header_value)
     if angle_match:
         display_name = angle_match.group(1).strip().strip('"').strip("'").strip()
-        addr = angle_match.group(2).strip().lower()
+        addr = angle_match.group(2).strip().lower().rstrip(".")
         if re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', addr):
             result["address"] = addr
             result["display_name"] = display_name if display_name else None
@@ -110,7 +111,7 @@ def parse_from_address(header_value: str) -> dict:
     # No angle brackets — try the whole string as a bare address
     bare = header_value.strip().strip('"').strip("'").strip()
     if re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', bare):
-        result["address"] = bare.lower()
+        result["address"] = bare.lower().rstrip(".")
 
     return result
 
@@ -122,8 +123,36 @@ def extract_domain(email_address: str) -> str:
     """
     if not email_address or "@" not in email_address:
         return None
-    domain = "@" + email_address.split("@", 1)[1].strip().lower()
+    domain = "@" + email_address.split("@", 1)[1].strip().lower().rstrip(".")
     return domain
+
+
+def _registrable_domain(host: str) -> str:
+    """Best-effort registrable domain = last two labels, lowercased.
+    NOT public-suffix-aware; acceptable because callers anchor on their OWN
+    known hosts / the delivering provider, never arbitrary attacker input."""
+    host = (host or "").strip().lower().strip("[]").rstrip(".")
+    labels = [l for l in host.split(".") if l]
+    if len(labels) < 2:
+        return host
+    return ".".join(labels[-2:])
+
+
+def select_trusted_auth_results(ar_headers, anchor_hosts) -> str:
+    """From all Authentication-Results header values, return the TOPMOST whose
+    authserv-id (the token before the first ';') shares a registrable domain with
+    the trust anchor. Returns "" if none match (trust nothing — safe direction)."""
+    anchor = {_registrable_domain(h) for h in (anchor_hosts or set()) if h}
+    anchor.discard("")
+    if not anchor:
+        return ""
+    for ar in ar_headers or []:
+        ar = str(ar or "")
+        head = ar.split(";", 1)[0].strip()
+        authserv = head.split()[0] if head else ""
+        if _registrable_domain(authserv) in anchor:
+            return ar
+    return ""
 
 
 def get_plain_text_body_from_msg(msg) -> str:
@@ -177,13 +206,19 @@ def summarize_authentication(headers: dict, from_domain: str = "") -> dict:
 
     Parses the RFC 8601 ``Authentication-Results`` header — emitted by virtually
     every modern mail provider (Gmail, Outlook/Office365, Yahoo/AOL, Proofpoint,
-    cPanel/Exim, Zoho, Fastmail, …) — plus its ARC-sealed variant
-    ``ARC-Authentication-Results`` (present when mail is forwarded/relayed, e.g.
-    through Microsoft) and the standalone ``Received-SPF`` header. It reads only
-    STANDARD tokens (``spf=``, ``dkim=``, ``dmarc=``, ``header.from=``,
-    ``header.d=``, ``header.i=@``, ``smtp.mailfrom=``), never any host-specific
-    format, so it is independent of the user's email provider. Opaque
-    provider-private blobs (X-YMailISG, X-Spam-*, etc.) are ignored.
+    cPanel/Exim, Zoho, Fastmail, …) — and the standalone ``Received-SPF`` header.
+    It reads only STANDARD tokens (``spf=``, ``dkim=``, ``dmarc=``,
+    ``header.from=``, ``header.d=``, ``header.i=@``, ``smtp.mailfrom=``), never
+    any host-specific format, so it is independent of the user's email provider.
+    Opaque provider-private blobs (X-YMailISG, X-Spam-*, etc.) are ignored.
+
+    Security (audit C5/ARC): ``ARC-Authentication-Results`` is deliberately NOT
+    parsed for proven domains — ARC is forgeable, so trusting it would let a
+    relay-forged chain claim any sender. The caller is expected to pass only the
+    main ``Authentication-Results`` value it has already vetted (see
+    ``select_trusted_auth_results``). An advisory ``arc`` verdict is still parsed
+    from the (already-trusted) main header for display context only and grants
+    NO domain.
 
     Security: a domain is listed in ``authenticated_domains`` ONLY when the
     relevant check actually PASSED. A bare ``DKIM-Signature: d=`` (an unverified
@@ -196,10 +231,7 @@ def summarize_authentication(headers: dict, from_domain: str = "") -> dict:
     Returns a dict: spf, dkim, dmarc, dmarc_from, spf_mailfrom,
     claimed_dkim_domain, authenticated_domains (sorted), from_domain.
     """
-    auth = "  ".join(p for p in (
-        str(headers.get("Authentication-Results", "") or ""),
-        str(headers.get("ARC-Authentication-Results", "") or ""),
-    ) if p)
+    auth = str(headers.get("Authentication-Results", "") or "")
     received_spf = str(headers.get("Received-SPF", "") or "")
     dkim_sig = str(headers.get("DKIM-Signature", "") or "")
 
@@ -219,14 +251,20 @@ def summarize_authentication(headers: dict, from_domain: str = "") -> dict:
     dmarc = _result("dmarc", auth)
     dkim_all = [r.lower() for r in re.findall(r'\bdkim\s*=\s*(\w+)', auth, re.IGNORECASE)]
     dkim = "pass" if "pass" in dkim_all else (dkim_all[0] if dkim_all else "")
+    arc = _result("arc", auth)
 
     authenticated = set()
 
-    # DKIM-authenticated domains — only when DKIM passed.
-    if dkim == "pass":
-        for m in re.finditer(r'header\.(?:i\s*=\s*@?|d\s*=\s*)([a-z0-9.\-]+)',
-                             auth, re.IGNORECASE):
-            authenticated.add(m.group(1).lower().lstrip("@").rstrip("."))
+    # DKIM-authenticated domains — correlate each header.d/header.i with ITS OWN
+    # dkim= result. Split the Authentication-Results into clauses (RFC 8601 resinfo
+    # are ';'-separated) and only harvest from a clause whose own dkim result passed.
+    # (A ';' inside a quoted reason="..." only ever fails safe — it can drop a real
+    # pass, never admit a forged domain.)
+    for clause in auth.split(";"):
+        if re.search(r'dkim\s*=\s*pass\b', clause, re.IGNORECASE):
+            for m in re.finditer(r'header\.(?:i\s*=\s*@?|d\s*=\s*)([a-z0-9.\-]+)',
+                                 clause, re.IGNORECASE):
+                authenticated.add(m.group(1).lower().lstrip("@").rstrip("."))
 
     # DMARC alignment domain (the From: organizational domain) — only when DMARC passed.
     dmarc_from = ""
@@ -248,21 +286,29 @@ def summarize_authentication(headers: dict, from_domain: str = "") -> dict:
     if spf == "pass" and spf_mailfrom:
         authenticated.add(spf_mailfrom)
 
-    # Unverified DKIM-Signature d= CLAIM — never authenticated unless DKIM passed.
-    claimed_dkim = ""
-    m = re.search(r'\bd\s*=\s*([a-z0-9.\-]+)', dkim_sig, re.IGNORECASE)
-    if m:
-        claimed_dkim = m.group(1).lower().rstrip(".")
-        if dkim == "pass":
-            authenticated.add(claimed_dkim)
+    # Unverified DKIM-Signature d= CLAIM(s). A DKIM-Signature header is sender-
+    # written and proves nothing on its own — a domain is PROVEN only when its OWN
+    # signature passed (added per-clause above) or via aligned DMARC/SPF. We never
+    # add a bare d= claim to `authenticated`; we DO surface claimed-but-unproven
+    # domains as a phishing signal. The (?:^|[;\s]) guard matches only real d= tags
+    # (base64 b= values contain no ';' or whitespace), avoiding false hits.
+    claimed = []
+    for m in re.finditer(r'(?:^|[;\s])d\s*=\s*([a-z0-9.\-]+)', dkim_sig, re.IGNORECASE):
+        dom = m.group(1).lower().rstrip(".")
+        if dom and dom not in claimed:
+            claimed.append(dom)
+    claimed_dkim = claimed[0] if claimed else ""
+    claimed_unverified = sorted(d for d in claimed if d not in authenticated)
 
     return {
         "spf": spf or "none",
         "dkim": dkim or "none",
         "dmarc": dmarc or "none",
+        "arc": arc or "none",
         "dmarc_from": dmarc_from,
         "spf_mailfrom": spf_mailfrom,
         "claimed_dkim_domain": claimed_dkim,
+        "claimed_unverified_domains": claimed_unverified,
         "authenticated_domains": sorted(authenticated),
         "from_domain": (from_domain or "").lower().lstrip("@").rstrip("."),
     }
@@ -347,37 +393,68 @@ def host_spam_verdict(headers: dict) -> dict | None:
     return {"score": score, "flag": verdict, "verdict": verdict}
 
 
-def _extract_sending_ip(received_headers) -> str:
-    """Extract the first external sending IP from Received headers.
-    Skips localhost and private IPs."""
+def _extract_sending_ip(received_headers, own_hosts=None) -> str:
+    """Extract the first external (public) sending IP from Received headers.
+
+    Security (M9/M10):
+      - Traverse TOP-DOWN: the topmost Received header is added by OUR own mail
+        infrastructure and names the host that connected to us (the real sender's
+        edge). We do NOT walk the chain in reverse — attacker-forged lower
+        Received lines must not win.
+      - Skip any header whose ``by``/``from`` host is one of our OWN hosts: that
+        is our own relay, not the sender's connecting IP.
+      - Only trust IPs in bracketed/parenthesized connecting-IP forms
+        (``[1.2.3.4]`` / ``(1.2.3.4)`` / ``[IPv6:..]``), never bare dotted-quads
+        appearing in HELO strings, dates, etc. Bracketed is preferred; paren
+        forms are consulted only if no bracketed public IP is found.
+      - Supports both IPv4 and IPv6; skips any non-public address.
+    """
     if not received_headers:
         return None
     if isinstance(received_headers, str):
         received_headers = [received_headers]
 
-    # Start from the last Received header (earliest in chain) and work up
-    for hdr in reversed(received_headers):
-        hdr_str = str(hdr)
-        # Find IPv4 addresses
-        ips = re.findall(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b', hdr_str)
-        for ip in ips:
-            parts = ip.split(".")
+    own = {h.strip().lower().rstrip(".") for h in (own_hosts or set()) if h}
+
+    def _first_public(candidates):
+        for cand in candidates:
+            cand = cand.strip()
             try:
-                p = [int(x) for x in parts]
+                ip = ipaddress.ip_address(cand)
             except ValueError:
                 continue
-            # Skip private/reserved ranges
-            if p[0] == 10:
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
                 continue
-            if p[0] == 127:
+            return str(ip)
+        return None
+
+    for hdr in received_headers:
+        hdr_str = str(hdr)
+
+        # Skip our own relays: if the 'by' or 'from' host is one of our hosts.
+        if own:
+            skip = False
+            for kw in (r'\bby\s+([^\s;()]+)', r'\bfrom\s+([^\s;()]+)'):
+                m = re.search(kw, hdr_str, re.I)
+                if m and m.group(1).strip().lower().rstrip(".") in own:
+                    skip = True
+                    break
+            if skip:
                 continue
-            if p[0] == 172 and 16 <= p[1] <= 31:
-                continue
-            if p[0] == 192 and p[1] == 168:
-                continue
-            if p[0] == 0:
-                continue
-            return ip
+
+        # Prefer bracketed connecting-IP forms.
+        bracketed = re.findall(r'\[(?:IPv6:)?([0-9a-fA-F:.]+)\]', hdr_str)
+        result = _first_public(bracketed)
+        if result:
+            return result
+
+        # Fall back to parenthesized forms only if no bracketed public IP found.
+        paren = re.findall(r'\((?:IPv6:)?([0-9a-fA-F:.]+)\)', hdr_str)
+        result = _first_public(paren)
+        if result:
+            return result
+
     return None
 
 
@@ -400,10 +477,15 @@ def check_ip_reputation(sending_ip: str, timeout: float = 3.0) -> dict:
         "dnsbl.sorbs.net",
     ]
 
-    parts = sending_ip.split(".")
-    if len(parts) != 4:
+    try:
+        ip_obj = ipaddress.ip_address(sending_ip)
+    except ValueError:
         return {"signal": None, "detail": "", "hits": []}
-    reversed_ip = ".".join(reversed(parts))
+    if ip_obj.version == 4:
+        reversed_ip = ".".join(reversed(sending_ip.split(".")))
+    else:
+        # nibble-reversed label without the .ip6.arpa suffix
+        reversed_ip = ip_obj.reverse_pointer[:-len(".ip6.arpa")]
 
     hits = []
     resolver = dns.resolver.Resolver()
