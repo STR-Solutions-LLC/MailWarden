@@ -3070,3 +3070,384 @@ def test_mixed_report_has_both_headers(monkeypatch, tmp_path):
     assert "real@spam.com" in body
     assert "dry@spam.com" in body
     assert "move them back from your Junk folder" in body
+
+
+# ---------------------------------------------------------------------------
+# Session 7 — Classifier sees the real email (B1 + Part 3 items 1-4)
+# All tests are written BEFORE the implementation so they fail first.
+# ---------------------------------------------------------------------------
+
+import os as _os_s7
+import pathlib as _pathlib_s7
+
+_FIXTURES = _pathlib_s7.Path(__file__).parent / "fixtures"
+
+
+def _load_fixture(name):
+    """Return extract_email_data dict for a fixture .eml file."""
+    raw = (_FIXTURES / name).read_bytes()
+    return spam_filter.extract_email_data(raw)
+
+
+def _build_prompt(msg_data):
+    return spam_filter.build_user_message(msg_data)
+
+
+# -- B1: HTML-only body reaches the model ------------------------------------
+
+def test_s7_html_only_body_nonempty():
+    """McAfee fixture has no plain-text part; body in the prompt must be
+    non-empty after the HTML fallback is in place."""
+    md = _load_fixture("07_mcafee_phish.eml")
+    assert md["plain_text_body"].strip() == "", (
+        "Fixture sanity: plain_text_body must be empty before the fix"
+    )
+    prompt = _build_prompt(md)
+    # The body section of the prompt must not be blank
+    # (look for a non-empty line after the BODY label)
+    # Extract body content: everything between the body label line and </untrusted_email>
+    for label in ("HTML-converted", "PLAIN TEXT BODY"):
+        if label in prompt:
+            # Take text after the label's colon, before the closing tag
+            after_label = prompt.split(label, 1)[1]
+            body_content = after_label.split(":", 1)[1].split("</untrusted_email>")[0].strip()
+            break
+    else:
+        body_content = ""
+    assert body_content != "", (
+        "HTML-only email must produce a non-empty body in the prompt"
+    )
+
+
+def test_s7_html_fallback_label_present():
+    """When HTML fallback is used, the prompt must contain 'HTML' in the body
+    label so the model knows the source."""
+    md = _load_fixture("07_mcafee_phish.eml")
+    prompt = _build_prompt(md)
+    assert "HTML" in prompt or "html" in prompt.lower(), (
+        "Prompt must label the body as HTML-derived when the fallback fires"
+    )
+
+
+# -- Body window expanded to 1500 chars -------------------------------------
+
+def test_s7_body_window_1500():
+    """A 2000-char plain-text body must be truncated at 1500, not 500."""
+    long_body = "x" * 2000
+    md = {
+        "plain_text_body": long_body,
+        "html_body": "",
+        "from_display_name": "", "from_email": "a@b.com",
+        "reply_to": "", "subject": "test",
+        "received_headers": [], "received_headers_first_3": [],
+        "auth_results": "", "received_spf": "", "dkim_signature": "",
+        "x_spam_flag": "", "x_spam_status": "", "message_id": "",
+    }
+    prompt = _build_prompt(md)
+    # 1500 x's must appear (chars 1..1500), char 1501 must not
+    assert "x" * 1500 in prompt, "First 1500 chars of body must be in prompt"
+    assert "x" * 1501 not in prompt, "Char 1501 must be truncated"
+
+
+def test_s7_body_window_does_not_regress_short():
+    """A body shorter than 1500 chars is kept in full."""
+    short = "Hello world."
+    md = {
+        "plain_text_body": short,
+        "html_body": "",
+        "from_display_name": "", "from_email": "a@b.com",
+        "reply_to": "", "subject": "test",
+        "received_headers": [], "received_headers_first_3": [],
+        "auth_results": "", "received_spf": "", "dkim_signature": "",
+        "x_spam_flag": "", "x_spam_status": "", "message_id": "",
+    }
+    prompt = _build_prompt(md)
+    assert short in prompt
+
+
+# -- Link domain extraction -------------------------------------------------
+
+def _md_with_html(html, plain=""):
+    return {
+        "plain_text_body": plain,
+        "html_body": html,
+        "from_display_name": "", "from_email": "a@from.com",
+        "reply_to": "", "subject": "test",
+        "received_headers": [], "received_headers_first_3": [],
+        "auth_results": "", "received_spf": "", "dkim_signature": "",
+        "x_spam_flag": "", "x_spam_status": "", "message_id": "",
+    }
+
+
+def test_s7_link_domains_extracted():
+    """An HTML body with href links must surface the link domains in the
+    prompt so the model can inspect them."""
+    html = '<a href="https://evil-phish.ru/click?id=1">Click here</a>'
+    prompt = _build_prompt(_md_with_html(html))
+    assert "evil-phish.ru" in prompt, "Link domain must appear in the prompt"
+
+
+def test_s7_link_domains_deduped():
+    """The same domain appearing in multiple hrefs is listed only once."""
+    html = ('<a href="https://same.com/a">A</a> '
+            '<a href="https://same.com/b">B</a>')
+    prompt = _build_prompt(_md_with_html(html))
+    assert prompt.count("same.com") == 1, "Duplicate link domain must be deduped"
+
+
+def test_s7_link_domains_absent_when_none():
+    """If there are no links in the email, the LINK DOMAINS section is omitted."""
+    md = _md_with_html("", plain="Plain text only, no links.")
+    prompt = _build_prompt(md)
+    assert "LINK DOMAIN" not in prompt.upper()
+
+
+def test_s7_mcafee_link_domains_in_prompt():
+    """The McAfee phish fixture has href links in its HTML body; those
+    domains must appear in the prompt after the implementation."""
+    md = _load_fixture("07_mcafee_phish.eml")
+    prompt = _build_prompt(md)
+    # araiscollections.info appears in the fixture's href links
+    assert "araiscollections.info" in prompt, (
+        "McAfee phish link domain must surface in prompt"
+    )
+
+
+# -- Reply-To mismatch advisory ---------------------------------------------
+
+def test_s7_reply_to_mismatch_advisory():
+    """When Reply-To domain differs from From domain, the prompt must flag
+    this as an advisory note."""
+    md = {
+        "plain_text_body": "Hi",
+        "html_body": "",
+        "from_display_name": "Company", "from_email": "noreply@legit.com",
+        "reply_to": "harvest@evil.ru",
+        "subject": "test",
+        "received_headers": [], "received_headers_first_3": [],
+        "auth_results": "", "received_spf": "", "dkim_signature": "",
+        "x_spam_flag": "", "x_spam_status": "", "message_id": "",
+    }
+    prompt = _build_prompt(md)
+    assert "Reply-To" in prompt and "mismatch" in prompt.lower(), \
+        "Reply-To domain mismatch advisory must appear in the prompt"
+
+
+def test_s7_reply_to_match_no_advisory():
+    """When From and Reply-To share the same domain, no mismatch advisory."""
+    md = {
+        "plain_text_body": "Hi",
+        "html_body": "",
+        "from_display_name": "Co", "from_email": "noreply@same.com",
+        "reply_to": "support@same.com",
+        "subject": "test",
+        "received_headers": [], "received_headers_first_3": [],
+        "auth_results": "", "received_spf": "", "dkim_signature": "",
+        "x_spam_flag": "", "x_spam_status": "", "message_id": "",
+    }
+    prompt = _build_prompt(md)
+    assert "mismatch" not in prompt.lower()
+
+
+# -- Punycode / IDN detection -----------------------------------------------
+
+def test_s7_punycode_from_domain_flagged():
+    """A punycode domain in the From address must produce an advisory note."""
+    md = {
+        "plain_text_body": "Urgent",
+        "html_body": "",
+        "from_display_name": "Chase", "from_email": "security@xn--chse-0ra.com",
+        "reply_to": "", "subject": "test",
+        "received_headers": [], "received_headers_first_3": [],
+        "auth_results": "", "received_spf": "", "dkim_signature": "",
+        "x_spam_flag": "", "x_spam_status": "", "message_id": "",
+    }
+    prompt = _build_prompt(md)
+    assert "punycode" in prompt.lower(), (
+        "Punycode From-domain must be flagged in the prompt"
+    )
+
+
+def test_s7_punycode_link_domain_flagged():
+    """A punycode domain appearing only in an href link must also be flagged."""
+    html = '<a href="https://xn--pple-43d.com/login">Sign in</a>'
+    prompt = _build_prompt(_md_with_html(html))
+    assert "punycode" in prompt.lower() or "xn--" in prompt
+
+
+def test_s7_no_punycode_no_advisory():
+    """Clean domains produce no punycode advisory."""
+    md = {
+        "plain_text_body": "Hello",
+        "html_body": '<a href="https://apple.com/">link</a>',
+        "from_display_name": "Apple", "from_email": "noreply@apple.com",
+        "reply_to": "", "subject": "test",
+        "received_headers": [], "received_headers_first_3": [],
+        "auth_results": "", "received_spf": "", "dkim_signature": "",
+        "x_spam_flag": "", "x_spam_status": "", "message_id": "",
+    }
+    prompt = _build_prompt(md)
+    assert "punycode" not in prompt.lower()
+
+
+# -- Origin Received hop surfaced -------------------------------------------
+
+def test_s7_origin_hop_shown_when_chain_long():
+    """For a Received chain of 4 hops, the 4th (origin) hop must appear in
+    the prompt labelled separately — it is currently dropped because only
+    the first 3 are shown."""
+    hops = [
+        "from internal4.mta by mx4.example.com",   # hop 0 — most recent
+        "from relay3.example.com by internal4.mta",
+        "from relay2.example.com by relay3.example.com",
+        "from origin-sending-server.evil.ru by relay2.example.com",  # origin
+    ]
+    md = {
+        "plain_text_body": "body",
+        "html_body": "",
+        "from_display_name": "", "from_email": "a@b.com",
+        "reply_to": "", "subject": "test",
+        "received_headers": hops,
+        "received_headers_first_3": hops[:3],
+        "auth_results": "", "received_spf": "", "dkim_signature": "",
+        "x_spam_flag": "", "x_spam_status": "", "message_id": "",
+    }
+    prompt = _build_prompt(md)
+    assert "origin-sending-server.evil.ru" in prompt, (
+        "The origin hop (4th Received header) must appear in the prompt"
+    )
+
+
+def test_s7_origin_hop_absent_when_chain_short():
+    """For a 2-hop chain, no separate 'ORIGIN HOP' label is needed — both
+    hops are already in the first-3 window."""
+    hops = [
+        "from relay.example.com by mx.example.com",
+        "from sender.example.com by relay.example.com",
+    ]
+    md = {
+        "plain_text_body": "body",
+        "html_body": "",
+        "from_display_name": "", "from_email": "a@b.com",
+        "reply_to": "", "subject": "test",
+        "received_headers": hops,
+        "received_headers_first_3": hops[:3],
+        "auth_results": "", "received_spf": "", "dkim_signature": "",
+        "x_spam_flag": "", "x_spam_status": "", "message_id": "",
+    }
+    prompt = _build_prompt(md)
+    assert "ORIGIN HOP" not in prompt.upper()
+
+
+# -- JSON salvage -----------------------------------------------------------
+
+import logging as _logging_s7
+
+
+def test_s7_json_salvage_recovers_embedded_json():
+    """When the model returns prose with an embedded JSON object, classify_email
+    must salvage the JSON rather than returning (None, response)."""
+    raw_response_text = (
+        'Sure, here is my assessment:\n\n'
+        '{"decision": "SPAM", "confidence": 0.92, "explanation": "Phishing link."}\n\n'
+        'Let me know if you need more detail.'
+    )
+
+    class _FakeContent:
+        text = raw_response_text
+
+    class _FakeResponse:
+        content = [_FakeContent()]
+
+    class _FakeClient:
+        class messages:
+            @staticmethod
+            def create(**kwargs):
+                return _FakeResponse()
+
+    logger = _logging_s7.getLogger("test_salvage")
+    md = {
+        "plain_text_body": "test", "html_body": "",
+        "from_display_name": "", "from_email": "a@b.com",
+        "reply_to": "", "subject": "s",
+        "received_headers": [], "received_headers_first_3": [],
+        "auth_results": "", "received_spf": "", "dkim_signature": "",
+        "x_spam_flag": "", "x_spam_status": "", "message_id": "",
+    }
+    result, _ = spam_filter.classify_email(
+        _FakeClient(), "system", md, "test-model", 256, logger
+    )
+    assert result is not None, "JSON salvage must return a parsed dict, not None"
+    assert result.get("decision") == "SPAM"
+    assert result.get("confidence") == 0.92
+
+
+def test_s7_clean_json_unaffected_by_salvage():
+    """A clean JSON response (no prose) must still parse correctly after the
+    salvage code is added."""
+    raw_response_text = '{"decision": "PASS", "confidence": 0.1, "explanation": "ok"}'
+
+    class _FakeContent:
+        text = raw_response_text
+
+    class _FakeResponse:
+        content = [_FakeContent()]
+
+    class _FakeClient:
+        class messages:
+            @staticmethod
+            def create(**kwargs):
+                return _FakeResponse()
+
+    logger = _logging_s7.getLogger("test_clean")
+    md = {
+        "plain_text_body": "test", "html_body": "",
+        "from_display_name": "", "from_email": "a@b.com",
+        "reply_to": "", "subject": "s",
+        "received_headers": [], "received_headers_first_3": [],
+        "auth_results": "", "received_spf": "", "dkim_signature": "",
+        "x_spam_flag": "", "x_spam_status": "", "message_id": "",
+    }
+    result, _ = spam_filter.classify_email(
+        _FakeClient(), "system", md, "test-model", 256, logger
+    )
+    assert result is not None
+    assert result.get("decision") == "PASS"
+
+
+def test_s7_reply_to_trailing_semicolon_no_false_mismatch():
+    """A trailing semicolon after the reply-to address (header-folding artifact)
+    must NOT trigger the mismatch advisory when the domain matches From."""
+    md = {
+        "plain_text_body": "Hi",
+        "html_body": "",
+        "from_display_name": "Co", "from_email": "noreply@same.com",
+        "reply_to": "support@same.com; ",
+        "subject": "test",
+        "received_headers": [], "received_headers_first_3": [],
+        "auth_results": "", "received_spf": "", "dkim_signature": "",
+        "x_spam_flag": "", "x_spam_status": "", "message_id": "",
+    }
+    prompt = spam_filter.build_user_message(md)
+    assert "mismatch" not in prompt.lower(), (
+        "Trailing semicolon must not cause false reply-to mismatch advisory"
+    )
+
+
+def test_s7_reply_to_address_list_no_false_mismatch():
+    """A comma-separated address-list in Reply-To must not trigger mismatch
+    when the first address matches the From domain."""
+    md = {
+        "plain_text_body": "Hi",
+        "html_body": "",
+        "from_display_name": "Co", "from_email": "noreply@same.com",
+        "reply_to": "a@same.com, b@same.com",
+        "subject": "test",
+        "received_headers": [], "received_headers_first_3": [],
+        "auth_results": "", "received_spf": "", "dkim_signature": "",
+        "x_spam_flag": "", "x_spam_status": "", "message_id": "",
+    }
+    prompt = spam_filter.build_user_message(md)
+    assert "mismatch" not in prompt.lower(), (
+        "Address-list Reply-To must not cause false mismatch advisory"
+    )
