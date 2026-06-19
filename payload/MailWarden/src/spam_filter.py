@@ -2955,7 +2955,7 @@ def build_user_message(msg_data: dict) -> str:
     all_received = msg_data.get("received_headers") or []
     first_3 = (msg_data.get("received_headers_first_3")
                 or all_received[:3])
-    received = "\n".join(first_3)
+    received = _sanitize_for_delimiter("\n".join(first_3))
 
     # Origin hop advisory: include the last hop only if the chain is > 3 hops
     # and the last hop is not already in first_3.
