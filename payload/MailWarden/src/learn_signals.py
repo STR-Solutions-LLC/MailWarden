@@ -429,7 +429,7 @@ def build_learner_prompt(new_examples: list[dict],
         if ex.get("received_headers"):
             lines.append("Received headers (first 3):")
             for h in ex["received_headers"]:
-                lines.append(f"  {h[:300]}")
+                lines.append(f"  {_sanitize_learner_delimiter(str(h))[:300]}")
         lines.append("Body excerpt:")
         lines.append(_sanitize_learner_delimiter(ex.get("plain_text_body", "")[:800]))
         lines.append("</untrusted_email>")
@@ -598,7 +598,7 @@ def build_teach_prompt(example: dict, direction: str,
     if example.get("received_headers"):
         lines.append("Received headers (first 3):")
         for h in example["received_headers"][:3]:
-            lines.append(f"  {str(h)[:300]}")
+            lines.append(f"  {_sanitize_learner_delimiter(str(h))[:300]}")
     lines.append("Body excerpt:")
     lines.append(_sanitize_learner_delimiter(
         (example.get("plain_text_body", "") or "")[:800]))
@@ -1116,19 +1116,46 @@ def call_claude(prompt: str, api_config: dict,
             if hasattr(resp, "usage") and resp.usage is not None:
                 _record_learner_tokens(resp.usage.input_tokens,
                                        resp.usage.output_tokens, model, logger)
-            text = resp.content[0].text.strip()
+            # W8: do NOT assume content[0] is text — a thinking or tool_use block
+            # can come first. Find the first text block; if there is none, fail
+            # this call cleanly instead of raising AttributeError (which would be
+            # swallowed by the generic handler and kill the whole batch).
+            text = next((b.text for b in (resp.content or [])
+                         if getattr(b, "type", None) == "text"), None)
+            if text is None:
+                # Tolerate SDK/mock blocks that expose .text without a typed kind.
+                text = next((b.text for b in (resp.content or [])
+                             if isinstance(getattr(b, "text", None), str)), None)
+            if text is None:
+                logger.error("Learner API response had no text content block")
+                return None
+            text = text.strip()
             if text.startswith("```"):
                 text = re.sub(r"^```\w*\n?", "", text)
                 text = re.sub(r"\n?```$", "", text).strip()
-            return json.loads(text)
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError as e:
+                # W9: salvage JSON wrapped in prose — pull the outermost {...}
+                # span and parse that, mirroring classify_email's prose salvage.
+                # Without this a single chatty response fails the whole learner
+                # batch and re-bills every tick (the watermark never advances).
+                salvage = re.search(r"\{.*\}", text, re.DOTALL)
+                if salvage:
+                    try:
+                        parsed = json.loads(salvage.group())
+                        logger.warning(
+                            f"Learner JSON salvaged from prose (original error: {e})")
+                        return parsed
+                    except json.JSONDecodeError:
+                        pass
+                logger.error(f"Failed to parse learner API response: {e}")
+                return None
         except anthropic.RateLimitError:
             import time as _time
             wait = (2 ** attempt) * 5
             logger.warning(f"Rate limited, waiting {wait}s (attempt {attempt + 1}/3)")
             _time.sleep(wait)
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse learner API response: {e}")
-            return None
         except Exception as e:
             logger.error(f"Claude API call failed: {e}")
             return None
@@ -1488,6 +1515,16 @@ def _run(logger: logging.Logger) -> int:
     last_scan = read_learner_scan_timestamp(config)
     last_scan_dt = datetime.fromisoformat(last_scan) if last_scan else None
 
+    # B8: capture the scan-start instant BEFORE listing files, and persist THIS
+    # as the new watermark at the end of the run. The old code stamped the
+    # watermark with datetime.now() at the END of the run, so an example dropped
+    # into the folder WHILE this run was processing (mtime after the listing but
+    # before the end stamp) fell behind the watermark and was never analyzed on
+    # any future run. Anchoring the watermark to scan_start guarantees any file
+    # modified after we listed is still strictly newer than the watermark and is
+    # picked up next run (at worst re-processed, never silently lost).
+    scan_start = datetime.now()
+
     new_files = _new_eml_files(folder, last_scan_dt)
     if not new_files:
         logger.info("No new .eml files since last scan")
@@ -1507,6 +1544,10 @@ def _run(logger: logging.Logger) -> int:
     signals_data = load_signals()
     active_refinements = [r for r in signals_data.get("ai_refinements", [])
                            if r.get("status", "active") == "active"]
+    # M11: bound the in-prompt dedup context to the 25 newest-active refinements,
+    # matching the classifier's cap (spam_filter: active = active[::-1][:25]).
+    # Unbounded, the learner prompt grows without limit after many approvals.
+    active_refinements = active_refinements[::-1][:25]
 
     prompt = build_learner_prompt(examples, active_refinements)
     result = call_claude(prompt, config.get("anthropic", {}), logger)
@@ -1528,25 +1569,41 @@ def _run(logger: logging.Logger) -> int:
     signals_needs_save = False
     # Persistent reinforcement delta from this run's duplicates (audit L1).
     reinforced_delta: dict = {}
+    # M13: count ONLY the examples that actually produced a derived signal (a new
+    # proposal or a reinforcement). derived_from_examples must not be inflated by
+    # no_rule/unknown examples, nor left unchanged when a run yields only new
+    # patterns — both were possible before.
+    derived_count = 0
     try:
         for i, cls in enumerate(classifications):
             if i > 0:
                 time.sleep(0.5)       # politeness throttle between sends
-            target_file = (cls.get("example") or "").strip()
-            ex = by_filename.get(target_file)
-            if ex is None:
-                logger.warning(f"Classification references unknown example: {target_file!r}")
+            # W9: isolate per-example failures. A single malformed classification
+            # or a handler error must not abort the whole batch — that would also
+            # skip the watermark advance and re-bill every example on the next tick.
+            try:
+                target_file = (cls.get("example") or "").strip()
+                ex = by_filename.get(target_file)
+                if ex is None:
+                    logger.warning(f"Classification references unknown example: {target_file!r}")
+                    continue
+                kind = (cls.get("kind") or "").lower()
+                if kind == "duplicate_of":
+                    if handle_duplicate(cls, ex, signals_data, config, logger,
+                                        smtp_conn, delta=reinforced_delta):
+                        signals_needs_save = True
+                        derived_count += 1
+                elif kind in ("new_pattern", "add_infrastructure"):
+                    if handle_new_pattern(cls, ex, signals_data, config, logger,
+                                          smtp_conn):
+                        derived_count += 1
+                else:
+                    logger.warning(f"Unknown classification kind {kind!r} for {target_file}")
+            except Exception as e:
+                ref = cls.get("example", "?") if isinstance(cls, dict) else "?"
+                logger.error(f"Failed to process classification {ref!r}: {e}",
+                             exc_info=True)
                 continue
-            kind = (cls.get("kind") or "").lower()
-            if kind == "duplicate_of":
-                if handle_duplicate(cls, ex, signals_data, config, logger,
-                                    smtp_conn, delta=reinforced_delta):
-                    signals_needs_save = True
-            elif kind in ("new_pattern", "add_infrastructure"):
-                handle_new_pattern(cls, ex, signals_data, config, logger,
-                                   smtp_conn)
-            else:
-                logger.warning(f"Unknown classification kind {kind!r} for {target_file}")
     finally:
         # Always close the shared SMTP connection, even if something raised.
         if smtp_conn[0] is not None:
@@ -1556,17 +1613,22 @@ def _run(logger: logging.Logger) -> int:
                 pass
             smtp_conn[0] = None
 
-    if signals_needs_save:
+    if signals_needs_save or derived_count:
         # Apply ONLY this run's delta onto a fresh, under-lock copy of
         # signals.json — never blind-save the stale run-start snapshot (L1).
-        # The derived_from_examples increment is preserved exactly (len(examples)
-        # when at least one duplicate was reinforced).
-        merge_save_signals_delta(reinforced_delta, derived_increment=len(examples))
+        # M13: derived_from_examples advances by derived_count — the number of
+        # examples that actually yielded a signal this run — NOT len(examples),
+        # which over-counted no_rule/unknown examples and (because only a
+        # duplicate set signals_needs_save) skipped runs that produced only new
+        # patterns. When only new patterns were proposed the delta is empty and
+        # this call just bumps the counter.
+        merge_save_signals_delta(reinforced_delta, derived_increment=derived_count)
 
     # Update the learner's scan watermark in its OWN file (NOT config.json), so
-    # a concurrent Dashboard config save is never reverted (L3). Same point in
-    # the run as before — timing semantics unchanged.
-    save_learner_scan_timestamp(datetime.now().isoformat())
+    # a concurrent Dashboard config save is never reverted (L3). The value is the
+    # scan-start instant captured BEFORE the file listing (B8), not the end of
+    # the run, so an example saved mid-run is never stranded behind the watermark.
+    save_learner_scan_timestamp(scan_start.isoformat())
 
     logger.info(f"Signal learner complete: processed {len(examples)} examples, "
                 f"{len(classifications)} classifications; "
