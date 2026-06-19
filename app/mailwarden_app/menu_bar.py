@@ -9,6 +9,7 @@ and launches the filter via subprocess when the user clicks Run Now
 """
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -138,6 +139,58 @@ def determine_state() -> tuple[str, str, str]:
         f"Last run: {last_fmt}"
         + (" (errors in log)" if errored else " (stale)")
     )
+
+
+def _load_report_state() -> dict:
+    try:
+        with paths.REPORT_STATE_PATH.open() as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _enabled_account_names() -> list:
+    try:
+        config = config_io.load_config()
+    except Exception:
+        return []
+    return [a.get("name") for a in config.get("accounts", [])
+            if a.get("enabled", True)]
+
+
+def last_report_success():
+    """Most recent successful daily-report send across ENABLED accounts
+    (orphaned/removed accounts in state are ignored). None if none yet."""
+    accounts = _load_report_state().get("accounts", {})
+    names = _enabled_account_names() or list(accounts.keys())
+    best = None
+    for name in names:
+        ts = accounts.get(name, {}).get("last_success_at")
+        try:
+            dt = datetime.fromisoformat(ts) if ts else None
+        except (ValueError, TypeError):
+            dt = None
+        if dt and (best is None or dt > best):
+            best = dt
+    return best
+
+
+def count_overdue_reports() -> int:
+    """# of ENABLED accounts whose last successful report is >25h old. A missing
+    last_success_at counts as pending (not overdue), so fresh installs / newly
+    added accounts don't false-alarm."""
+    accounts = _load_report_state().get("accounts", {})
+    now = datetime.now()
+    overdue = 0
+    for name in _enabled_account_names():
+        ts = accounts.get(name, {}).get("last_success_at")
+        try:
+            dt = datetime.fromisoformat(ts) if ts else None
+        except (ValueError, TypeError):
+            dt = None
+        if dt is not None and (now - dt).total_seconds() > 25 * 3600:
+            overdue += 1
+    return overdue
 
 
 def lock_is_active() -> bool:
@@ -451,10 +504,12 @@ class MailWardenMenuBar(rumps.App if rumps else object):
             super().__init__(MENUBAR_ICON_TEXT_FALLBACK, quit_button=None)
         self.status_item = rumps.MenuItem("MailWarden: starting…")
         self.last_run_item = rumps.MenuItem("Last run: —")
+        self.report_item = rumps.MenuItem("Last report: —")
         self.pause_item = rumps.MenuItem("Pause Filtering", callback=self.on_pause_toggle)
         self.menu = [
             self.status_item,
             self.last_run_item,
+            self.report_item,
             None,
             rumps.MenuItem("Run Now", callback=self.on_run_now),
             rumps.MenuItem("Open Dashboard", callback=self.on_open_dashboard),
@@ -467,6 +522,20 @@ class MailWardenMenuBar(rumps.App if rumps else object):
 
     def refresh_status(self, _timer=None):
         shape, short, long_line = determine_state()
+        # Report-health override: surface the most recent successful report
+        # send and any overdue accounts, and demote a GREEN filter state to
+        # YELLOW if a report is overdue (the report agent failing is itself a
+        # problem even when the filter is healthy).
+        overdue = count_overdue_reports()
+        last_rep = last_report_success()
+        if last_rep is None:
+            self.report_item.title = "Last report: pending"
+        else:
+            rep_fmt = last_rep.strftime("%Y-%m-%d %H:%M")
+            self.report_item.title = ("Last report: " + rep_fmt
+                                      + (f" ({overdue} overdue)" if overdue else ""))
+        if overdue and shape == STATE_GREEN[0]:
+            shape, short = STATE_YELLOW[0], STATE_YELLOW[1]
         # When using the image icon we leave the title empty so only the
         # icon appears in the menu bar. When falling back to text, we
         # keep the text title visible.

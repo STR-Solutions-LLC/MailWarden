@@ -8,7 +8,6 @@ Also serves as a system heartbeat: if the email stops arriving, something is wro
 import email
 import email.header
 import email.policy
-import imaplib
 import json
 import logging
 import os
@@ -16,6 +15,7 @@ import re
 import smtplib
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from logging.handlers import RotatingFileHandler
@@ -23,7 +23,7 @@ from pathlib import Path
 
 import file_lock
 
-from utils import parse_from_address, process_blacklist_entry
+from utils import parse_from_address
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
@@ -32,6 +32,8 @@ SIGNALS_PATH = PROJECT_ROOT / "memory" / "signals.json"
 WHITELIST_PATH = PROJECT_ROOT / "memory" / "whitelist.json"
 BLACKLIST_PATH = PROJECT_ROOT / "memory" / "blacklist.json"
 TOKEN_USAGE_PATH = PROJECT_ROOT / "memory" / "token_usage.json"
+REPORT_STATE_PATH = PROJECT_ROOT / "memory" / "report_state.json"
+REPORT_BOUNDARY_HOUR = 8  # local clock hour the report "day" rolls over
 PENDING_SIGNALS_PATH = PROJECT_ROOT / "memory" / "pending_signals.json"
 # The learner now stores its scan watermark here (audit L3) instead of in
 # config.json; the report reads it for the "Last ran" line, falling back to the
@@ -259,15 +261,6 @@ def sync_domains_txt(whitelist_dir: Path, logger: logging.Logger) -> dict:
     return result
 
 
-def get_blacklist_dir(config: dict) -> Path:
-    """Get the blacklist folder path from config."""
-    bl_config = config.get("blacklist", {})
-    folder = bl_config.get("folder", "")
-    if folder:
-        return Path(folder)
-    return PROJECT_ROOT / "blacklist"
-
-
 def load_blacklist() -> dict:
     try:
         with open(BLACKLIST_PATH, "r") as f:
@@ -313,332 +306,66 @@ def load_skip_names(blacklist_dir: Path) -> set:
     return names
 
 
-def detect_imap_separator(conn: imaplib.IMAP4_SSL) -> str:
-    """Detect the IMAP hierarchy separator for a connection."""
+def most_recent_boundary(now: datetime) -> datetime:
+    """Latest local 08:00 boundary at or before `now`. Calendar arithmetic on
+    naive local datetimes, so a 23h/25h DST day still maps to that date's 08:00."""
+    boundary_today = now.replace(hour=REPORT_BOUNDARY_HOUR, minute=0,
+                                 second=0, microsecond=0)
+    if now >= boundary_today:
+        return boundary_today
+    return boundary_today - timedelta(days=1)
+
+
+def compute_report_window(now: datetime, last_report_through):
+    """Return (start, end) for one report run. end = most recent 08:00 boundary.
+    start = the watermark, or (first run / None) the prior 08:00 boundary (one
+    complete day). Clamped so start <= end (a clock rewind yields an empty
+    window, never a negative one)."""
+    end = most_recent_boundary(now)
+    if last_report_through is None:
+        start = end - timedelta(days=1)
+    else:
+        start = last_report_through
+        if start > end:
+            start = end
+    return start, end
+
+
+def load_report_state() -> dict:
+    """Read report_state.json. Caller holds the lock (mirrors load_token_usage)."""
     try:
-        status, folders = conn.list()
-        if status == "OK" and folders:
-            first = folders[0].decode()
-            m = re.match(r'\(.*?\)\s+"([^"]+)"\s+', first)
-            if m:
-                return m.group(1)
+        with open(REPORT_STATE_PATH, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_report_state(data: dict):
+    """Atomic write of report_state.json. Caller holds the lock (mirrors save_token_usage)."""
+    fd, tmp_path = tempfile.mkstemp(dir=REPORT_STATE_PATH.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, REPORT_STATE_PATH)
     except Exception:
-        pass
-    return "."  # safe default
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
 
 
-def get_imap_root_prefix(conn: imaplib.IMAP4_SSL, sep: str) -> str:
-    """Determine whether folders need to be rooted under INBOX (like Bluehost)
-    or at top level (like Gmail). Returns 'INBOX{sep}' or '' accordingly."""
+def _parse_state_ts(value):
+    if not value:
+        return None
     try:
-        status, folders = conn.list()
-        if status != "OK":
-            return ""
-        # Check if common folders (Sent, Drafts) are under INBOX
-        for f in folders:
-            fstr = f.decode()
-            if "INBOX" + sep in fstr:
-                return f"INBOX{sep}"
-    except Exception:
-        pass
-    return ""
+        return datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
 
 
-def parse_folder_name(folder_line: str) -> str:
-    """Extract the folder name from a LIST response line."""
-    m = re.match(r'\(.*?\)\s+"[^"]+"\s+(.+)', folder_line)
-    if m:
-        name = m.group(1).strip()
-        if name.startswith('"') and name.endswith('"'):
-            name = name[1:-1]
-        return name
-    return ""
-
-
-def ensure_blacklist_folders(conn: imaplib.IMAP4_SSL, prefix: str,
-                              logger: logging.Logger) -> dict:
-    """Ensure Blacklist/Both, Name-Only, Address-Only folders exist.
-    Returns dict with full folder names (including root prefix) for each type."""
-    sep = detect_imap_separator(conn)
-    root = get_imap_root_prefix(conn, sep)
-
-    targets = {
-        "both": f"{root}{prefix}{sep}Both",
-        "name-only": f"{root}{prefix}{sep}Name-Only",
-        "address-only": f"{root}{prefix}{sep}Address-Only",
-    }
-
-    # Get existing folders
-    existing = set()
-    try:
-        status, folders = conn.list()
-        if status == "OK":
-            for f in folders:
-                name = parse_folder_name(f.decode())
-                if name:
-                    existing.add(name)
-    except Exception as e:
-        logger.error(f"[BLACKLIST] Failed to list folders: {e}")
-        return targets
-
-    for subfolder_type, full_name in targets.items():
-        if full_name in existing:
-            logger.debug(f"[BLACKLIST] Folder already exists: {full_name}")
-        else:
-            try:
-                status, _ = conn.create(full_name)
-                if status == "OK":
-                    logger.info(f"[BLACKLIST] Created folder: {full_name}")
-                else:
-                    logger.warning(f"[BLACKLIST] Failed to create {full_name}: {status}")
-            except Exception as e:
-                logger.error(f"[BLACKLIST] Error creating {full_name}: {e}")
-
-    return targets
-
-
-def process_imap_blacklist_folders(account: dict, skip_names: set,
-                                    logger: logging.Logger) -> list:
-    """Process the three Blacklist/* IMAP folders for one account.
-    Returns a list of addition dicts describing what was added."""
-    additions = []
-
-    if not account.get("imap_blacklist_enabled", True):
-        return additions
-
-    account_name = account.get("name", "Unknown")
-    prefix = account.get("blacklist_folder_prefix", "Blacklist")
-
-    try:
-        conn = imaplib.IMAP4_SSL(account["imap_host"], account["imap_port"])
-        conn.login(account["username"], account["password"])
-    except Exception as e:
-        logger.error(f"[BLACKLIST] IMAP connection failed for {account_name}: {e}")
-        return additions
-
-    try:
-        folder_names = ensure_blacklist_folders(conn, prefix, logger)
-        # Locked read-modify-write of blacklist.json so a concurrent filter
-        # command handler / Dashboard edit isn't clobbered by this folder sync
-        # (C7). NOTE: the .lower() on possibly-dict scoped entries (C9) is a
-        # SEPARATE known crash bug owned by Session 9 — left unchanged here.
-        with file_lock.locked(BLACKLIST_PATH):
-            blacklist = load_blacklist()
-            existing_addrs = {a.lower() for a in blacklist.get("addresses", [])}
-            existing_names = {n.lower() for n in blacklist.get("display_names", [])}
-            changed = False
-
-            for subfolder_type, full_name in folder_names.items():
-                try:
-                    status, _ = conn.select(full_name)
-                    if status != "OK":
-                        logger.debug(f"[BLACKLIST] Cannot select {full_name}")
-                        continue
-
-                    status, data = conn.uid("SEARCH", None, "ALL")
-                    if status != "OK":
-                        continue
-
-                    uids = data[0].split() if data[0] else []
-                    if not uids:
-                        continue
-
-                    logger.info(f"[BLACKLIST] Processing {len(uids)} messages in {full_name} ({account_name})")
-
-                    for uid in uids:
-                        # Fetch raw email
-                        status, fetch_data = conn.uid("FETCH", uid, "(BODY.PEEK[])")
-                        if status != "OK" or not fetch_data or not fetch_data[0]:
-                            logger.error(f"[BLACKLIST] Failed to fetch UID {uid} in {full_name}")
-                            continue
-
-                        eml_bytes = fetch_data[0][1]
-                        entry = process_blacklist_entry(eml_bytes, subfolder_type, skip_names)
-
-                        addr = entry.get("address")
-                        name = entry.get("display_name")
-                        warning = entry.get("warning")
-                        skipped = entry.get("skipped_name")
-
-                        addr_added = False
-                        name_added = False
-                        if addr and addr not in existing_addrs:
-                            blacklist.setdefault("addresses", []).append(addr)
-                            existing_addrs.add(addr)
-                            changed = True
-                            addr_added = True
-                        if name and name.lower() not in existing_names:
-                            blacklist.setdefault("display_names", []).append(name)
-                            existing_names.add(name.lower())
-                            changed = True
-                            name_added = True
-
-                        if addr_added or name_added:
-                            logger.info(
-                                f"[BLACKLIST] Added via IMAP ({account_name}/{subfolder_type}): "
-                                f"addr={addr if addr_added else 'no'} name={name if name_added else 'no'}"
-                            )
-                            additions.append({
-                                "address": addr if addr_added else None,
-                                "display_name": name if name_added else None,
-                                "source": f"IMAP, {account_name}",
-                                "subfolder_type": subfolder_type,
-                                "original_from": entry.get("original_from", ""),
-                            })
-                        if warning:
-                            logger.warning(f"[BLACKLIST] {warning}")
-                        if skipped:
-                            logger.info(
-                                f"[BLACKLIST] Skipped generic name '{skipped}' (in skip_names.txt)"
-                            )
-
-                        # Delete the message from the folder
-                        try:
-                            conn.uid("STORE", uid, "+FLAGS", "\\Deleted")
-                        except Exception as e:
-                            logger.error(f"[BLACKLIST] Failed to flag UID {uid} for deletion: {e}")
-
-                    # Expunge after processing all messages in this folder
-                    try:
-                        conn.expunge()
-                    except Exception as e:
-                        logger.error(f"[BLACKLIST] Expunge failed in {full_name}: {e}")
-
-                except Exception as e:
-                    logger.error(f"[BLACKLIST] Error processing {full_name}: {e}")
-
-            if changed:
-                save_blacklist(blacklist)
-
-    finally:
-        try:
-            conn.logout()
-        except Exception:
-            pass
-
-    return additions
-
-
-def process_filesystem_blacklist_folders(blacklist_dir: Path, skip_names: set,
-                                           logger: logging.Logger) -> list:
-    """Process filesystem blacklist/{both,name-only,address-only} folders."""
-    additions = []
-
-    if not blacklist_dir.is_dir():
-        logger.warning(f"[BLACKLIST] Folder does not exist: {blacklist_dir}")
-        return additions
-
-    # Locked read-modify-write of blacklist.json so a concurrent filter command
-    # handler / Dashboard edit isn't clobbered by this folder sync (C7). NOTE:
-    # the .lower() on possibly-dict scoped entries (C9) is a SEPARATE known
-    # crash bug owned by Session 9 — left unchanged here.
-    with file_lock.locked(BLACKLIST_PATH):
-        blacklist = load_blacklist()
-        existing_addrs = {a.lower() for a in blacklist.get("addresses", [])}
-        existing_names = {n.lower() for n in blacklist.get("display_names", [])}
-        changed = False
-
-        for subfolder_type in ("both", "name-only", "address-only"):
-            subdir = blacklist_dir / subfolder_type
-            if not subdir.is_dir():
-                continue
-
-            eml_files = sorted(subdir.glob("*.eml"))
-            for eml_path in eml_files:
-                try:
-                    with open(eml_path, "rb") as f:
-                        eml_bytes = f.read()
-
-                    entry = process_blacklist_entry(eml_bytes, subfolder_type, skip_names)
-
-                    addr = entry.get("address")
-                    name = entry.get("display_name")
-                    warning = entry.get("warning")
-                    skipped = entry.get("skipped_name")
-
-                    addr_added = False
-                    name_added = False
-                    if addr and addr not in existing_addrs:
-                        blacklist.setdefault("addresses", []).append(addr)
-                        existing_addrs.add(addr)
-                        changed = True
-                        addr_added = True
-                    if name and name.lower() not in existing_names:
-                        blacklist.setdefault("display_names", []).append(name)
-                        existing_names.add(name.lower())
-                        changed = True
-                        name_added = True
-
-                    if addr_added or name_added:
-                        logger.info(
-                            f"[BLACKLIST] Added via filesystem ({subfolder_type}): "
-                            f"addr={addr if addr_added else 'no'} name={name if name_added else 'no'}"
-                        )
-                        additions.append({
-                            "address": addr if addr_added else None,
-                            "display_name": name if name_added else None,
-                            "source": "filesystem",
-                            "subfolder_type": subfolder_type,
-                            "original_from": entry.get("original_from", ""),
-                        })
-                    if warning:
-                        logger.warning(f"[BLACKLIST] {warning}")
-                    if skipped:
-                        logger.info(f"[BLACKLIST] Skipped generic name '{skipped}'")
-
-                    # Delete the .eml file
-                    eml_path.unlink()
-
-                except Exception as e:
-                    logger.error(f"[BLACKLIST] Error processing {eml_path.name}: {e}")
-
-        if changed:
-            save_blacklist(blacklist)
-
-    return additions
-
-
-def sync_display_names_txt(blacklist_dir: Path, logger: logging.Logger) -> list:
-    """Additively sync display_names.txt to blacklist.json. Returns list of added names."""
-    added = []
-    path = blacklist_dir / "display_names.txt"
-    if not path.exists():
-        logger.warning(f"[BLACKLIST] display_names.txt not found at {path}")
-        return added
-
-    # Locked read-modify-write of blacklist.json so a concurrent filter command
-    # handler / Dashboard edit isn't clobbered by this sync (C7).
-    with file_lock.locked(BLACKLIST_PATH):
-        blacklist = load_blacklist()
-        existing = {n.lower() for n in blacklist.get("display_names", [])}
-        changed = False
-
-        try:
-            with open(path, "r") as f:
-                for line in f:
-                    line = line.strip().rstrip("\r")
-                    if not line or line.startswith("#"):
-                        continue
-                    if line.lower() not in existing:
-                        blacklist.setdefault("display_names", []).append(line)
-                        existing.add(line.lower())
-                        added.append(line)
-                        changed = True
-                        logger.info(f"[BLACKLIST] Added display name from file: {line}")
-        except Exception as e:
-            logger.error(f"[BLACKLIST] Failed to read display_names.txt: {e}")
-            return added
-
-        if changed:
-            save_blacklist(blacklist)
-
-    return added
-
-
-def count_blacklisted_blocked_24h() -> tuple:
-    """Count BLACKLISTED decisions and gather entries from last 24h.
+def count_blacklisted_blocked_24h(window_start, window_end) -> tuple:
+    """Count BLACKLISTED decisions and gather entries within an explicit window.
+    Now takes an explicit (window_start, window_end) half-open window.
     Returns (count, entries_list)."""
-    cutoff = datetime.now() - timedelta(hours=24)
     count = 0
     entries = []
 
@@ -664,7 +391,7 @@ def count_blacklisted_blocked_24h() -> tuple:
             ts = datetime.strptime(ts_match.group(1), "%Y-%m-%d %H:%M:%S")
         except ValueError:
             continue
-        if ts < cutoff:
+        if ts < window_start or ts >= window_end:
             continue
 
         count += 1
@@ -684,9 +411,9 @@ def count_blacklisted_blocked_24h() -> tuple:
     return count, entries
 
 
-def count_whitelisted_passthrough_24h() -> int:
-    """Count WHITELISTED decisions in decisions.log from last 24 hours."""
-    cutoff = datetime.now() - timedelta(hours=24)
+def count_whitelisted_passthrough_24h(window_start, window_end) -> int:
+    """Count WHITELISTED decisions in decisions.log within an explicit window.
+    Now takes an explicit (window_start, window_end) half-open window."""
     count = 0
 
     if not DECISIONS_LOG_PATH.exists():
@@ -709,7 +436,7 @@ def count_whitelisted_passthrough_24h() -> int:
             continue
         try:
             ts = datetime.strptime(ts_match.group(1), "%Y-%m-%d %H:%M:%S")
-            if ts >= cutoff:
+            if window_start <= ts < window_end:
                 count += 1
         except ValueError:
             continue
@@ -855,16 +582,17 @@ def build_pending_signals_section(sig_status: dict) -> list:
     return lines
 
 
-def get_last_filter_run() -> tuple:
+def get_last_filter_run(window_start, window_end) -> tuple:
     """Find the most recent filter run timestamp and error count from the operational log.
-    Returns (datetime_or_None, runs_in_24h, errors_in_24h)."""
+    Now takes an explicit (window_start, window_end) half-open window for the
+    runs/errors counts. last_run stays ABSOLUTE (the most-recent run, ungated).
+    Returns (datetime_or_None, runs_in_window, errors_in_window)."""
     if not LOG_PATH.exists():
         return None, 0, 0
 
     last_run = None
     runs_24h = 0
     errors_24h = 0
-    cutoff = datetime.now() - timedelta(hours=24)
 
     try:
         with open(LOG_PATH, "r") as f:
@@ -879,10 +607,10 @@ def get_last_filter_run() -> tuple:
 
                 if "Spam filter starting" in line:
                     last_run = ts
-                    if ts > cutoff:
+                    if window_start <= ts < window_end:
                         runs_24h += 1
 
-                if ts > cutoff and "[ERROR]" in line:
+                if window_start <= ts < window_end and "[ERROR]" in line:
                     errors_24h += 1
     except Exception:
         pass
@@ -890,9 +618,9 @@ def get_last_filter_run() -> tuple:
     return last_run, runs_24h, errors_24h
 
 
-def parse_decisions_24h() -> dict:
-    """Parse decisions.log for entries in the last 24 hours."""
-    cutoff = datetime.now() - timedelta(hours=24)
+def parse_decisions_24h(window_start, window_end) -> dict:
+    """Parse decisions.log for entries within an explicit window.
+    Now takes an explicit (window_start, window_end) half-open window."""
     result = {
         "evaluated": 0,
         "spam_moved": 0,
@@ -928,7 +656,7 @@ def parse_decisions_24h() -> dict:
         except ValueError:
             continue
 
-        if ts < cutoff:
+        if ts < window_start or ts >= window_end:
             continue
 
         # Extract account name — timestamp and ACCOUNT: share the first line
@@ -998,7 +726,7 @@ def parse_decisions_24h() -> dict:
 
     logger = logging.getLogger("daily_report")
     logger.info(
-        f"parse_decisions_24h: window=24h, "
+        f"parse_decisions_24h: window={window_start.isoformat()}..{window_end.isoformat()}, "
         f"per_account_keys={sorted(result.get('per_account', {}).keys())}"
     )
     return result
@@ -1011,7 +739,8 @@ def build_report_body(config: dict, decisions: dict, last_run: datetime,
                       token_usage: dict = None, api_key: str = "",
                       sig_status: dict = None,
                       bl_additions: list = None, bl_blocked: tuple = None,
-                      bl_totals: tuple = None) -> str:
+                      bl_totals: tuple = None,
+                      window_start=None, window_end=None) -> str:
     """Build the plain text email body."""
     now = datetime.now()
     date_str = now.strftime("%B %d, %Y")
@@ -1021,6 +750,14 @@ def build_report_body(config: dict, decisions: dict, last_run: datetime,
 
     lines.append("SPAM FILTER DAILY REPORT")
     lines.append(f"{date_str} — {time_str}")
+    # Period covered — only when an explicit window is supplied AND it spans more
+    # than one calendar date (a catch-up run). The single-date path (params None,
+    # or a one-day window) stays byte-identical to the original report.
+    if (window_start is not None and window_end is not None
+            and window_start.date() != window_end.date()):
+        _fmt = "%b %d %I:%M %p"
+        lines.append(f"Period covered: {window_start.strftime(_fmt)} – "
+                     f"{window_end.strftime(_fmt)}")
     lines.append("=" * 40)
     lines.append("")
 
@@ -1260,39 +997,60 @@ def send_report(config: dict, subject: str, body: str, logger: logging.Logger,
     msg["From"] = from_addr
     msg["To"] = to_addr
 
-    server = None
-    try:
-        # utils.smtp_login handles SMTP_SSL vs STARTTLS and refuses to
-        # send credentials over a plaintext connection.
-        from utils import smtp_login
-        server = smtp_login(smtp_config)
-        server.sendmail(from_addr, [to_addr], msg.as_string())
-        logger.info(f"Daily report sent to {to_addr}")
-    except Exception as e:
-        logger.error(f"SMTP to {to_addr} failed: {e}")
-        raise
-    finally:
-        if server:
-            try:
-                server.quit()
-            except Exception:
-                pass
+    # Retry transient/network failures; permanent errors (auth, refused
+    # recipient/sender, data) raise immediately. PERMANENT is checked first
+    # because smtplib exceptions are OSError subclasses.
+    permanent = (smtplib.SMTPAuthenticationError, smtplib.SMTPRecipientsRefused,
+                 smtplib.SMTPSenderRefused, smtplib.SMTPDataError,
+                 smtplib.SMTPNotSupportedError)
+    transient = (smtplib.SMTPConnectError, smtplib.SMTPHeloError,
+                 smtplib.SMTPServerDisconnected, TimeoutError,
+                 ConnectionError, OSError)
+    attempts = 3
+    backoffs = [2, 4]  # seconds before attempts 2 and 3
+    for attempt in range(1, attempts + 1):
+        server = None
+        try:
+            from utils import smtp_login
+            server = smtp_login(smtp_config)
+            server.sendmail(from_addr, [to_addr], msg.as_string())
+            logger.info(f"Daily report sent to {to_addr}")
+            return
+        except permanent as e:
+            logger.error(f"SMTP to {to_addr} failed (permanent, no retry): {e}")
+            raise
+        except transient as e:
+            if attempt >= attempts:
+                logger.error(f"SMTP to {to_addr} failed after {attempts} attempts: {e}")
+                raise
+            logger.warning(f"SMTP to {to_addr} transient failure "
+                           f"(attempt {attempt}/{attempts}): {e}; retrying")
+            time.sleep(backoffs[attempt - 1])
+        except Exception as e:
+            logger.error(f"SMTP to {to_addr} failed: {e}")
+            raise
+        finally:
+            if server:
+                try:
+                    server.quit()
+                except Exception:
+                    pass
 
 
-def main():
+def main(now=None):
     logger = setup_logging()
     logger.info("=" * 60)
     logger.info("Daily report starting")
+
+    now = now if now is not None else datetime.now()
 
     config = load_config()
     signals_data = load_signals()
     api_key = config.get("anthropic", {}).get("api_key", "")
 
     # --- Token usage: load, prune old records, save ---
-    # The report is a THIRD writer of token_usage.json (filter + learner are the
-    # others). Hold the lock across the whole load->prune->save so the load is
-    # fresh-under-lock and the report can't erase a concurrent filter/learner
-    # write (audit D3). 90-day prune behavior is unchanged.
+    # The report is the SOLE 90-day pruner of token_usage.json (the filter and
+    # learner only merge-append). Hold the lock across load->prune->save.
     with file_lock.locked(TOKEN_USAGE_PATH):
         token_usage = load_token_usage()
         token_usage = prune_token_usage(token_usage)
@@ -1302,124 +1060,152 @@ def main():
     logger.info("Checking pending signal proposals...")
     sig_status = expire_pending_signals(logger)
 
-    # --- Whitelist activity summary ---
-    # Whitelist and blacklist entries are added via email commands ("Fwd: Whitelist",
-    # "Fwd: Blacklist All", etc.) processed in spam_filter.py. This phase only
-    # gathers 24h counts for the daily report — no folder scanning.
-    wl_additions = []         # email-command additions are logged in decisions.log
+    # --- Current whitelist/blacklist snapshots (NOT windowed) ---
+    wl_additions = []
     wl_domains = {"added": [], "removed": [], "total": 0}
-    wl_passthrough = count_whitelisted_passthrough_24h()
     whitelist = load_whitelist()
     wl_domains["total"] = len(whitelist.get("domains", []))
-    logger.info(f"Whitelist: {wl_passthrough} passed through in last 24h")
 
-    # --- Blacklist activity summary ---
     bl_additions = []
-    bl_blocked = count_blacklisted_blocked_24h()
     blacklist = load_blacklist()
-    bl_totals = (len(blacklist.get("addresses", [])), len(blacklist.get("display_names", [])))
-    logger.info(
-        f"Blacklist: {bl_blocked[0]} blocked in last 24h, "
-        f"totals: {bl_totals[0]} addresses, {bl_totals[1]} names"
-    )
+    bl_totals = (len(blacklist.get("addresses", [])),
+                 len(blacklist.get("display_names", [])))
 
-    # Parse last 24h of decisions
-    decisions = parse_decisions_24h()
-
-    # Surface orphaned decisions (no ACCOUNT: tag in the log record). The
-    # per-account loop below silently excludes them — logging here makes
-    # any new code path in spam_filter.py that forgets to stamp ACCOUNT
-    # visible in spam_filter.log instead of invisibly dropping user data.
-    orphaned = decisions.get("per_account", {}).get("Unknown", {}).get("evaluated", 0)
-    if orphaned:
-        logger.warning(
-            f"{orphaned} decision(s) in the last 24h had no ACCOUNT: tag "
-            f"and will not appear in any per-account report"
-        )
-
-    # Get filter run status
-    last_run, runs_24h, errors_24h = get_last_filter_run()
-    decisions["errors"] = errors_24h
-
-    # Build and send one report PER ACCOUNT. Each account gets its own
-    # email showing what was filtered on THAT account. The primary account
-    # (first in the list) additionally receives the API usage summary.
-    now = datetime.now()
     date_str = now.strftime("%B %d, %Y")
+
+    # --- Per-account calendar-day windows + watermark (C10) ---
+    # Each account advances ITS OWN watermark only on ITS OWN successful send;
+    # one account's failure never touches another's window.
+    with file_lock.locked(REPORT_STATE_PATH):
+        report_state = load_report_state()
+    state_accounts = report_state.get("accounts", {})
+    advances = {}
+
+    def _window_for(name):
+        return compute_report_window(
+            now, _parse_state_ts(
+                state_accounts.get(name, {}).get("last_report_through")))
+
     accounts = [a for a in config.get("accounts", []) if a.get("enabled", True)]
+
     if not accounts:
-        # Fallback: send a single aggregate report to summary.recipient.
-        body = build_report_body(
-            config, decisions, last_run, runs_24h, signals_data,
-            wl_additions=wl_additions, wl_domains=wl_domains,
-            wl_passthrough=wl_passthrough,
-            token_usage=token_usage, api_key=api_key,
-            sig_status=sig_status,
-            bl_additions=bl_additions, bl_blocked=bl_blocked,
-            bl_totals=bl_totals,
-        )
-        subject = (f"MailWarden Report — {date_str} — "
-                   f"{decisions['spam_moved']} moved to Junk")
-        try:
-            send_report(config, subject, body, logger)
-        except Exception as e:
-            logger.error(f"Failed to send daily report: {e}")
-        logger.info("Daily report complete")
-        logger.info("=" * 60)
-        return
+        # Fallback: single aggregate report to summary.recipient.
+        name = "__aggregate__"
+        window_start, window_end = _window_for(name)
+        if window_start == window_end:
+            logger.info(f"{name}: already reported through "
+                        f"{window_end.isoformat()}; nothing new to send.")
+        else:
+            wl_passthrough = count_whitelisted_passthrough_24h(window_start, window_end)
+            bl_blocked = count_blacklisted_blocked_24h(window_start, window_end)
+            decisions = parse_decisions_24h(window_start, window_end)
+            last_run, runs_24h, errors_24h = get_last_filter_run(window_start, window_end)
+            decisions["errors"] = errors_24h
+            orphaned = decisions.get("per_account", {}).get("Unknown", {}).get("evaluated", 0)
+            if orphaned:
+                logger.warning(
+                    f"{orphaned} decision(s) in the window had no ACCOUNT: tag "
+                    f"and will not appear in any per-account report")
+            body = build_report_body(
+                config, decisions, last_run, runs_24h, signals_data,
+                wl_additions=wl_additions, wl_domains=wl_domains,
+                wl_passthrough=wl_passthrough,
+                token_usage=token_usage, api_key=api_key,
+                sig_status=sig_status,
+                bl_additions=bl_additions, bl_blocked=bl_blocked,
+                bl_totals=bl_totals,
+                window_start=window_start, window_end=window_end,
+            )
+            subject = (f"MailWarden Report — {date_str} — "
+                       f"{decisions['spam_moved']} moved to Junk")
+            try:
+                send_report(config, subject, body, logger)
+                advances[name] = {
+                    "last_report_through": window_end.isoformat(),
+                    "last_success_at": datetime.now().isoformat(),
+                }
+            except Exception as e:
+                logger.error(f"Failed to send daily report: {e}")
+    else:
+        for idx, account in enumerate(accounts):
+            is_primary = (idx == 0)
+            acct_name = account.get("name", "Unknown")
+            acct_user = account.get("username", "")
+            if not acct_user:
+                logger.warning(f"Skipping report for account {acct_name!r}: no email address")
+                continue
 
-    for idx, account in enumerate(accounts):
-        is_primary = (idx == 0)
-        acct_name = account.get("name", "Unknown")
-        acct_user = account.get("username", "")
-        if not acct_user:
-            logger.warning(f"Skipping report for account {acct_name!r}: no email address")
-            continue
+            window_start, window_end = _window_for(acct_name)
+            if window_start == window_end:
+                logger.info(f"{acct_name}: already reported through "
+                            f"{window_end.isoformat()}; skipping.")
+                continue
 
-        # Filter decisions for this account only.
-        all_per = decisions.get("per_account", {})
-        per_acct = all_per.get(acct_name, {})
-        if not per_acct:
-            # Tolerant fallback: case-insensitive + whitespace-stripped match
-            norm_target = acct_name.strip().lower()
-            for log_key, log_val in all_per.items():
-                if log_key.strip().lower() == norm_target:
-                    per_acct = log_val
-                    logger.warning(
-                        f"Daily report: account {acct_name!r} matched log key "
-                        f"{log_key!r} via tolerant lookup. Consider renaming for "
-                        f"exact match in future entries."
-                    )
-                    break
-        acct_decisions = {
-            "evaluated": per_acct.get("evaluated", 0),
-            "spam_moved": per_acct.get("spam", 0),
-            "spam_dry_run": per_acct.get("spam_dry_run", 0),
-            "not_spam": per_acct.get("not_spam", 0),
-            "errors": decisions.get("errors", 0),  # runtime errors are global
-            "spam_entries": [e for e in decisions.get("spam_entries", [])
-                             if e.get("account") == acct_name],
-            "per_account": {acct_name: per_acct},
-        }
+            wl_passthrough = count_whitelisted_passthrough_24h(window_start, window_end)
+            bl_blocked = count_blacklisted_blocked_24h(window_start, window_end)
+            decisions = parse_decisions_24h(window_start, window_end)
+            last_run, runs_24h, errors_24h = get_last_filter_run(window_start, window_end)
+            decisions["errors"] = errors_24h
 
-        body = build_report_body(
-            config, acct_decisions, last_run, runs_24h, signals_data,
-            wl_additions=wl_additions, wl_domains=wl_domains,
-            wl_passthrough=wl_passthrough,
-            # API usage + sig_status only in the primary recipient's report.
-            token_usage=(token_usage if is_primary else None),
-            api_key=(api_key if is_primary else ""),
-            sig_status=(sig_status if is_primary else {}),
-            bl_additions=bl_additions, bl_blocked=bl_blocked,
-            bl_totals=bl_totals,
-        )
-        subject = (f"MailWarden Report — {acct_name} — {date_str} — "
-                   f"{acct_decisions['spam_moved']} moved to Junk")
-        try:
-            send_report(config, subject, body, logger, to_addr=acct_user)
-        except Exception as e:
-            logger.error(f"Failed to send report to {acct_user}: {e}")
-            # keep going — one account's SMTP failure should not block others
+            orphaned = decisions.get("per_account", {}).get("Unknown", {}).get("evaluated", 0)
+            if orphaned:
+                logger.warning(
+                    f"{orphaned} decision(s) in {acct_name}'s window had no "
+                    f"ACCOUNT: tag and will not appear in any per-account report")
+
+            all_per = decisions.get("per_account", {})
+            per_acct = all_per.get(acct_name, {})
+            if not per_acct:
+                norm_target = acct_name.strip().lower()
+                for log_key, log_val in all_per.items():
+                    if log_key.strip().lower() == norm_target:
+                        per_acct = log_val
+                        logger.warning(
+                            f"Daily report: account {acct_name!r} matched log key "
+                            f"{log_key!r} via tolerant lookup. Consider renaming for "
+                            f"exact match in future entries.")
+                        break
+            acct_decisions = {
+                "evaluated": per_acct.get("evaluated", 0),
+                "spam_moved": per_acct.get("spam", 0),
+                "spam_dry_run": per_acct.get("spam_dry_run", 0),
+                "not_spam": per_acct.get("not_spam", 0),
+                "errors": decisions.get("errors", 0),  # runtime errors are global
+                "spam_entries": [e for e in decisions.get("spam_entries", [])
+                                 if e.get("account") == acct_name],
+                "per_account": {acct_name: per_acct},
+            }
+
+            body = build_report_body(
+                config, acct_decisions, last_run, runs_24h, signals_data,
+                wl_additions=wl_additions, wl_domains=wl_domains,
+                wl_passthrough=wl_passthrough,
+                token_usage=(token_usage if is_primary else None),
+                api_key=(api_key if is_primary else ""),
+                sig_status=(sig_status if is_primary else {}),
+                bl_additions=bl_additions, bl_blocked=bl_blocked,
+                bl_totals=bl_totals,
+                window_start=window_start, window_end=window_end,
+            )
+            subject = (f"MailWarden Report — {acct_name} — {date_str} — "
+                       f"{acct_decisions['spam_moved']} moved to Junk")
+            try:
+                send_report(config, subject, body, logger, to_addr=acct_user)
+                advances[acct_name] = {
+                    "last_report_through": window_end.isoformat(),
+                    "last_success_at": datetime.now().isoformat(),
+                }
+            except Exception as e:
+                logger.error(f"Failed to send report to {acct_user}: {e}")
+                # keep going — one account's failure must not affect others
+
+    # Write advances ONCE, after the loop. Orphaned/removed-account entries are
+    # left intact (not pruned).
+    if advances:
+        with file_lock.locked(REPORT_STATE_PATH):
+            fresh = load_report_state()
+            fresh.setdefault("accounts", {}).update(advances)
+            save_report_state(fresh)
 
     logger.info("Daily report complete")
     logger.info("=" * 60)

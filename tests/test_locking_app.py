@@ -471,3 +471,76 @@ def test_t6_all_dashboard_saves_are_locked():
     assert not unlocked, (
         "every dashboard save_whitelist/save_blacklist must sit inside a "
         f"file_lock.locked(...) block; unlocked at lines {unlocked}")
+
+
+# ===========================================================================
+# Test 7 — menu-bar report-health helpers (audit Session 9A, finding C10).
+# last_report_success() / count_overdue_reports() read report_state.json and the
+# ENABLED-account set, so we redirect paths.REPORT_STATE_PATH to a tmp file and
+# stub config_io.load_config for the enabled list. These exercise the real
+# menu_bar helpers — no mocking of file_lock (the helpers don't lock).
+# ===========================================================================
+
+from datetime import datetime, timedelta  # noqa: E402
+
+
+@pytest.fixture
+def report_state_env(tmp_path, monkeypatch):
+    state_path = tmp_path / "report_state.json"
+    monkeypatch.setattr(app_paths, "REPORT_STATE_PATH", state_path)
+    return state_path
+
+
+def _set_enabled_accounts(monkeypatch, names):
+    cfg = {"accounts": [{"name": n, "enabled": True} for n in names]}
+    monkeypatch.setattr(config_io, "load_config", lambda: cfg)
+
+
+def test_t7_last_report_success_returns_freshest_enabled(report_state_env, monkeypatch):
+    state_path = report_state_env
+    now = datetime.now()
+    older = (now - timedelta(hours=30)).isoformat()
+    newer = (now - timedelta(hours=2)).isoformat()
+    _write_json(state_path, {"accounts": {
+        "A": {"last_report_through": "x", "last_success_at": older},
+        "B": {"last_report_through": "x", "last_success_at": newer},
+    }})
+    _set_enabled_accounts(monkeypatch, ["A", "B"])
+
+    best = menu_bar.last_report_success()
+    assert best == datetime.fromisoformat(newer), \
+        "last_report_success must return the freshest enabled-account success"
+
+
+def test_t7_last_report_success_none_when_no_state(report_state_env, monkeypatch):
+    # No file at all, enabled accounts present → None.
+    _set_enabled_accounts(monkeypatch, ["A"])
+    assert menu_bar.last_report_success() is None
+
+
+def test_t7_count_overdue_reports(report_state_env, monkeypatch):
+    """One enabled account >25h stale (overdue), one fresh, one missing
+    (pending, NOT overdue) → exactly 1 overdue."""
+    state_path = report_state_env
+    now = datetime.now()
+    stale = (now - timedelta(hours=26)).isoformat()
+    fresh = (now - timedelta(hours=1)).isoformat()
+    _write_json(state_path, {"accounts": {
+        "A": {"last_report_through": "x", "last_success_at": stale},   # overdue
+        "B": {"last_report_through": "x", "last_success_at": fresh},   # fresh
+        # C has no entry at all → missing → pending, not overdue.
+    }})
+    _set_enabled_accounts(monkeypatch, ["A", "B", "C"])
+
+    assert menu_bar.count_overdue_reports() == 1
+
+
+def test_t7_menu_bar_source_has_report_health():
+    """STRUCTURAL: menu_bar wires the report-health UI + helpers in."""
+    import inspect
+    src = inspect.getsource(menu_bar)
+    assert "report_item" in src, "menu_bar must define a report_item menu entry"
+    assert "count_overdue_reports" in src, \
+        "menu_bar must define count_overdue_reports"
+    assert "last_report_success" in src, \
+        "menu_bar must define last_report_success"

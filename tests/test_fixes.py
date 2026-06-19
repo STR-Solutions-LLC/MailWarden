@@ -2874,7 +2874,9 @@ def test_dry_run_report_rebucket(tmp_path, monkeypatch):
     log_path.write_text(log)
     monkeypatch.setattr(daily_report, "DECISIONS_LOG_PATH", log_path)
 
-    result = daily_report.parse_decisions_24h()
+    from datetime import timedelta as _td
+    result = daily_report.parse_decisions_24h(datetime.now() - _td(hours=1),
+                                              datetime.now() + _td(hours=1))
     assert result["spam_moved"] == 1
     assert result["spam_dry_run"] == 1
     assert result["per_account"]["Acct"]["spam"] == 1
