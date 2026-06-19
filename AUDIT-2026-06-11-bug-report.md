@@ -497,3 +497,32 @@ Files changed: `app/mailwarden_app/config_io.py`, `app/mailwarden_app/dashboard.
 **Audit status after this session:** Sessions 1, 2, 3, 4, 5, 6, 7, 10 complete and committed. Still open in Part 4: Session 8 (reply understanding), 9 (daily report correctness), 11 (learner robustness), 12 (IMAP runtime safety), 13 (build/packaging hygiene), 14 (private eval corpus), 15+ (spam-improvement). Plus the planned safe sender-approval feature and the M18 follow-up. (The Session-7 received-header-sanitization follow-up was fixed 2026-06-18.)
 
 **Next step:** Matt chooses the next session.
+
+## Session 11 — Learner hardening (completed 2026-06-19)
+**Status: full test suite green (370 passed; 363 after the Session-7 received-header follow-up → 370 with 7 new Session 11 regression tests). Independent review gate: PASSED (2026-06-19) — fix authored on Opus 4.8, reviewed on Sonnet 4.6 (different model). The reviewer re-ran the full suite itself, proved the C8 sanitize-then-truncate boundary safe (a substring of a delimiter-free string is delimiter-free, and the following template text begins with "B" so it cannot complete a partial tail), confirmed each new test fails on revert, verified M11 matches the classifier's `active[::-1][:25]` ordering exactly, M13 counts correctly in both directions, W8/W9 robustness, and that the watermark advance is unconditional after the loop. Committed on `calibration-security-build1` (`e9f21d5`); no version bump (still 1.6.0-beta.16.2); not deployed.**
+
+**Findings closed: C8 (CRITICAL — learner prompt-injection via unsanitized Received headers), B8 (mid-run teaching examples silently skipped forever), M11 (uncapped refinement context), M13 (meaningless derived-from-examples counter), W8 (non-text first content block crashes the batch), W9 (one unparseable response fails the whole batch and re-bills every tick). M12 (.eml retention) intentionally OUT of scope.**
+
+**What was built** (payload/MailWarden/src/learn_signals.py; tests in tests/test_phase1a.py): Received headers in both `build_learner_prompt` and `build_teach_prompt` now pass through `_sanitize_learner_delimiter` (sanitize-then-truncate); the new-example watermark is anchored to a `scan_start` captured before the file scan and persisted at run end (so an example saved mid-run is picked up next run, never stranded); refinement context capped at 25 (`active_refinements[::-1][:25]`); `derived_count` increments only when a handler returns True (save still fires on patterns-only runs); `call_claude` selects the first `type=="text"` block with an untyped `.text` fallback; JSON salvage from prose-wrapped responses (mirrors `classify_email`); and a per-classification try/except so one bad entry no longer aborts the batch.
+
+**Known follow-up (surfaced by the review, NOT a Session 11 defect — PRE-EXISTING, not yet fixed):** when `call_claude` returns None (all API retries exhausted) or `classifications` is malformed, the learner's early `return 1` paths in `_run` skip the watermark advance, so a batch that always fails the API re-bills every tick. This predates Session 11 and is outside W9's per-example scope. Queue for a future learner session (sibling to W9/B8).
+
+**Audit status after this session:** Sessions 1, 2, 3, 4, 5, 6, 7, 10, 11 complete and committed. Still open in Part 4: Session 8 (reply understanding), 9 (daily report correctness — carries CRITICALs C9+C10), 12 (IMAP runtime safety), 13 (build/packaging hygiene), 14 (private eval corpus), 15+ (spam-improvement). **Closed criticals: C1–C8. STILL-OPEN criticals: C9, C10 (both Session 9 — now the only remaining critical-bearing session).** Plus the planned safe sender-approval feature, the M18 follow-up, and the new learner re-bill-on-API-failure follow-up above.
+
+**Next step:** Matt chooses the next session — Session 9 (C9+C10) is the only remaining critical-bearing session.
+
+## Operating rule — fix workflow (GLOBAL, NON-OPTIONAL, reaffirmed 2026-06-19)
+Every fix session follows 5 steps, never skipped or collapsed (even for "simple" changes): (1) the fix session **plans first** in PLAN mode (no code); (2) the **master session vets the plan** against the real code and approves or returns fixes; (3) the fix session **implements + tests** only after approval; (4) a **separate session on a different model reviews** the diff (PASS/FAIL gate); (5) the **master commits & pushes** only after a PASS. Steps 1–2 are the easiest to drop — do not drop them.
+
+## Session 9 — Daily report correctness (IN PROGRESS / planning, 2026-06-19)
+**Split into two focused fix sessions** (Matt's decision) because the audit's "Session 9" actually spans the report AND the filter:
+- **9A (report — `daily_report.py` + `menu_bar.py` + `EULA.md`):** C10 clean calendar-day window (08:00 boundaries) + persisted `memory/report_state.json` watermark that advances only on a successful send; C9 delete dead blacklist-folder code + fix stale EULA Step-5; B10 report health surfaced in the menu bar; SMTP retry in `send_report`; the report's `token_usage.json` made read-only.
+- **9B (filter logging & cost — `spam_filter.py`):** W10 sanitize newlines/`  ---` separator out of logged subjects (decision-log injection); B9 `decisions.log` rotation; M15 cost-math unknown-model fallback + capture/price cache tokens; retention = prune resolved/expired `pending_signals.json` conversations after 90 days.
+
+**C9 RECLASSIFIED — not a live critical:** the "blacklist folder sync" (`process_imap_blacklist_folders` / `process_filesystem_blacklist_folders`) is **dead code — zero callers** (verified 2026-06-19), so the crash/data-loss never happens. There is no blacklist folder; the only live folder is "Train MailWarden" → the learner. Action = delete + EULA fix.
+
+**Decisions locked (Matt, 2026-06-19):** report window = clean calendar day (08:00→08:00) with watermark; folder-drag scope = N/A (feature deleted); teach-conversation retention = prune resolved after 90 days.
+
+**Current state:** 9A is in flight in an Opus 4.8 window in PLAN mode (producing a plan, no code); the next step is the master vetting that plan (Rhythm step 2). 9B not started.
+
+**Status: NOT committed — planning stage.**
