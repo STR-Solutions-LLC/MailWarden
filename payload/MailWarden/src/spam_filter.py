@@ -54,6 +54,11 @@ LEARNER_LOG_PATH = PROJECT_ROOT / "logs" / "learner.log"
 PENDING_SIGNALS_PATH = PROJECT_ROOT / "memory" / "pending_signals.json"
 REFINEMENTS_LOG_PATH = PROJECT_ROOT / "memory" / "signal_refinements.log"
 TOKEN_USAGE_PATH = PROJECT_ROOT / "memory" / "token_usage.json"
+# Persistent lifetime counters that survive pruning of decisions.log and
+# pending_signals.json. When old records are pruned away, their tallies are
+# rolled up here so the Dashboard's lifetime totals (and the daily report's
+# signal-history totals) never reset to zero. There is exactly ONE such store.
+LIFETIME_STATS_PATH = PROJECT_ROOT / "memory" / "lifetime_stats.json"
 
 
 # ---------------------------------------------------------------------------
@@ -660,29 +665,6 @@ def save_token_usage(data: dict):
         raise
 
 
-# Pricing per million tokens (input, output). Update here when rates change.
-MODEL_PRICING = {
-    "claude-opus-4-5":            (5.00, 25.00),
-    "claude-opus-4-6":            (5.00, 25.00),
-    "claude-opus-4-7":            (5.00, 25.00),
-    "claude-sonnet-4-20250514":   (3.00, 15.00),
-    "claude-sonnet-4-5":          (3.00, 15.00),
-    "claude-sonnet-4-6":          (3.00, 15.00),
-    "claude-haiku-4":             (1.00,  5.00),
-    "claude-haiku-4-5":           (1.00,  5.00),
-    "claude-haiku-4-5-20251001":  (1.00,  5.00),
-}
-
-
-def get_model_pricing(model: str) -> tuple:
-    """Return (input_rate, output_rate) in $/million tokens."""
-    if model in MODEL_PRICING:
-        return MODEL_PRICING[model]
-    # Default fallback: Sonnet-like pricing
-    logging.getLogger("spam_filter").warning(f"Unknown model {model!r}; using Sonnet-rate fallback pricing")
-    return (3.00, 15.00)
-
-
 def new_token_delta() -> dict:
     """Create an empty token-usage delta accumulator (audit L5/R4/D2).
 
@@ -707,7 +689,7 @@ def new_token_delta() -> dict:
 def _delta_day(delta: dict, date_str: str) -> dict:
     return delta["by_date"].setdefault(date_str, {
         "input_tokens": 0, "output_tokens": 0, "api_calls": 0,
-        "api_calls_skipped_by_pre_classifier": 0, "estimated_cost_usd": 0.0,
+        "api_calls_skipped_by_pre_classifier": 0,
     })
 
 
@@ -719,8 +701,6 @@ def record_token_usage(usage_data: dict, input_tokens: int, output_tokens: int,
     When ``delta`` is supplied, the same increments are accumulated there for a
     later locked merge onto the file (audit L5/R4/D2)."""
     today = datetime.now().strftime("%Y-%m-%d")
-    in_rate, out_rate = get_model_pricing(model)
-    cost = (input_tokens / 1_000_000) * in_rate + (output_tokens / 1_000_000) * out_rate
 
     usage_data["lifetime_input_tokens"] += input_tokens
     usage_data["lifetime_output_tokens"] += output_tokens
@@ -737,16 +717,12 @@ def record_token_usage(usage_data: dict, input_tokens: int, output_tokens: int,
         today_record = {
             "date": today, "input_tokens": 0, "output_tokens": 0,
             "api_calls": 0, "api_calls_skipped_by_pre_classifier": 0,
-            "estimated_cost_usd": 0.0,
         }
         daily.append(today_record)
 
     today_record["input_tokens"] += input_tokens
     today_record["output_tokens"] += output_tokens
     today_record["api_calls"] += 1
-    today_record["estimated_cost_usd"] = round(
-        today_record["estimated_cost_usd"] + cost, 6
-    )
     # Ensure field exists on records created before this change
     today_record.setdefault("api_calls_skipped_by_pre_classifier", 0)
 
@@ -760,7 +736,6 @@ def record_token_usage(usage_data: dict, input_tokens: int, output_tokens: int,
         dd["input_tokens"] += input_tokens
         dd["output_tokens"] += output_tokens
         dd["api_calls"] += 1
-        dd["estimated_cost_usd"] += cost
 
 
 def record_pre_classifier_skip(usage_data: dict, delta: dict | None = None):
@@ -779,7 +754,6 @@ def record_pre_classifier_skip(usage_data: dict, delta: dict | None = None):
         today_record = {
             "date": today, "input_tokens": 0, "output_tokens": 0,
             "api_calls": 0, "api_calls_skipped_by_pre_classifier": 0,
-            "estimated_cost_usd": 0.0,
         }
         daily.append(today_record)
     today_record.setdefault("api_calls_skipped_by_pre_classifier", 0)
@@ -831,7 +805,6 @@ def persist_token_delta(usage_data: dict, delta: dict):
                 rec = {
                     "date": date_str, "input_tokens": 0, "output_tokens": 0,
                     "api_calls": 0, "api_calls_skipped_by_pre_classifier": 0,
-                    "estimated_cost_usd": 0.0,
                 }
                 daily.append(rec)
                 by_date[date_str] = rec
@@ -841,8 +814,6 @@ def persist_token_delta(usage_data: dict, delta: dict):
             rec["api_calls_skipped_by_pre_classifier"] = (
                 rec.get("api_calls_skipped_by_pre_classifier", 0)
                 + dd["api_calls_skipped_by_pre_classifier"])
-            rec["estimated_cost_usd"] = round(
-                rec.get("estimated_cost_usd", 0.0) + dd["estimated_cost_usd"], 6)
 
         save_token_usage(fresh)
 
@@ -1108,6 +1079,184 @@ def save_pending_signals(data: dict):
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
         raise
+
+
+def _default_lifetime_stats() -> dict:
+    return {
+        "version": "1.0",
+        "decisions_evaluated_lifetime": 0,
+        "decisions_spam_lifetime": 0,
+        "signals_submitted_lifetime": 0,
+        "signals_approved_lifetime": 0,
+        "signals_rejected_lifetime": 0,
+    }
+
+
+def load_lifetime_stats() -> dict:
+    """Read lifetime_stats.json, returning an all-zero default on missing/corrupt.
+
+    Callers that mutate the result must hold the LIFETIME_STATS_PATH lock across
+    the read-modify-write (the prune helpers do)."""
+    try:
+        with open(LIFETIME_STATS_PATH, "r") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return _default_lifetime_stats()
+    # Backfill any field a future/older file might be missing.
+    base = _default_lifetime_stats()
+    for k, v in base.items():
+        data.setdefault(k, v)
+    return data
+
+
+def save_lifetime_stats(stats: dict):
+    fd, tmp_path = tempfile.mkstemp(dir=LIFETIME_STATS_PATH.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(stats, f, indent=2)
+        os.replace(tmp_path, LIFETIME_STATS_PATH)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+def prune_decisions_log(max_age_days: int = 90):
+    """Prune decisions.log records older than max_age_days, rolling the dropped
+    counts into lifetime_stats.json so the Dashboard's lifetime totals don't
+    reset (audit Session 9B, B9).
+
+    Gates (cheap → expensive):
+      - skip if the log is below a 100 KB size floor (tiny logs aren't worth it);
+      - skip if a '.decisions_prune_ts' sidecar shows we pruned in the last 24h.
+
+    Each record's timestamp is parsed with the same regex the readers use; a
+    record whose timestamp cannot be parsed is KEPT (never silently dropped).
+    If nothing is old enough to drop we touch the sidecar and return without
+    rewriting. The rewrite is atomic (tmp + os.replace)."""
+    sidecar = DECISIONS_LOG_PATH.with_suffix(
+        DECISIONS_LOG_PATH.suffix + ".decisions_prune_ts")
+    with file_lock.locked(DECISIONS_LOG_PATH, LIFETIME_STATS_PATH):
+        if not DECISIONS_LOG_PATH.exists():
+            return
+        try:
+            if DECISIONS_LOG_PATH.stat().st_size < 100 * 1024:
+                return
+        except OSError:
+            return
+
+        # 24h sidecar gate.
+        now = datetime.now()
+        try:
+            last_prune = datetime.fromtimestamp(sidecar.stat().st_mtime)
+            if (now - last_prune) < timedelta(hours=24):
+                return
+        except OSError:
+            pass  # No sidecar yet → proceed.
+
+        try:
+            content = DECISIONS_LOG_PATH.read_text(
+                encoding="utf-8", errors="replace")
+        except OSError:
+            return
+
+        cutoff = now - timedelta(days=max_age_days)
+        ts_re = re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]')
+        spam_re = re.compile(r'\bDECISION: SPAM\b')
+
+        kept_records = []
+        dropped_count = 0
+        dropped_spam = 0
+        for record in content.split("  ---\n"):
+            if not record.strip():
+                continue
+            m = ts_re.search(record)
+            ts = None
+            if m:
+                try:
+                    ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    ts = None
+            # Drop only records with a parseable, sufficiently-old timestamp.
+            if ts is not None and ts < cutoff:
+                dropped_count += 1
+                if spam_re.search(record):
+                    dropped_spam += 1
+            else:
+                kept_records.append(record)
+
+        if dropped_count == 0:
+            # Nothing to prune; just stamp the sidecar so we don't re-scan for 24h.
+            sidecar.write_text(now.isoformat())
+            return
+
+        # Roll the dropped tallies into the persistent lifetime store.
+        stats = load_lifetime_stats()
+        stats["decisions_evaluated_lifetime"] += dropped_count
+        stats["decisions_spam_lifetime"] += dropped_spam
+
+        # Atomic rewrite of the surviving records, preserving the '  ---\n'
+        # record terminator each record had before the split.
+        new_content = "".join(rec + "  ---\n" for rec in kept_records)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=DECISIONS_LOG_PATH.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(new_content)
+            os.replace(tmp_path, DECISIONS_LOG_PATH)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
+
+        save_lifetime_stats(stats)
+        sidecar.write_text(now.isoformat())
+
+
+def prune_pending_signals(max_age_days: int = 90):
+    """Prune resolved/expired pending conversations older than max_age_days,
+    rolling their tallies into lifetime_stats.json (audit Session 9B retention).
+
+    Keep rules:
+      - ALWAYS keep conversations still 'awaiting_reply' (they're live);
+      - otherwise keep if 'created' is within max_age_days;
+      - a missing or unparseable 'created' field → KEEP (never silently drop).
+
+    If nothing is dropped we return without writing. The save is atomic."""
+    with file_lock.locked(PENDING_SIGNALS_PATH, LIFETIME_STATS_PATH):
+        pending = load_pending_signals()
+        cutoff = datetime.now() - timedelta(days=max_age_days)
+
+        survivors = []
+        dropped = []
+        for conv in pending.get("conversations", []):
+            if conv.get("status") == "awaiting_reply":
+                survivors.append(conv)
+                continue
+            created = conv.get("created", "")
+            try:
+                created_dt = datetime.fromisoformat(created)
+            except (TypeError, ValueError):
+                survivors.append(conv)  # missing/unparseable → keep
+                continue
+            if created_dt >= cutoff:
+                survivors.append(conv)
+            else:
+                dropped.append(conv)
+
+        if not dropped:
+            return
+
+        stats = load_lifetime_stats()
+        stats["signals_submitted_lifetime"] += len(dropped)
+        stats["signals_approved_lifetime"] += sum(
+            1 for c in dropped if c.get("resolution") == "approved")
+        stats["signals_rejected_lifetime"] += sum(
+            1 for c in dropped if c.get("resolution") == "rejected")
+
+        pending["conversations"] = survivors
+        save_pending_signals(pending)
+        save_lifetime_stats(stats)
 
 
 def persist_pending_merge(pending: dict):
@@ -2875,6 +3024,19 @@ def _sanitize_for_delimiter(text: str) -> str:
     return text
 
 
+def _sanitize_decision_log_field(text) -> str:
+    """Sanitize a field value before writing to the decision log.
+
+    Strips newlines (which would break the line-oriented record format) and
+    neutralizes the literal '  ---' record separator so attacker-controlled
+    field values (subject, display name, etc.) cannot forge a second record
+    (audit Session 9B, W10)."""
+    text = str(text)
+    text = text.replace('\n', ' ').replace('\r', ' ')
+    text = text.replace('  ---', '  ___')
+    return text
+
+
 def _format_authentication_block(auth: dict, msg_data: dict) -> str:
     """Render the SERVER-VERIFIED authentication summary (F3) for the classifier.
 
@@ -3968,11 +4130,21 @@ def log_decision(account_name: str, msg_data: dict, result: dict,
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     signals = ", ".join(result.get("signals_hit", []))
 
+    # Sanitize every attacker-controlled value (account name + the four
+    # sender/message fields) before formatting them into the line-oriented
+    # record, so a newline or '  ---' in any of them cannot forge a record
+    # (audit Session 9B, W10).
+    s_account = _sanitize_decision_log_field(account_name)
+    s_message_id = _sanitize_decision_log_field(msg_data['message_id'])
+    s_from_name = _sanitize_decision_log_field(msg_data['from_display_name'])
+    s_from_email = _sanitize_decision_log_field(msg_data['from_email'])
+    s_subject = _sanitize_decision_log_field(msg_data['subject'])
+
     entry = (
-        f"[{now}] ACCOUNT: {account_name}\n"
-        f"  MESSAGE-ID: {msg_data['message_id']}\n"
-        f"  FROM: {msg_data['from_display_name']} <{msg_data['from_email']}>\n"
-        f"  SUBJECT: {msg_data['subject']}\n"
+        f"[{now}] ACCOUNT: {s_account}\n"
+        f"  MESSAGE-ID: {s_message_id}\n"
+        f"  FROM: {s_from_name} <{s_from_email}>\n"
+        f"  SUBJECT: {s_subject}\n"
         f"  DECISION: {result['decision']} (confidence: {result['confidence']:.2f})\n"
         f"  SIGNALS HIT: {signals}\n"
         f"  ACTION: {action}\n"
@@ -4269,6 +4441,25 @@ def run_filter(force: bool = False):
     # The FILE is only ever updated via this delta (locked re-read-merge), so the
     # learner / daily report token writes are never lost (B7/L5/R4/D2).
     token_delta = new_token_delta()
+
+    # Retention pruning (audit Session 9B). Both are heavily gated (size floor /
+    # 24h sidecar for decisions.log; only drops resolved/expired conversations
+    # past the age cutoff for pending_signals) and roll any dropped tallies into
+    # the persistent lifetime_stats.json, so lifetime totals never reset. Run at
+    # every filter startup, not only at daily-report time. Best-effort: a prune
+    # failure must never block a filter run.
+    try:
+        prune_decisions_log()
+    except Exception as e:
+        logger.warning(f"prune_decisions_log skipped: {e}")
+    try:
+        prune_pending_signals()
+    except Exception as e:
+        logger.warning(f"prune_pending_signals skipped: {e}")
+
+    # Load the in-memory pending snapshot AFTER pruning, so the prune's on-disk
+    # deletions aren't resurrected by a stale snapshot when persist_pending_merge
+    # later merges this dict back onto the file (audit Session 9B fix).
     pending = load_pending_signals()
     # NOTE: the classifier prompt is now built PER ACCOUNT inside the loop below
     # (P1 per-account scoping), not once here.

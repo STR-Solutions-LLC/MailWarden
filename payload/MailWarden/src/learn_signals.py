@@ -1027,20 +1027,6 @@ def _record_learner_tokens(input_tokens: int, output_tokens: int,
     the two processes may write concurrently so we need the same atomic
     rename pattern here.
     """
-    # Minimal pricing table — keep in sync with spam_filter.MODEL_PRICING
-    _PRICING = {
-        "claude-opus-4-5":           (5.00, 25.00),
-        "claude-opus-4-6":           (5.00, 25.00),
-        "claude-opus-4-7":           (5.00, 25.00),
-        "claude-sonnet-4-20250514":  (3.00, 15.00),
-        "claude-sonnet-4-5":         (3.00, 15.00),
-        "claude-sonnet-4-6":         (3.00, 15.00),
-        "claude-haiku-4":            (1.00,  5.00),
-        "claude-haiku-4-5":          (1.00,  5.00),
-        "claude-haiku-4-5-20251001": (1.00,  5.00),
-    }
-    in_rate, out_rate = _PRICING.get(model, (3.00, 15.00))
-    cost = (input_tokens / 1_000_000) * in_rate + (output_tokens / 1_000_000) * out_rate
     today = datetime.now().strftime("%Y-%m-%d")
 
     try:
@@ -1072,16 +1058,12 @@ def _record_learner_tokens(input_tokens: int, output_tokens: int,
                 today_record = {
                     "date": today, "input_tokens": 0, "output_tokens": 0,
                     "api_calls": 0, "api_calls_skipped_by_pre_classifier": 0,
-                    "estimated_cost_usd": 0.0,
                 }
                 daily.append(today_record)
 
             today_record["input_tokens"] += input_tokens
             today_record["output_tokens"] += output_tokens
             today_record["api_calls"] += 1
-            today_record["estimated_cost_usd"] = round(
-                today_record["estimated_cost_usd"] + cost, 6
-            )
             today_record.setdefault("api_calls_skipped_by_pre_classifier", 0)
             usage_data["daily_records"] = daily
             usage_data["last_updated"] = datetime.now().isoformat()

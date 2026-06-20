@@ -5110,6 +5110,28 @@ def _fmt_age(sec: float) -> str:
     return f"{m // 60}h {m % 60}m"
 
 
+def _load_lifetime_stats() -> dict:
+    """Read lifetime_stats.json, returning an all-zero default on missing/corrupt
+    (audit Session 9B). Holds the tallies of decisions.log records that have been
+    pruned away, so the Dashboard's lifetime counts don't reset on prune."""
+    default = {
+        "version": "1.0",
+        "decisions_evaluated_lifetime": 0,
+        "decisions_spam_lifetime": 0,
+        "signals_submitted_lifetime": 0,
+        "signals_approved_lifetime": 0,
+        "signals_rejected_lifetime": 0,
+    }
+    try:
+        with paths.LIFETIME_STATS_PATH.open(encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return default
+    for k, v in default.items():
+        data.setdefault(k, v)
+    return data
+
+
 def _decision_counts() -> tuple[int, int, int]:
     """Return (today, this_week, lifetime) evaluated-email counts from decisions.log.
 
@@ -5148,6 +5170,10 @@ def _decision_counts() -> tuple[int, int, int]:
             today_n += 1
         if d >= week_start:
             week_n += 1
+    # Add the persistent counter for records that have been pruned from the
+    # live log (audit Session 9B, B9) so the lifetime total never resets.
+    life = _load_lifetime_stats()
+    life_n += life["decisions_evaluated_lifetime"]
     return today_n, week_n, life_n
 
 
@@ -5230,6 +5256,10 @@ def _spam_killed_counts() -> tuple[int, int]:
         life_n += 1
         if d == today:
             today_n += 1
+    # Add the persistent counter for SPAM records that have been pruned from the
+    # live log (audit Session 9B, B9) so the lifetime spam total never resets.
+    life = _load_lifetime_stats()
+    life_n += life["decisions_spam_lifetime"]
     return today_n, life_n
 
 

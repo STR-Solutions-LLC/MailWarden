@@ -27,6 +27,10 @@ BLACKLIST_PATH = MEMORY_DIR / "blacklist.json"
 PROCESSED_IDS_PATH = MEMORY_DIR / "processed_ids.json"
 TOKEN_USAGE_PATH = MEMORY_DIR / "token_usage.json"
 REPORT_STATE_PATH = MEMORY_DIR / "report_state.json"
+# Persistent lifetime counters that survive pruning of decisions.log and
+# pending_signals.json. The Dashboard adds these to its live decisions-log
+# counts so the lifetime totals never reset when old records are pruned.
+LIFETIME_STATS_PATH = MEMORY_DIR / "lifetime_stats.json"
 PENDING_SIGNALS_PATH = MEMORY_DIR / "pending_signals.json"
 EULA_SENT_PATH = MEMORY_DIR / "eula_sent.json"
 UPDATE_CHECK_PATH = MEMORY_DIR / "update_check.json"

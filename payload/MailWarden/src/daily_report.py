@@ -35,6 +35,10 @@ TOKEN_USAGE_PATH = PROJECT_ROOT / "memory" / "token_usage.json"
 REPORT_STATE_PATH = PROJECT_ROOT / "memory" / "report_state.json"
 REPORT_BOUNDARY_HOUR = 8  # local clock hour the report "day" rolls over
 PENDING_SIGNALS_PATH = PROJECT_ROOT / "memory" / "pending_signals.json"
+# Persistent lifetime counters that survive pruning of decisions.log and
+# pending_signals.json (written by spam_filter's prune helpers). The report
+# adds these to its per-run signal-history totals so they never reset.
+LIFETIME_STATS_PATH = PROJECT_ROOT / "memory" / "lifetime_stats.json"
 # The learner now stores its scan watermark here (audit L3) instead of in
 # config.json; the report reads it for the "Last ran" line, falling back to the
 # legacy config value for installs that predate the change.
@@ -494,6 +498,29 @@ def build_api_usage_section(config: dict) -> list:
     return lines
 
 
+def _load_lifetime_stats() -> dict:
+    """Read lifetime_stats.json, returning an all-zero default on missing/corrupt
+    (audit Session 9B). These counters carry the tallies of pending-signal
+    conversations that have been pruned away, so the report's signal-history
+    totals don't reset when old conversations are retired."""
+    default = {
+        "version": "1.0",
+        "decisions_evaluated_lifetime": 0,
+        "decisions_spam_lifetime": 0,
+        "signals_submitted_lifetime": 0,
+        "signals_approved_lifetime": 0,
+        "signals_rejected_lifetime": 0,
+    }
+    try:
+        with open(LIFETIME_STATS_PATH, "r") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+    for k, v in default.items():
+        data.setdefault(k, v)
+    return data
+
+
 def load_pending_signals() -> dict:
     try:
         with open(PENDING_SIGNALS_PATH, "r") as f:
@@ -521,8 +548,11 @@ def expire_pending_signals(logger: logging.Logger) -> dict:
     result = {"expired": [], "active": []}
     # Locked read-modify-write of pending_signals.json so a concurrent learner
     # append or filter resolution isn't clobbered by this expiry pass (T5/C7).
-    with file_lock.locked(PENDING_SIGNALS_PATH):
+    # Also lock lifetime_stats.json: it's read here for the totals and the
+    # filter's prune helpers write it under the same pair (audit Session 9B).
+    with file_lock.locked(PENDING_SIGNALS_PATH, LIFETIME_STATS_PATH):
         pending = load_pending_signals()
+        lifetime = _load_lifetime_stats()
         changed = False
 
         for conv in pending.get("conversations", []):
@@ -539,11 +569,18 @@ def expire_pending_signals(logger: logging.Logger) -> dict:
         if changed:
             save_pending_signals(pending)
 
-    # Gather lifetime stats
+    # Gather lifetime stats. The per-run scalars count the conversations still
+    # ON DISK; the persistent lifetime counters add back the conversations that
+    # have since been pruned away, so the totals never regress (audit Session 9B).
     all_convs = pending.get("conversations", [])
-    result["total_submitted"] = len(all_convs)
-    result["total_approved"] = sum(1 for c in all_convs if c.get("resolution") == "approved")
-    result["total_rejected"] = sum(1 for c in all_convs if c.get("resolution") == "rejected")
+    result["total_submitted"] = (
+        len(all_convs) + lifetime["signals_submitted_lifetime"])
+    result["total_approved"] = (
+        sum(1 for c in all_convs if c.get("resolution") == "approved")
+        + lifetime["signals_approved_lifetime"])
+    result["total_rejected"] = (
+        sum(1 for c in all_convs if c.get("resolution") == "rejected")
+        + lifetime["signals_rejected_lifetime"])
     result["total_pending"] = len(result["active"])
 
     return result
