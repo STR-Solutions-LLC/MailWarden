@@ -33,6 +33,7 @@ from utils import (
     check_header_signals, _extract_sending_ip,
     summarize_authentication, host_spam_verdict,
     random_token, select_trusted_auth_results,
+    clear_dnsbl_cache,
 )
 from learn_signals import save_signals
 
@@ -152,7 +153,10 @@ def load_last_filter_run() -> datetime | None:
     try:
         with open(LAST_FILTER_RUN_PATH, "r") as f:
             data = json.load(f)
-        return datetime.fromisoformat(data["last_run"])
+        dt = datetime.fromisoformat(data["last_run"])
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError):
         return None
 
@@ -166,7 +170,7 @@ def save_last_filter_run(when: datetime) -> None:
     )
     try:
         with os.fdopen(fd, "w") as f:
-            json.dump({"last_run": when.isoformat()}, f, indent=2)
+            json.dump({"last_run": when.astimezone(timezone.utc).isoformat()}, f, indent=2)
         os.replace(tmp_path, LAST_FILTER_RUN_PATH)
     except Exception:
         if os.path.exists(tmp_path):
@@ -3776,7 +3780,7 @@ def classify_eml_offline(raw_email: bytes, signals: dict, *,
                          "classify (set $ANTHROPIC_API_KEY or configure the app).")
         return out
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = anthropic.Anthropic(api_key=api_key, timeout=60.0, max_retries=4)
     result, api_response = classify_email(
         client, system_prompt, msg_data, model, max_tokens, logger,
     )
@@ -3820,7 +3824,7 @@ def classify_eml_offline(raw_email: bytes, signals: dict, *,
 
 def connect_imap(account: dict, logger: logging.Logger) -> imaplib.IMAP4_SSL:
     """Connect to IMAP server and authenticate."""
-    conn = imaplib.IMAP4_SSL(account["imap_host"], account["imap_port"])
+    conn = imaplib.IMAP4_SSL(account["imap_host"], account["imap_port"], timeout=15.0)
     conn.login(account["username"], account["password"])
     return conn
 
@@ -4023,7 +4027,11 @@ def scan_train_folder(conn: imaplib.IMAP4_SSL, account: dict, config: dict,
                 # Message-ID dedup prevents a duplicate .eml save.
                 try:
                     conn.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
-                    conn.expunge()
+                    try:
+                        conn.uid("EXPUNGE", uid)
+                    except Exception:
+                        logger.warning(f"[TRAIN] UID EXPUNGE not supported for UID {uid}, falling back")
+                        conn.expunge()
                     logger.info(
                         f"  [TRAIN] Deleted {subject!r} from Train folder "
                         f"after learner trigger")
@@ -4140,7 +4148,10 @@ def move_to_junk(conn: imaplib.IMAP4_SSL, uid: bytes, junk_folder: str,
         logger.error(f"Failed to copy UID {uid} to {junk_folder}")
         return False
 
-    conn.uid("STORE", uid, "+FLAGS", "\\Deleted")
+    store_status, _ = conn.uid("STORE", uid, "+FLAGS", "\\Deleted")
+    if store_status != "OK":
+        logger.error(f"[JUNK] STORE \\Deleted failed for UID {uid} after COPY to {junk_folder}")
+        return False
     # Use UID EXPUNGE if available (UIDPLUS extension) to avoid
     # expunging other messages flagged as deleted by other clients
     try:
@@ -4200,7 +4211,11 @@ def execute_spam_action(conn: imaplib.IMAP4_SSL, uid: bytes, account: dict,
     if spam_action == "delete":
         try:
             conn.uid("STORE", uid, "+FLAGS", "\\Deleted")
-            conn.expunge()
+            try:
+                conn.uid("EXPUNGE", uid)
+            except Exception:
+                logger.warning(f"[DELETE] UID EXPUNGE not supported for UID {uid}, falling back")
+                conn.expunge()
             return "[DELETED] (spam_action=delete)"
         except Exception as e:
             logger.error(f"  [DELETE] EXPUNGE failed: {e}")
@@ -4494,13 +4509,17 @@ def run_filter(force: bool = False):
     global _learner_triggered_this_tick
     _learner_triggered_this_tick = False
 
+    # B11: clear the per-run DNSBL cache so a fresh run re-queries blocklists
+    # (results are cached only within a single run to dedupe repeated IPs).
+    clear_dnsbl_cache()
+
     # Interval gate (scheduled runs only). The plist wakes us every 5 min as
     # a floor; the user's actual cadence (filter.interval_minutes) is enforced
     # here, before any IMAP login or API call. Only an actual run updates the
     # last-run timestamp, so skipped wakes don't reset the clock.
     if not force:
         interval_minutes = config.get("filter", {}).get("interval_minutes", 15)
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         last_run = load_last_filter_run()
         if last_run is not None:
             elapsed_min = (now - last_run).total_seconds() / 60.0
@@ -4576,7 +4595,7 @@ def run_filter(force: bool = False):
     # (P1 per-account scoping), not once here.
 
     api_config = config.get("anthropic", {})
-    client = anthropic.Anthropic(api_key=api_config.get("api_key", ""))
+    client = anthropic.Anthropic(api_key=api_config.get("api_key", ""), timeout=60.0, max_retries=4)
     model = api_config.get("model", "claude-haiku-4-5-20251001")
     max_tokens = api_config.get("max_tokens", 500)
 
@@ -4590,6 +4609,7 @@ def run_filter(force: bool = False):
             continue
 
         account_name = account.get("name", "Unknown")
+        account_key = account.get("username") or account_name
         logger.info(f"Processing account: {account_name}")
         accounts_checked += 1
 
@@ -4609,11 +4629,17 @@ def run_filter(force: bool = False):
         # account's username (email); rules with no scope are treated as "all".
         system_prompt = build_classifier_prompt(signals, account.get("username", ""))
 
-        # Ensure account has an entry in processed_ids
-        if account_name not in processed["ids"]:
-            processed["ids"][account_name] = []
+        # One-time migration: rename display-name bucket to username key
+        old_name = account.get("name", "Unknown")
+        if account_key != old_name and old_name in processed["ids"] and account_key not in processed["ids"]:
+            processed["ids"][account_key] = processed["ids"].pop(old_name)
+            # persist_progress at ~6463 will flush this
 
-        account_processed = {e[0] for e in processed["ids"][account_name]}
+        # Ensure account has an entry in processed_ids
+        if account_key not in processed["ids"]:
+            processed["ids"][account_key] = []
+
+        account_processed = {e[0] for e in processed["ids"][account_key]}
 
         try:
             conn = connect_imap(account, logger)
@@ -4667,7 +4693,7 @@ def run_filter(force: bool = False):
 
                     # Generate synthetic ID for emails without Message-ID
                     if not msg_id:
-                        raw_key = f"{uid}:{msg_data.get('from_email','')}:{msg_data.get('subject','')}"
+                        raw_key = f"{msg_data.get('from_email','')}:{msg_data.get('subject','')}"
                         msg_id = f"<synthetic-{hashlib.sha256(raw_key.encode()).hexdigest()[:16]}>"
                         msg_data["message_id"] = msg_id
 
@@ -4697,7 +4723,7 @@ def run_filter(force: bool = False):
                             f"(X-MailWarden-System: 1): {msg_data.get('subject','')[:60]}"
                         )
                         mark_uid_seen(conn, uid, logger)
-                        _record_processed(processed, account_name,
+                        _record_processed(processed, account_key,
                                           account_processed, msg_id)
                         continue
 
@@ -4758,16 +4784,20 @@ def run_filter(force: bool = False):
                         # skip it); the 5550 recording is guarded against a
                         # double-append of the same msg_id.
                         mark_uid_seen(conn, uid, logger)
-                        _record_processed(processed, account_name,
+                        _record_processed(processed, account_key,
                                           account_processed, msg_id)
                         command = None
 
-                    if command:
-                        # Mark the message \\Seen so a subsequent filter run
-                        # (or a processed_ids reset) doesn't re-fire the same
-                        # command handler and spam the user with duplicate
-                        # confirmations or proposals.
+                    # W4: a command handler is only finalized (marked \\Seen +
+                    # recorded in processed_ids) AFTER it has run to completion.
+                    # Each handler's success exit point calls _finalize_command()
+                    # right before its `continue`. If a handler raises mid-way,
+                    # the message is left UNSEEN and unrecorded, so the next tick
+                    # retries it instead of silently dropping the command.
+                    def _finalize_command():
                         mark_uid_seen(conn, uid, logger)
+                        _record_processed(processed, account_key,
+                                          account_processed, msg_id)
 
                     # --- Command: Remove from Blacklist ---
                     if command == "Remove from Blacklist":
@@ -4857,8 +4887,7 @@ def run_filter(force: bool = False):
                                     to_addr=account.get("username", ""),
                                 )
 
-                        _record_processed(processed, account_name,
-                                          account_processed, msg_id)
+                        _finalize_command()
                         total_evaluated += 1
                         continue
 
@@ -5020,8 +5049,7 @@ Conversation ID: {sfid}
                             logger.error(f"  False positive analysis failed: {e}")
 
                         # Mark as processed regardless
-                        _record_processed(processed, account_name,
-                                          account_processed, msg_id)
+                        _finalize_command()
                         total_evaluated += 1
                         continue
 
@@ -5082,8 +5110,7 @@ Conversation ID: {sfid}
                             logger,
                             to_addr=account.get("username", ""),
                         )
-                        _record_processed(processed, account_name,
-                                          account_processed, msg_id)
+                        _finalize_command()
                         total_evaluated += 1
                         continue
 
@@ -5144,8 +5171,7 @@ Conversation ID: {sfid}
                             logger,
                             to_addr=account.get("username", ""),
                         )
-                        _record_processed(processed, account_name,
-                                          account_processed, msg_id)
+                        _finalize_command()
                         total_evaluated += 1
                         continue
 
@@ -5185,8 +5211,7 @@ Conversation ID: {sfid}
                                     "  [WHITELIST] No forward structure found and no address — "
                                     "skipping silently (no reply sent) to prevent loop"
                                 )
-                                _record_processed(processed, account_name,
-                                                  account_processed, msg_id)
+                                _finalize_command()
                                 total_evaluated += 1
                                 continue
                             # TODO: final copy pending PM approval
@@ -5241,8 +5266,7 @@ Conversation ID: {sfid}
                                        msg_out + _wl_conflict_note, logger,
                                        to_addr=account.get("username", ""))
 
-                        _record_processed(processed, account_name,
-                                          account_processed, msg_id)
+                        _finalize_command()
                         total_evaluated += 1
                         continue
 
@@ -5281,8 +5305,7 @@ Conversation ID: {sfid}
                                     "  [WHITELIST DOMAIN] No forward structure found — "
                                     "skipping silently to prevent loop"
                                 )
-                                _record_processed(processed, account_name,
-                                                  account_processed, msg_id)
+                                _finalize_command()
                                 total_evaluated += 1
                                 continue
                             # TODO: final copy pending PM approval
@@ -5333,8 +5356,7 @@ Conversation ID: {sfid}
                                        msg_out + _wld_conflict_note, logger,
                                        to_addr=account.get("username", ""))
 
-                        _record_processed(processed, account_name,
-                                          account_processed, msg_id)
+                        _finalize_command()
                         total_evaluated += 1
                         continue
 
@@ -5375,8 +5397,7 @@ Conversation ID: {sfid}
                                 logger,
                                 to_addr=account.get("username", ""),
                             )
-                            _record_processed(processed, account_name,
-                                              account_processed, msg_id)
+                            _finalize_command()
                             total_evaluated += 1
                             continue
                         if _spam["address"]:
@@ -5405,8 +5426,7 @@ Conversation ID: {sfid}
                                     "  [BLACKLIST ALL] No forward structure found — "
                                     "skipping silently to prevent loop"
                                 )
-                                _record_processed(processed, account_name,
-                                                  account_processed, msg_id)
+                                _finalize_command()
                                 total_evaluated += 1
                                 continue
                             # TODO: final copy pending PM approval
@@ -5423,8 +5443,7 @@ Conversation ID: {sfid}
                                 logger,
                                 to_addr=account.get("username", ""),
                             )
-                            _record_processed(processed, account_name,
-                                              account_processed, msg_id)
+                            _finalize_command()
                             total_evaluated += 1
                             continue
 
@@ -5493,8 +5512,7 @@ Conversation ID: {sfid}
                         )
                         logger.info(f"  [BLACKLIST ALL] addr_added={addr_added} name_added={name_added} skipped={skipped_name}")
 
-                        _record_processed(processed, account_name,
-                                          account_processed, msg_id)
+                        _finalize_command()
                         total_evaluated += 1
                         continue
 
@@ -5528,8 +5546,7 @@ Conversation ID: {sfid}
                                 logger,
                                 to_addr=account.get("username", ""),
                             )
-                            _record_processed(processed, account_name,
-                                              account_processed, msg_id)
+                            _finalize_command()
                             total_evaluated += 1
                             continue
                         if _spam["address"]:
@@ -5550,8 +5567,7 @@ Conversation ID: {sfid}
                                     "  [BLACKLIST ADDRESS] No forward structure found — "
                                     "skipping silently to prevent loop"
                                 )
-                                _record_processed(processed, account_name,
-                                                  account_processed, msg_id)
+                                _finalize_command()
                                 total_evaluated += 1
                                 continue
                             # TODO: final copy pending PM approval
@@ -5592,8 +5608,7 @@ Conversation ID: {sfid}
                                        logger,
                                        to_addr=account.get("username", ""))
 
-                        _record_processed(processed, account_name,
-                                          account_processed, msg_id)
+                        _finalize_command()
                         total_evaluated += 1
                         continue
 
@@ -5630,8 +5645,7 @@ Conversation ID: {sfid}
                                 logger,
                                 to_addr=account.get("username", ""),
                             )
-                            _record_processed(processed, account_name,
-                                              account_processed, msg_id)
+                            _finalize_command()
                             total_evaluated += 1
                             continue
                         if _spam["name"]:
@@ -5664,8 +5678,7 @@ Conversation ID: {sfid}
                                     "  [BLACKLIST NAME] No forward structure found — "
                                     "skipping silently to prevent loop"
                                 )
-                                _record_processed(processed, account_name,
-                                                  account_processed, msg_id)
+                                _finalize_command()
                                 total_evaluated += 1
                                 continue
                             # TODO: final copy pending PM approval
@@ -5718,8 +5731,7 @@ Conversation ID: {sfid}
                                        logger,
                                        to_addr=account.get("username", ""))
 
-                        _record_processed(processed, account_name,
-                                          account_processed, msg_id)
+                        _finalize_command()
                         total_evaluated += 1
                         continue
 
@@ -5753,8 +5765,7 @@ Conversation ID: {sfid}
                                 logger,
                                 to_addr=account.get("username", ""),
                             )
-                            _record_processed(processed, account_name,
-                                              account_processed, msg_id)
+                            _finalize_command()
                             total_evaluated += 1
                             continue
                         # Rewrite original_from to the resolved non-owner sender so
@@ -5807,8 +5818,7 @@ Conversation ID: {sfid}
                                    msg_out + _owner_skip_note_txt + _se_conflict_note,
                                    logger,
                                    to_addr=account.get("username", ""))
-                        _record_processed(processed, account_name,
-                                          account_processed, msg_id)
+                        _finalize_command()
                         total_evaluated += 1
                         continue
 
@@ -5856,7 +5866,7 @@ Conversation ID: {sfid}
                         # notice. The message still flows to classification; the
                         # 5550 recording is guarded against a double-append.
                         mark_uid_seen(conn, uid, logger)
-                        _record_processed(processed, account_name,
+                        _record_processed(processed, account_key,
                                           account_processed, msg_id)
                         sfid_match = None
                     if sfid_match:
@@ -5880,7 +5890,7 @@ Conversation ID: {sfid}
                         )
                         if is_our_own_email:
                             logger.debug(f"  Skipping own SFID email: {sfid}")
-                            _record_processed(processed, account_name,
+                            _record_processed(processed, account_key,
                                               account_processed, msg_id)
                             continue
 
@@ -5905,7 +5915,7 @@ Conversation ID: {sfid}
                                 resolved_body,
                                 logger,
                                 to_addr=account.get("username", ""))
-                            _record_processed(processed, account_name,
+                            _record_processed(processed, account_key,
                                               account_processed, msg_id)
                             total_evaluated += 1
                             continue
@@ -5920,7 +5930,7 @@ Conversation ID: {sfid}
                                 f"To revisit, forward the original email again with 'Fwd: False Positive' subject.",
                                 logger,
                                 to_addr=account.get("username", ""))
-                            _record_processed(processed, account_name,
+                            _record_processed(processed, account_key,
                                               account_processed, msg_id)
                             total_evaluated += 1
                             continue
@@ -5970,7 +5980,7 @@ Conversation ID: {sfid}
                                 f"[{sfid}] Revised refinement — {ref.get('headline', '')[:60]}",
                                 revised_body, logger,
                                 to_addr=account.get("username", ""))
-                            _record_processed(processed, account_name,
+                            _record_processed(processed, account_key,
                                               account_processed, msg_id)
                             total_evaluated += 1
                             continue
@@ -6003,7 +6013,7 @@ Conversation ID: {sfid}
                                 f"[{sfid}] Revised refinement — {ref.get('headline', '')[:60]}",
                                 revised_body, logger,
                                 to_addr=account.get("username", ""))
-                            _record_processed(processed, account_name,
+                            _record_processed(processed, account_key,
                                               account_processed, msg_id)
                             total_evaluated += 1
                             continue
@@ -6196,7 +6206,7 @@ USER'S FOLLOW-UP:
                             except Exception as e:
                                 logger.error(f"  Follow-up API call failed: {e}")
 
-                        _record_processed(processed, account_name,
+                        _record_processed(processed, account_key,
                                           account_processed, msg_id)
                         total_evaluated += 1
                         continue
@@ -6212,7 +6222,7 @@ USER'S FOLLOW-UP:
                         wl_result = {"decision": "WHITELISTED", "confidence": 0.0, "signals_hit": []}
                         action = f"No action taken — passed through (matched: {wl_addr_match})"
                         log_decision(account_name, msg_data, wl_result, action)
-                        _record_processed(processed, account_name,
+                        _record_processed(processed, account_key,
                                           account_processed, msg_id)
                         total_evaluated += 1
                         continue
@@ -6242,7 +6252,7 @@ USER'S FOLLOW-UP:
                             if "FAILED" in action or "DELETE FAILED" in action:
                                 total_errors += 1
                         log_decision(account_name, msg_data, bl_result, action)
-                        _record_processed(processed, account_name,
+                        _record_processed(processed, account_key,
                                           account_processed, msg_id)
                         total_evaluated += 1
                         continue
@@ -6282,7 +6292,7 @@ USER'S FOLLOW-UP:
                                 action = action + " (subject-keyword)"
                         log_decision(account_name, msg_data, kw_result, action)
                         record_pre_classifier_skip(token_usage, delta=token_delta)
-                        _record_processed(processed, account_name,
+                        _record_processed(processed, account_key,
                                           account_processed, msg_id)
                         total_evaluated += 1
                         continue
@@ -6297,7 +6307,7 @@ USER'S FOLLOW-UP:
                         wl_result = {"decision": "WHITELISTED", "confidence": 0.0, "signals_hit": []}
                         action = f"No action taken — passed through (matched: {wl_match})"
                         log_decision(account_name, msg_data, wl_result, action)
-                        _record_processed(processed, account_name,
+                        _record_processed(processed, account_key,
                                           account_processed, msg_id)
                         total_evaluated += 1
                         continue
@@ -6350,7 +6360,7 @@ USER'S FOLLOW-UP:
                             action = action + " (pre-classifier)"
                         log_decision(account_name, msg_data, pre_decision, action)
                         record_pre_classifier_skip(token_usage, delta=token_delta)
-                        _record_processed(processed, account_name,
+                        _record_processed(processed, account_key,
                                           account_processed, msg_id)
                         total_evaluated += 1
                         continue
@@ -6440,7 +6450,7 @@ USER'S FOLLOW-UP:
                     # dry-run cache_this gate; _record_processed is idempotent
                     # (no-op if msg_id already recorded for this account).
                     if cache_this:
-                        _record_processed(processed, account_name,
+                        _record_processed(processed, account_key,
                                           account_processed, msg_id)
 
                 # Break out of folder loop if max reached

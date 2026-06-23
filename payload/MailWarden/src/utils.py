@@ -14,6 +14,13 @@ import secrets
 import smtplib
 
 
+_dnsbl_cache: dict = {}
+
+
+def clear_dnsbl_cache() -> None:
+    _dnsbl_cache.clear()
+
+
 def random_token(nbytes: int = 6) -> str:
     """Cryptographically random hex token (default 12 hex chars / 48 bits)."""
     return secrets.token_hex(nbytes)
@@ -458,12 +465,32 @@ def _extract_sending_ip(received_headers, own_hosts=None) -> str:
     return None
 
 
+def _dnsbl_lookup_one(bl: str, reversed_ip: str, timeout: float):
+    """Single DNSBL lookup for one blocklist. Returns bl name on hit, None otherwise."""
+    try:
+        import dns.resolver
+        import dns.exception
+        r = dns.resolver.Resolver()
+        r.timeout = timeout
+        r.lifetime = timeout
+        answers = r.resolve(f"{reversed_ip}.{bl}", "A")
+        for ans in answers:
+            if str(ans).startswith("127."):
+                return bl
+    except Exception:
+        pass
+    return None
+
+
 def check_ip_reputation(sending_ip: str, timeout: float = 3.0) -> dict:
     """Signal 7: DNSBL lookup on sending IP (HARD only).
     Hard: listed on 2+ blocklists. A single listing is NOT a signal — single
     DNSBL hits are noisy/often stale and are left for the AI to weigh."""
     if not sending_ip:
         return {"signal": None, "detail": "", "hits": []}
+
+    if sending_ip in _dnsbl_cache:
+        return _dnsbl_cache[sending_ip]
 
     try:
         import dns.resolver
@@ -487,33 +514,24 @@ def check_ip_reputation(sending_ip: str, timeout: float = 3.0) -> dict:
         # nibble-reversed label without the .ip6.arpa suffix
         reversed_ip = ip_obj.reverse_pointer[:-len(".ip6.arpa")]
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     hits = []
-    resolver = dns.resolver.Resolver()
-    resolver.timeout = timeout
-    resolver.lifetime = timeout
-
-    for bl in blocklists:
-        query = f"{reversed_ip}.{bl}"
-        try:
-            answers = resolver.resolve(query, "A")
-            for ans in answers:
-                ans_str = str(ans)
-                if ans_str.startswith("127."):
-                    hits.append(bl)
-                    break
-        except dns.resolver.NXDOMAIN:
-            continue  # not listed
-        except (dns.exception.Timeout, dns.resolver.NoNameservers,
-                dns.resolver.NoAnswer):
-            continue
-        except Exception:
-            continue
+    with ThreadPoolExecutor(max_workers=len(blocklists)) as executor:
+        futures = {executor.submit(_dnsbl_lookup_one, bl, reversed_ip, timeout): bl
+                   for bl in blocklists}
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                hits.append(result)
 
     if len(hits) >= 2:
-        return {"signal": "IP_DNSBL_MULTIPLE",
-                "detail": f"IP {sending_ip} listed on: {', '.join(hits)}",
-                "hits": hits}
-    return {"signal": None, "detail": "", "hits": []}
+        result = {"signal": "IP_DNSBL_MULTIPLE",
+                  "detail": f"IP {sending_ip} listed on: {', '.join(hits)}",
+                  "hits": hits}
+    else:
+        result = {"signal": None, "detail": "", "hits": []}
+    _dnsbl_cache[sending_ip] = result
+    return result
 
 
 # ---------------------------------------------------------------------------

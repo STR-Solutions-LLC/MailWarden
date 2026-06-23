@@ -3480,3 +3480,424 @@ def test_received_header_prompt_injection_sanitized():
     assert "evil.example.com" in prompt, (
         "Sanitizing must preserve the actual Received-header hostname"
     )
+
+
+# ===========================================================================
+# Session 12 — IMAP runtime safety fixes
+# ===========================================================================
+
+def test_m1_store_failure_returns_false():
+    """M1: post-COPY STORE \\Deleted result must be checked — if STORE fails, return False."""
+    import logging
+    from spam_filter import move_to_junk
+
+    uid = b"42"
+    calls = []
+
+    class MockConn:
+        def uid(self, cmd, *args, **kwargs):
+            calls.append((cmd,) + args)
+            if cmd == "MOVE":
+                return ("NO", None)
+            if cmd == "COPY":
+                return ("OK", None)
+            if cmd == "STORE":
+                return ("NO", ["STORE failed"])
+            return ("OK", None)
+        def expunge(self):
+            calls.append(("expunge",))
+
+    logger = logging.getLogger("test_m1")
+    result = move_to_junk(MockConn(), uid, "Junk", logger)
+    assert result is False, "move_to_junk must return False when STORE \\Deleted fails"
+    store_calls = [c for c in calls if c[0] == "STORE"]
+    assert store_calls, "STORE must have been called"
+
+
+def test_m2_train_uses_uid_expunge(monkeypatch):
+    """M2 site 1: train-folder scan must use UID EXPUNGE, not bare expunge."""
+    import logging
+    import spam_filter
+
+    uid = b"7"
+    calls = []
+
+    class MockConn:
+        def select(self, mbox):
+            return ("OK", [b"1"])
+        def uid(self, cmd, *args, **kwargs):
+            calls.append((cmd,) + args)
+            if cmd == "SEARCH":
+                return ("OK", [uid])
+            return ("OK", None)
+        def expunge(self):
+            calls.append(("expunge",))
+
+    monkeypatch.setattr(spam_filter, "fetch_raw_email", lambda conn, u, lg: b"raw")
+    monkeypatch.setattr(spam_filter, "extract_email_data",
+                        lambda raw, own_hosts=None: {
+                            "from_email": "s@x.com", "subject": "hi",
+                            "from_header_raw": "", "plain_text_body": ""})
+    monkeypatch.setattr(spam_filter, "submit_spam_example",
+                        lambda fwd, cfg, acct, lg: True)
+
+    logger = logging.getLogger("test_m2_train")
+    spam_filter.scan_train_folder(MockConn(), {"name": "A"}, {}, logger)
+
+    uid_expunge = [c for c in calls if c[0] == "EXPUNGE"]
+    assert uid_expunge, "Train scan must call conn.uid('EXPUNGE', uid)"
+    assert not any(c == ("expunge",) for c in calls), \
+        "Train scan must not fall back to bare conn.expunge() when UID EXPUNGE works"
+
+
+def test_m2_delete_uses_uid_expunge():
+    """M2 site 2: execute_spam_action delete path must use UID EXPUNGE."""
+    import logging
+    from spam_filter import execute_spam_action
+
+    uid = b"9"
+    calls = []
+
+    class MockConn:
+        def uid(self, cmd, *args, **kwargs):
+            calls.append((cmd,) + args)
+            return ("OK", None)
+        def expunge(self):
+            calls.append(("expunge",))
+
+    logger = logging.getLogger("test_m2_delete")
+    account = {"spam_action": "delete", "junk_folder": "Junk"}
+    result = execute_spam_action(MockConn(), uid, account, logger)
+    assert "DELETED" in result
+    uid_expunge = [c for c in calls if c[0] == "EXPUNGE"]
+    assert uid_expunge, "Delete path must call conn.uid('EXPUNGE', uid)"
+    assert not any(c == ("expunge",) for c in calls), \
+        "Delete path must not fall back to bare conn.expunge() when UID EXPUNGE works"
+
+
+def test_m3_client_kwargs(monkeypatch):
+    """M3: Anthropic client must be created with timeout=60.0 and max_retries=4."""
+    import spam_filter
+    import anthropic
+
+    captured = {}
+
+    class MockAnthropic:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(anthropic, "Anthropic", MockAnthropic)
+    # short-circuit right after the client is created
+    monkeypatch.setattr(spam_filter, "classify_email",
+                        lambda *a, **k: (None, None))
+
+    raw = (b"From: Friend <friend@example.com>\r\n"
+           b"To: me@example.com\r\n"
+           b"Subject: Lunch tomorrow?\r\n"
+           b"Message-ID: <abc@example.com>\r\n"
+           b"\r\nWant to grab lunch tomorrow?\r\n")
+
+    spam_filter.classify_eml_offline(raw, {"signals": {}}, api_key="sk-test")
+
+    assert captured.get("timeout") == 60.0, f"Expected timeout=60.0, got {captured.get('timeout')}"
+    assert captured.get("max_retries") == 4, f"Expected max_retries=4, got {captured.get('max_retries')}"
+
+
+def test_b12_connect_imap_has_timeout():
+    """B12: connect_imap must pass timeout=15.0 to IMAP4_SSL."""
+    import inspect
+    import spam_filter
+    src = inspect.getsource(spam_filter.connect_imap)
+    assert "timeout=" in src, "connect_imap must pass a timeout= to IMAP4_SSL"
+    assert "15" in src, "connect_imap timeout must be 15.0 (matching the validator)"
+
+
+def test_w1_uid_not_in_synthetic_key():
+    """W1: IMAP UID must not be part of the synthetic dedup key (makes it volatile)."""
+    import inspect
+    import spam_filter
+    src = inspect.getsource(spam_filter)
+    assert 'f"{uid}:' not in src, "Synthetic ID raw_key must not include the IMAP uid"
+    assert "synthetic-" in src, "Synthetic ID block must still exist"
+
+
+def test_b11_second_call_uses_cache(monkeypatch):
+    """B11: second check_ip_reputation call for same IP must not make DNS lookups."""
+    import utils
+    utils.clear_dnsbl_cache()
+
+    call_count = [0]
+    def counting_lookup(bl, reversed_ip, timeout):
+        call_count[0] += 1
+        return None
+    monkeypatch.setattr(utils, "_dnsbl_lookup_one", counting_lookup)
+
+    utils.check_ip_reputation("1.2.3.4", timeout=0.01)
+    count_after_first = call_count[0]
+    utils.check_ip_reputation("1.2.3.4", timeout=0.01)
+    assert call_count[0] == count_after_first, "Second call must use cache, not re-run lookups"
+
+
+def test_b11_cache_cleared_between_runs(monkeypatch):
+    """B11: clear_dnsbl_cache must empty the cache."""
+    import utils
+    monkeypatch.setattr(utils, "_dnsbl_lookup_one", lambda *a: None)
+    utils.check_ip_reputation("1.2.3.4", timeout=0.01)
+    assert "1.2.3.4" in utils._dnsbl_cache
+    utils.clear_dnsbl_cache()
+    assert utils._dnsbl_cache == {}
+
+
+def test_b11_lookups_run_concurrently(monkeypatch):
+    """B11: DNSBL lookups must run in parallel, not serial."""
+    import utils
+    import threading
+    import time
+    utils.clear_dnsbl_cache()
+
+    lock = threading.Lock()
+    active = [0]
+    max_active = [0]
+
+    def concurrent_stub(bl, reversed_ip, timeout):
+        with lock:
+            active[0] += 1
+            if active[0] > max_active[0]:
+                max_active[0] = active[0]
+        time.sleep(0.05)
+        with lock:
+            active[0] -= 1
+        return None
+
+    monkeypatch.setattr(utils, "_dnsbl_lookup_one", concurrent_stub)
+    utils.check_ip_reputation("5.6.7.8", timeout=5.0)
+    assert max_active[0] > 1, \
+        f"Expected concurrent lookups (max_active > 1) but got max_active={max_active[0]} — lookups ran serially"
+
+
+def test_w2_load_naive_timestamp_returns_utc_aware(tmp_path, monkeypatch):
+    """W2: loading a naive ISO timestamp from last_filter_run.json must return UTC-aware datetime."""
+    import json
+    import spam_filter
+    from datetime import timezone
+
+    run_file = tmp_path / "last_filter_run.json"
+    run_file.write_text(json.dumps({"last_run": "2026-06-23T10:00:00"}))
+
+    monkeypatch.setattr(spam_filter, "LAST_FILTER_RUN_PATH", run_file)
+
+    result = spam_filter.load_last_filter_run()
+    assert result is not None
+    assert result.tzinfo is not None, "load_last_filter_run must return timezone-aware datetime"
+    assert result.tzinfo == timezone.utc or result.utcoffset().total_seconds() == 0
+
+
+def test_w2_interval_gate_uses_utc():
+    """W2: interval gate must use datetime.now(timezone.utc), not naive datetime.now()."""
+    import inspect
+    import spam_filter
+    src = inspect.getsource(spam_filter.run_filter)
+    assert "datetime.now(timezone.utc)" in src or "now(timezone.utc)" in src, \
+        "Interval gate must use UTC-aware datetime"
+
+
+def test_w3_account_key_recorded_as_username(monkeypatch):
+    """W3: run_filter must record processed ids under the account username key."""
+    import spam_filter
+    _w4_harness(monkeypatch)  # sets up full run_filter env; discard return value
+
+    captured_keys = []
+    real_record = spam_filter._record_processed
+    def _key_spy(processed, key, account_processed, msg_id):
+        captured_keys.append(key)
+        return real_record(processed, key, account_processed, msg_id)
+    monkeypatch.setattr(spam_filter, "_record_processed", _key_spy)
+
+    spam_filter.run_filter(force=True)
+    assert captured_keys, "run_filter must call _record_processed at least once"
+    assert all(k == "owner@example.com" for k in captured_keys), \
+        f"Expected username key 'owner@example.com', got {captured_keys}"
+
+
+def test_w3_migration_renames_display_name_bucket_in_run_filter(monkeypatch):
+    """W3: run_filter must migrate a display-name bucket to the username key."""
+    import spam_filter
+    _w4_harness(monkeypatch)  # sets up full run_filter env
+
+    # Override load stub to seed the display-name bucket
+    monkeypatch.setattr(spam_filter, "load_processed_ids",
+        lambda: {"ids": {"My Account": [["<old-msg@example.com>", "2024-01-01T00:00:00"]]},
+                 "sender_scores": {}})
+
+    # Override persist_progress stub to capture the final processed dict
+    captured = {}
+    monkeypatch.setattr(spam_filter, "persist_progress",
+        lambda processed, *a, **k: captured.__setitem__("p", processed))
+
+    spam_filter.run_filter(force=True)
+
+    assert "p" in captured, "persist_progress was never called — run_filter may have exited early"
+    ids = captured["p"]["ids"]
+    assert "owner@example.com" in ids, "Migration must create the username key"
+    assert "My Account" not in ids, "Migration must remove the display-name key"
+    old_ids = {e[0] for e in ids["owner@example.com"]}
+    assert "<old-msg@example.com>" in old_ids, "Migration must preserve existing msg_id data"
+
+
+# ---------------------------------------------------------------------------
+# W4 — command emails are marked \Seen + recorded only AFTER the handler
+# succeeds. Drives the real run_filter per-uid command path with a fully
+# mocked IMAP/IO environment, exercising a Direct Whitelist command.
+# ---------------------------------------------------------------------------
+
+import contextlib  # noqa: E402
+
+
+def _w4_harness(monkeypatch, *, dry_run=False, auth_ok=True,
+                handler_raises=False, subject="Whitelist"):
+    """Configure run_filter to process exactly one Direct Whitelist command.
+
+    Returns (conn_calls, recorded) where conn_calls is the list of conn.uid(...)
+    invocations and recorded is the list of msg_ids passed to _record_processed.
+    """
+    import spam_filter
+
+    uid = b"1"
+    conn_calls = []
+    recorded = []
+
+    class FakeConn:
+        def uid(self, cmd, *args, **kwargs):
+            conn_calls.append((cmd,) + args)
+            return ("OK", None)
+        def select(self, *a, **k):
+            return ("NO", [b"x"])  # no Train folder
+        def logout(self):
+            pass
+        def close(self):
+            pass
+
+    config = {
+        "filter": {"dry_run": dry_run, "interval_minutes": 0,
+                   "max_emails_per_run": 10, "log_level": "ERROR"},
+        "accounts": [{
+            "enabled": True, "name": "My Account",
+            "username": "owner@example.com", "password": "pw",
+            "imap_host": "imap.example.com", "imap_port": 993,
+            "folders_to_scan": ["INBOX"],
+        }],
+        "anthropic": {"api_key": "", "model": "m", "max_tokens": 1},
+        "smtp": {},
+    }
+
+    msg_data = {
+        "message_id": "<cmd-1@example.com>",
+        "from_email": "owner@example.com",
+        "from_display_name": "Owner",
+        "subject": subject,
+        "plain_text_body": "friend@example.com",
+        "html_body": "",
+        "_mime_msg": None,
+    }
+
+    # Loaders → in-memory
+    monkeypatch.setattr(spam_filter, "load_config", lambda: config)
+    monkeypatch.setattr(spam_filter, "load_processed_ids", lambda: {"ids": {}})
+    monkeypatch.setattr(spam_filter, "load_signals", lambda: {"signals": {}})
+    monkeypatch.setattr(spam_filter, "load_whitelist",
+                        lambda lg=None: {"addresses": [], "domains": []})
+    monkeypatch.setattr(spam_filter, "load_blacklist",
+                        lambda lg=None: {"addresses": [], "display_names": []})
+    monkeypatch.setattr(spam_filter, "load_pending_signals",
+                        lambda: {"conversations": []})
+    monkeypatch.setattr(spam_filter, "load_token_usage", lambda: {})
+    monkeypatch.setattr(spam_filter, "detect_conflicts", lambda *a, **k: [])
+    monkeypatch.setattr(spam_filter, "deliver_eula_if_needed", lambda *a, **k: False)
+    monkeypatch.setattr(spam_filter, "persist_progress", lambda *a, **k: None)
+    monkeypatch.setattr(spam_filter, "build_classifier_prompt", lambda *a, **k: "")
+    monkeypatch.setattr(spam_filter, "save_whitelist", lambda *a, **k: None)
+    monkeypatch.setattr(spam_filter, "save_signals", lambda *a, **k: None)
+    monkeypatch.setattr(spam_filter, "_maybe_send_dry_run_reminder",
+                        lambda *a, **k: None)
+
+    # IMAP + parsing
+    monkeypatch.setattr(spam_filter, "connect_imap", lambda acct, lg: FakeConn())
+    monkeypatch.setattr(spam_filter, "fetch_unseen_uids",
+                        lambda conn, folder, lg: [uid])
+    monkeypatch.setattr(spam_filter, "fetch_raw_email",
+                        lambda conn, u, lg: b"raw")
+    monkeypatch.setattr(spam_filter, "extract_email_data",
+                        lambda raw, own_hosts=None: dict(msg_data))
+
+    # Ownership / auth gates
+    monkeypatch.setattr(spam_filter, "_command_sender_is_owner",
+                        lambda *a, **k: True)
+    monkeypatch.setattr(spam_filter, "_command_auth_ok",
+                        lambda *a, **k: auth_ok)
+    monkeypatch.setattr(spam_filter, "_notify_unverified_command",
+                        lambda *a, **k: None)
+
+    # No real SMTP / file locks
+    if handler_raises:
+        def _boom(*a, **k):
+            raise RuntimeError("handler blew up before finalize")
+        monkeypatch.setattr(spam_filter, "send_email", _boom)
+    else:
+        monkeypatch.setattr(spam_filter, "send_email", lambda *a, **k: None)
+
+    @contextlib.contextmanager
+    def _fake_lock(*paths):
+        yield
+    monkeypatch.setattr(spam_filter.file_lock, "locked", _fake_lock)
+
+    # Capture _record_processed
+    real_record = spam_filter._record_processed
+    def _spy_record(processed, key, account_processed, msg_id):
+        recorded.append(msg_id)
+        return real_record(processed, key, account_processed, msg_id)
+    monkeypatch.setattr(spam_filter, "_record_processed", _spy_record)
+
+    return conn_calls, recorded
+
+
+def _seen_store_calls(conn_calls):
+    return [c for c in conn_calls
+            if c[0] == "STORE" and len(c) >= 4 and c[3] == "\\Seen"]
+
+
+def test_w4_successful_command_marks_seen_and_records(monkeypatch):
+    """W4: on successful command, message is marked \\Seen AND recorded."""
+    import spam_filter
+    conn_calls, recorded = _w4_harness(monkeypatch)
+    spam_filter.run_filter(force=True)
+    assert _seen_store_calls(conn_calls), "Successful command must mark \\Seen"
+    assert "<cmd-1@example.com>" in recorded, "Successful command must be recorded"
+
+
+def test_w4_handler_failure_leaves_unseen_and_unrecorded(monkeypatch):
+    """W4: if a handler raises mid-execution, message must NOT be \\Seen / recorded."""
+    import spam_filter
+    conn_calls, recorded = _w4_harness(monkeypatch, handler_raises=True)
+    spam_filter.run_filter(force=True)
+    assert not _seen_store_calls(conn_calls), \
+        "A handler that raises before finalize must NOT mark \\Seen"
+    assert "<cmd-1@example.com>" not in recorded, \
+        "A handler that raises before finalize must NOT record the command"
+
+
+def test_w4_auth_rejection_still_marks_seen(monkeypatch):
+    """W4 regression (Session 2/3): auth-rejected command must still be marked \\Seen."""
+    import spam_filter
+    conn_calls, recorded = _w4_harness(monkeypatch, auth_ok=False)
+    spam_filter.run_filter(force=True)
+    assert _seen_store_calls(conn_calls), \
+        "Auth-rejected command must still be marked \\Seen"
+
+
+def test_w4_dry_run_leaves_command_unseen(monkeypatch):
+    """W4 regression (Session 4): dry-run command must remain UNSEEN."""
+    import spam_filter
+    conn_calls, recorded = _w4_harness(monkeypatch, dry_run=True)
+    spam_filter.run_filter(force=True)
+    assert not _seen_store_calls(conn_calls), \
+        "Dry-run command must remain UNSEEN"
