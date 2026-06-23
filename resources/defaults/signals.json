@@ -38,6 +38,7 @@
       "Relay hostname patterns: [word][number].[domain].com (e.g., token9709, solid7134, copper6141, flame4339)",
       "Sending domains using compromised/unrelated legitimate-looking domains (ligamorazan.com, galluplionsclubrodeo.com, comandosfilmes.com, tenislibre.com, benjaminrausseo.com, macadomi.com, dalhfuneralchapel.com, jawwhiskey.com, shopgreatescape.com, factorypricedjewelry.com, beachhouseshakes.com, instrumentacionanalitica.com, bubcash.com, crusincountryradio.com, bonusfivicai.com, asianeyestry.com, lemegethat.com)"
     ],
+    "trusted_infrastructure": [],
     "learner_notes": "Derived from sample spam patterns. Will expand as users forward 'Fwd: SPAM Example' emails."
   }
 }

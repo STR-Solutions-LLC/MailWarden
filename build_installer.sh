@@ -30,21 +30,43 @@ log() { printf "\033[1;34m[build]\033[0m %s\n" "$*"; }
 die() { printf "\033[1;31m[build]\033[0m %s\n" "$*" >&2; exit 1; }
 
 # ----------------------------------------------------------------------------
-# Step 0 — pre-build audit. Hard gate.
-# ----------------------------------------------------------------------------
-log "Running §0 pre-build audit..."
-if ! "$INSTALLER_ROOT/scripts/audit_payload.sh"; then
-    die "Audit failed. Fix findings before continuing."
-fi
-
-# ----------------------------------------------------------------------------
-# Step 1 — refresh scrubbed signals.json from live install.
+# Step 0 — refresh scrubbed signals.json from live install.
 # ----------------------------------------------------------------------------
 log "Refreshing scrubbed signals.json..."
 if [ -f "$HOME/MailWarden/memory/signals.json" ]; then
     python3 "$INSTALLER_ROOT/scripts/scrub_signals.py"
 else
     log "  (no live signals.json found — keeping whatever is already in resources/defaults/)"
+fi
+
+# ----------------------------------------------------------------------------
+# Step 0.5 — clean dev-runtime junk from the source payload tree before audit.
+# The audit scans payload/MailWarden/ for .lock sidecars, .claude-mpm dirs,
+# __pycache__/*.pyc, non-empty logs/, and false_positives/. These regenerate on
+# every local engine/test run; remove them so the audit validates a clean source.
+# Scope: ONLY these artifact categories — never src/*.py, blacklist/, EULA.md,
+# LICENSE, requirements.txt, or ~/MailWarden.
+# ----------------------------------------------------------------------------
+log "Cleaning dev-runtime artifacts from source payload tree..."
+PAYLOAD_SRC="$INSTALLER_ROOT/payload/MailWarden"
+find "$PAYLOAD_SRC" -name "*.lock" -delete 2>/dev/null || true
+find "$PAYLOAD_SRC" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+find "$PAYLOAD_SRC" -name ".claude-mpm" -type d -exec rm -rf {} + 2>/dev/null || true
+if [ -d "$PAYLOAD_SRC/logs" ]; then
+    for f in "$PAYLOAD_SRC/logs"/*; do
+        [ -f "$f" ] && : > "$f"
+    done
+fi
+if [ -d "$PAYLOAD_SRC/false_positives" ]; then
+    find "$PAYLOAD_SRC/false_positives" -maxdepth 1 -type f -delete
+fi
+
+# ----------------------------------------------------------------------------
+# Step 1 — pre-build audit. Hard gate. Runs after scrub so it sees the fresh signals.json.
+# ----------------------------------------------------------------------------
+log "Running §1 pre-build audit..."
+if ! "$INSTALLER_ROOT/scripts/audit_payload.sh"; then
+    die "Audit failed. Fix findings before continuing."
 fi
 
 # ----------------------------------------------------------------------------

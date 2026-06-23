@@ -158,6 +158,51 @@ else
     pass "No .DS_Store / .pyc noise in payload"
 fi
 
+# --- 7b. Dev-session artifacts (.lock, .claude-mpm, non-empty logs, false_positives) ---
+lock_files="$(find "$PAYLOAD" -name "*.lock" 2>/dev/null)"
+if [ -n "$lock_files" ]; then
+    while IFS= read -r f; do
+        [ -n "$f" ] && fail ".lock sidecar in payload: $f"
+    done <<< "$lock_files"
+else
+    pass "No .lock sidecars in payload"
+fi
+
+claude_mpm_dirs="$(find "$PAYLOAD" -name ".claude-mpm" -type d 2>/dev/null)"
+if [ -n "$claude_mpm_dirs" ]; then
+    while IFS= read -r d; do
+        [ -n "$d" ] && fail ".claude-mpm/ directory in payload: $d"
+    done <<< "$claude_mpm_dirs"
+else
+    pass "No .claude-mpm/ directories in payload"
+fi
+
+if [ -d "$PAYLOAD/logs" ]; then
+    nonempty_logs="$(find "$PAYLOAD/logs" -type f ! -empty 2>/dev/null)"
+    if [ -n "$nonempty_logs" ]; then
+        while IFS= read -r f; do
+            [ -n "$f" ] && fail "non-empty log file in payload: $f"
+        done <<< "$nonempty_logs"
+    else
+        pass "No non-empty log files in payload/logs/"
+    fi
+else
+    pass "No logs/ directory in payload"
+fi
+
+if [ -d "$PAYLOAD/false_positives" ]; then
+    fp_files="$(find "$PAYLOAD/false_positives" -type f 2>/dev/null)"
+    if [ -n "$fp_files" ]; then
+        while IFS= read -r f; do
+            [ -n "$f" ] && fail "file in payload/false_positives/: $f"
+        done <<< "$fp_files"
+    else
+        pass "No files in payload/false_positives/"
+    fi
+else
+    pass "No false_positives/ directory in payload"
+fi
+
 # --- 8. Forbidden learner plist (legacy, removed in v1.5) ---
 # This rule checks that no PLIST or DISTRIBUTION file shipped in the .pkg
 # invokes the removed com.mailwarden.learn agent. Python modules that

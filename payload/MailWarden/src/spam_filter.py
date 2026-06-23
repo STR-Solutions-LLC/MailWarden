@@ -2338,8 +2338,8 @@ def _command_auth_ok(msg_data: dict, from_email: str,
     Why two paths? The original strict path (a) requires SPF/DKIM/DMARC pass +
     alignment, proven by ``summarize_authentication``. That works for
     Gmail-class providers but is incompatible with the production mail host:
-    when the owner submits mail to their own server (Bluehost
-    box5275.bluehost.com) it is delivered locally over LMTP and NEVER carries
+    when the owner submits mail to their own server (the shared Bluehost
+    mail host) it is delivered locally over LMTP and NEVER carries
     Authentication-Results, so path (a) alone would reject 100% of genuine
     owner commands. Path (b) instead trusts the server-written Received chain:
     if the mail entered the account's OWN mail server via authenticated
@@ -2430,7 +2430,7 @@ def _command_auth_ok(msg_data: dict, from_email: str,
 
         if from_host in own_hosts:
             # Pure internal relay (e.g. Bluehost's LMTP delivery hop:
-            # "from box5275... by box5275... with LMTP"). Not the entry hop;
+            # "from <mailhost>... by <mailhost>... with LMTP"). Not the entry hop;
             # keep walking down to the hop that actually accepted the mail.
             continue
 

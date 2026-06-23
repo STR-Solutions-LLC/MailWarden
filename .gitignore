@@ -23,6 +23,8 @@ resources/eula.rtf
 # --- Payload exclusions: dev data must never enter the payload ---
 payload/MailWarden/config/config.json
 payload/MailWarden/memory/*.json
+payload/MailWarden/memory/*.lock
+payload/MailWarden/.claude-mpm/
 payload/MailWarden/memory/decisions.log
 payload/MailWarden/memory/eula_sent.json
 
