@@ -2483,21 +2483,132 @@ def _resolved_sfid_reply(conv, sfid):
     return (f"Re: [{sfid}]", body)
 
 
-def classify_reply(text: str) -> str:
-    """Classify a user reply as affirmative, negative, or follow_up."""
-    text = text.strip().lower()
-    affirmative = {"yes", "apply", "do it", "looks good", "approved",
-                   "go ahead", "sounds right", "confirmed"}
-    negative = {"no", "reject", "skip", "don't", "never mind",
-                "leave it", "cancel", "nope", "withdraw"}
+_AFFIRMATIVE_PHRASES = [
+    "do it", "looks good", "go ahead", "sounds right",
+    "yes", "apply", "approved", "confirmed",
+]
 
-    for phrase in affirmative:
-        if text.startswith(phrase):
-            return "affirmative"
-    for phrase in negative:
-        if text.startswith(phrase):
-            return "negative"
+_NEGATIVE_PHRASES = [
+    "never mind", "leave it",
+    "no", "reject", "skip", "cancel", "nope", "withdraw",
+]
+# "don't" is NOT in _NEGATIVE_PHRASES — too ambiguous ("don't worry, looks fine")
+# Explicit "don't apply / do not add" patterns handled by _NEGATIVE_COMBOS.
+
+_NEGATIVE_COMBOS = [
+    r"\bdon'?t\s+(apply|do\s+it|approve|add|use|block)\b",
+    r"\bdo\s+not\s+(apply|do\s+it|approve|add|use|block)\b",
+    r"\bdoesn'?t\s+(apply|do\s+it|approve|add|use|block)\b",
+    r"\bdoes\s+not\s+(apply|do\s+it|approve|add|use|block)\b",
+    r"\bdidn'?t\s+(apply|do\s+it|approve|add|use|block)\b",
+    r"\bdid\s+not\s+(apply|do\s+it|approve|add|use|block)\b",
+]
+
+_STRONG_QUALIFIERS = [
+    r"\bonly\b",
+    r"\bunless\b",
+    r"\bexcept\b",
+    r"\bas\s+long\s+as\b",
+    r"\bhowever\b",
+    r"\balthough\b",
+    r"\bprovided\b",
+    r"\bassuming\b",
+]
+
+_WEAK_QUALIFIER_PAT = r"\b(but|just)\b"
+
+
+def _phrase_in_text(phrase: str, text: str) -> bool:
+    escaped = re.escape(phrase).replace(r"\ ", r"\s+")
+    return bool(re.search(r"\b" + escaped + r"\b", text))
+
+
+def classify_reply(text: str) -> str:
+    """Classify a user reply as affirmative, negative, follow_up, or qualified_yes."""
+    t = text.strip().lower()
+
+    # Strip neg-combo spans before affirmative check so "apply" inside
+    # "don't apply" doesn't falsely register as a standalone affirmative.
+    t_aff = t
+    for p in _NEGATIVE_COMBOS:
+        t_aff = re.sub(p, " ", t_aff)
+
+    has_neg_combo = any(re.search(p, t) for p in _NEGATIVE_COMBOS)
+    has_negative = any(_phrase_in_text(p, t) for p in _NEGATIVE_PHRASES)
+    has_affirmative = any(_phrase_in_text(p, t_aff) for p in _AFFIRMATIVE_PHRASES)
+
+    # 1. Standalone negative word (retraction/clear rejection) always wins
+    if has_negative:
+        return "negative"
+
+    # 2. Standalone affirmative + negative-combo = conditional approval
+    if has_affirmative and has_neg_combo:
+        return "qualified_yes"
+
+    # 3. Negative-combo alone (no standalone affirmative) = explicit rejection
+    if has_neg_combo:
+        return "negative"
+
+    # 4. Affirmative: check for scope qualifiers
+    if has_affirmative:
+        if any(re.search(q, t) for q in _STRONG_QUALIFIERS):
+            return "qualified_yes"
+        # defensive: use t_aff (no-op while branch 4 is only reached when has_neg_combo=False)
+        m = re.search(_WEAK_QUALIFIER_PAT, t_aff)
+        if m:
+            after = t_aff[m.end():]
+            if not any(_phrase_in_text(p, after) for p in _AFFIRMATIVE_PHRASES):
+                return "qualified_yes"
+        return "affirmative"
+
     return "follow_up"
+
+
+def _send_scope_clarification(
+    conv: dict,
+    reply_text: str,
+    conv_kind: str,
+    config: dict,
+    logger,
+    account_email: str,
+    pending: dict,
+    sfid: str,
+) -> None:
+    """Handle a qualified-yes reply: keep awaiting_reply and send a
+    clarifying email asking the owner to confirm scope.
+    History is recorded once by the caller (the SFID-reply dispatch, before
+    classify_reply), so this helper must not append again."""
+    persist_pending_merge(pending)
+
+    quoted = reply_text[:200].strip()
+    if conv_kind == "spam_example_proposal":
+        body = (
+            f"Your reply looks like it may include a condition:\n\n"
+            f"  \"{quoted}\"\n\n"
+            f"MailWarden hasn't applied anything yet. Please reply with one of:\n\n"
+            f"  NARROW: <your condition>   — apply the rule with this restriction\n"
+            f"                               (e.g., NARROW: only for newsletters)\n"
+            f"  YES                         — apply the rule as originally proposed\n"
+            f"  NO                          — reject the proposal\n\n"
+            f"Conversation ID: {sfid}\n"
+        )
+    else:
+        body = (
+            f"Your reply looks like it may include a condition:\n\n"
+            f"  \"{quoted}\"\n\n"
+            f"MailWarden hasn't applied anything yet. Please reply:\n\n"
+            f"  YES  — apply as originally proposed\n"
+            f"  NO   — reject the proposal\n\n"
+            f"Conversation ID: {sfid}\n"
+        )
+
+    send_email(
+        config,
+        f"Re: [{sfid}] — Scope clarification needed",
+        body,
+        logger,
+        to_addr=account_email,
+    )
 
 
 def extract_reply_text(plain_body: str) -> str:
@@ -5761,6 +5872,7 @@ Conversation ID: {sfid}
                             "MailWarden analyzed your forwarded spam example",
                             "The refinement has been applied",
                             "The refinement proposal has been rejected",
+                            "Your reply looks like it may include a condition:",
                         )
                         is_our_own_email = (
                             any(body_text.strip().startswith(p) for p in _own_prefixes)
@@ -5993,6 +6105,12 @@ Conversation ID: {sfid}
                                     f"and ask Claude to revert the change to signals.json.",
                                     logger,
                                     to_addr=account.get("username", ""))
+
+                        elif classification == "qualified_yes":
+                            _send_scope_clarification(
+                                conv, reply_text, conv_kind, config, logger,
+                                account.get("username", ""), pending, sfid,
+                            )
 
                         elif classification == "negative":
                             conv["status"] = "rejected"
