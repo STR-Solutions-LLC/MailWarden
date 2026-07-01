@@ -1117,6 +1117,7 @@ def call_claude(prompt: str, api_config: dict,
             resp = client.messages.create(
                 model=model,
                 max_tokens=4000,
+                temperature=0,
                 system=system,
                 messages=[{"role": "user", "content": prompt}],
             )

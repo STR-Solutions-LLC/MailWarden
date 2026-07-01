@@ -2695,14 +2695,17 @@ from datetime import datetime, timezone, timedelta  # noqa: E402
 
 
 def _dry_run_filter_harness(monkeypatch, *, uids=None, msg_data=None,
-                            dry_run=True):
+                            dry_run=True, pending=None):
     """Drive spam_filter.run_filter(force=True) with all IO/network mocked.
 
     Returns a dict of call-recording spies so a test can assert which
     side-effecting functions DID or DID NOT fire. ``uids`` is the list of
     UNSEEN UIDs the INBOX scan returns (default: none → empty message loop);
     ``msg_data`` is the parsed-email dict every fetched UID resolves to.
+    ``pending`` overrides the pending-signals structure load_pending_signals
+    returns (default: no conversations).
     """
+    import types
     calls = {
         "scan_train_folder": 0,
         "deliver_eula_if_needed": 0,
@@ -2714,6 +2717,7 @@ def _dry_run_filter_harness(monkeypatch, *, uids=None, msg_data=None,
         "persist_pending_merge": 0,
         "execute_spam_action": 0,
         "classify_email": 0,
+        "messages_create_kwargs": [],
     }
 
     cfg = {
@@ -2754,7 +2758,8 @@ def _dry_run_filter_harness(monkeypatch, *, uids=None, msg_data=None,
     monkeypatch.setattr(spam_filter, "load_token_usage", lambda: {})
     monkeypatch.setattr(spam_filter, "new_token_delta", lambda: {})
     monkeypatch.setattr(spam_filter, "load_pending_signals",
-                        lambda: {"conversations": []})
+                        lambda: pending if pending is not None
+                        else {"conversations": []})
     monkeypatch.setattr(spam_filter, "persist_progress",
                         lambda processed, tu, td: None)
     monkeypatch.setattr(spam_filter, "build_classifier_prompt",
@@ -2781,9 +2786,21 @@ def _dry_run_filter_harness(monkeypatch, *, uids=None, msg_data=None,
     monkeypatch.setattr(spam_filter, "classify_email", _classify_spy)
 
     # Anthropic client must not actually be constructed against a real API.
+    # messages.create records its kwargs (so a test can assert temperature=0)
+    # and returns a canned analysis block. No `usage` attribute is exposed, so
+    # the fp handlers' `hasattr(response, 'usage')` guard skips token recording.
+    def _fake_create(**kwargs):
+        calls["messages_create_kwargs"].append(kwargs)
+        content = types.SimpleNamespace(
+            text=("WHY IT WAS FLAGGED:\nx\n\n"
+                  "PROPOSED CHANGE:\nnarrow it\n\n"
+                  "TRADEOFF:\nlow\n\n"
+                  "MY RECOMMENDATION:\napply\n"))
+        return types.SimpleNamespace(content=[content])
+
     class _FakeClient:
         def __init__(self, *a, **k):
-            pass
+            self.messages = types.SimpleNamespace(create=_fake_create)
     monkeypatch.setattr(spam_filter.anthropic, "Anthropic", _FakeClient)
 
     # IMAP layer.
@@ -2925,6 +2942,58 @@ def test_dry_run_defers_sfid_reply_no_mark_seen(monkeypatch):
     assert calls["mark_uid_seen"] == 0
     assert calls["send_email"] == 0
     assert calls["classify_email"] == 0
+
+
+def test_temperature_pinned_fp_analysis_sends_temperature_zero(monkeypatch):
+    """Determinism: the False Positive analysis API call must pin
+    temperature=0 so the same forwarded FP yields the same analysis."""
+    # No decisions.log lookup — force None so nothing touches disk.
+    monkeypatch.setattr(spam_filter, "lookup_decision", lambda *a, **k: None)
+    msg_data = {
+        "message_id": "<fp-1@example.com>",
+        "from_email": "owner@example.com",
+        "from_display_name": "Owner",
+        "subject": "Fwd: False Positive",
+        "plain_text_body": (
+            "Please review.\n\nBegin forwarded message:\n"
+            "From: Legit <legit@example.com>\nSubject: Receipt\n"
+            "Date: Mon, 19 Apr 2026 09:00:00 -0700\n\n"
+            "Thanks for your order.\n"
+        ),
+        "html_body": "",
+        "_mime_msg": None,
+    }
+    calls = _dry_run_filter_harness(
+        monkeypatch, uids=[b"1"], msg_data=msg_data, dry_run=False)
+    assert len(calls["messages_create_kwargs"]) == 1
+    assert calls["messages_create_kwargs"][0].get("temperature") == 0
+
+
+def test_temperature_pinned_fp_followup_sends_temperature_zero(monkeypatch):
+    """Determinism: the SFID follow-up API call must pin temperature=0 so a
+    given conversation state yields the same follow-up answer."""
+    from datetime import datetime as _dt, timedelta as _tdlt
+    pending = {"conversations": [{
+        "id": "SFID-TESTFU01",
+        "status": "awaiting_reply",
+        "kind": "false_positive",
+        "expires": (_dt.now() + _tdlt(days=7)).isoformat(),
+        "conversation_history": [],
+    }]}
+    msg_data = {
+        "message_id": "<followup-1@example.com>",
+        "from_email": "owner@example.com",
+        "from_display_name": "Owner",
+        "subject": "Re: [SFID-TESTFU01] question",
+        "plain_text_body": "Why was this flagged as spam? Can you clarify?",
+        "html_body": "",
+        "_mime_msg": None,
+    }
+    calls = _dry_run_filter_harness(
+        monkeypatch, uids=[b"1"], msg_data=msg_data, dry_run=False,
+        pending=pending)
+    assert len(calls["messages_create_kwargs"]) == 1
+    assert calls["messages_create_kwargs"][0].get("temperature") == 0
 
 
 def test_dry_run_report_rebucket(tmp_path, monkeypatch):
@@ -3489,6 +3558,41 @@ def test_s7_clean_json_unaffected_by_salvage():
     )
     assert result is not None
     assert result.get("decision") == "PASS"
+
+
+def test_temperature_pinned_classify_email_sends_temperature_zero():
+    """Determinism: classify_email must pin temperature=0 on the API call so
+    the same email yields the same verdict run-to-run (also covers the eval
+    path, which routes through classify_email via classify_eml_offline)."""
+    captured = []
+
+    class _FakeContent:
+        text = '{"decision": "PASS", "confidence": 0.1, "explanation": "ok"}'
+
+    class _FakeResponse:
+        content = [_FakeContent()]
+
+    class _FakeClient:
+        class messages:
+            @staticmethod
+            def create(**kwargs):
+                captured.append(kwargs)
+                return _FakeResponse()
+
+    logger = _logging_s7.getLogger("test_temp0_classify")
+    md = {
+        "plain_text_body": "test", "html_body": "",
+        "from_display_name": "", "from_email": "a@b.com",
+        "reply_to": "", "subject": "s",
+        "received_headers": [], "received_headers_first_3": [],
+        "auth_results": "", "received_spf": "", "dkim_signature": "",
+        "x_spam_flag": "", "x_spam_status": "", "message_id": "",
+    }
+    spam_filter.classify_email(
+        _FakeClient(), "system", md, "test-model", 256, logger
+    )
+    assert len(captured) == 1
+    assert captured[0].get("temperature") == 0
 
 
 def test_s7_reply_to_trailing_semicolon_no_false_mismatch():

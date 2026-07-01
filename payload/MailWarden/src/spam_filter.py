@@ -3505,6 +3505,7 @@ def classify_email(client: anthropic.Anthropic, system_prompt: str,
             response = client.messages.create(
                 model=model,
                 max_tokens=max_tokens,
+                temperature=0,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_message}],
             )
@@ -4934,6 +4935,7 @@ CURRENT SIGNAL DEFINITIONS:
                             logger.info(f"API call: model={model} site=fp_analysis")
                             response = client.messages.create(
                                 model=model, max_tokens=1500,
+                                temperature=0,
                                 system=fp_system,
                                 messages=[{"role": "user", "content": fp_user_msg}],
                             )
@@ -6140,6 +6142,7 @@ USER'S FOLLOW-UP:
                                 logger.info(f"API call: model={model} site=fp_followup")
                                 response = client.messages.create(
                                     model=model, max_tokens=1000,
+                                    temperature=0,
                                     system=followup_system,
                                     messages=[{"role": "user", "content": followup_msg}],
                                 )

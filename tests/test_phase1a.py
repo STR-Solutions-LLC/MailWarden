@@ -712,6 +712,37 @@ def test_w8_non_text_first_content_block_does_not_fail_call(monkeypatch):
         "a non-text first content block must not fail the learner call (W8)")
 
 
+def _stub_anthropic_capturing(resp, captured):
+    """Like _stub_anthropic, but records the kwargs passed to messages.create()
+    into ``captured`` so a test can assert on them."""
+    import types
+
+    class _Client:
+        def __init__(self, *a, **k):
+            def _create(**kw):
+                captured.append(kw)
+                return resp
+            self.messages = types.SimpleNamespace(create=_create)
+    return _Client
+
+
+def test_temperature_pinned_call_claude_sends_temperature_zero(monkeypatch):
+    """Determinism: the learner's call_claude must pin temperature=0 so signal
+    proposals are reproducible run-to-run."""
+    import types
+    import logging
+    captured = []
+    resp = types.SimpleNamespace(
+        content=[types.SimpleNamespace(type="text", text='{"classifications": []}')],
+        usage=None)
+    monkeypatch.setattr(learn_signals.anthropic, "Anthropic",
+                        _stub_anthropic_capturing(resp, captured))
+    learn_signals.call_claude("p", {"api_key": "k", "model": "m"},
+                              logging.getLogger("t"))
+    assert len(captured) == 1
+    assert captured[0].get("temperature") == 0
+
+
 def test_w9_salvages_json_wrapped_in_prose(monkeypatch):
     """W9: a single chatty response (valid JSON wrapped in prose) must be
     salvaged, not dropped. Dropping it returns None, which fails the whole batch
