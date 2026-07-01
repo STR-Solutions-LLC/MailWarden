@@ -299,6 +299,22 @@ Each block below is one Claude Code session. Run them in order — Session 1 red
 
 ---
 
+### Queued build item — Prompt caching for the classifier system prompt *(cost optimization; added 2026-06-30 at Matt's request)*
+
+**Goal:** cache the classifier's large, stable instruction block at the Anthropic API so repeated classifications in a run stop re-paying full input-token price for it — only the per-email content is charged at the full rate. Anthropic cache **reads** cost ~10% of the base input rate (~90% saving on the cached portion); cache **writes** cost 1.25× (5-minute TTL) or 2× (1-hour TTL).
+
+**How it maps to the real code (verified 2026-06-30):** the system prompt is `build_classifier_prompt(signals, account_username)` = `BASE_SYSTEM_PROMPT` + a per-account learned-signals block (`spam_filter.py:~3098`), passed as `system=` to `client.messages.create` in `classify_email` (`:~3529`). The per-email content is the *user* message (`build_user_message`, `:~3215`). So the cacheable prefix is the system block; putting `cache_control:{"type":"ephemeral"}` on it is the correct structure (the variable per-email content stays uncached in the user turn). The prefix is per-account (learned signals differ per account), so each account's batch caches independently within a run — fine.
+
+**Two make-or-break conditions the build session MUST verify FIRST (this is why it is discussion-/plan-first, not a drop-in):**
+1. **Haiku's minimum cacheable prefix is 4,096 tokens; below it, caching silently does nothing (no error).** `BASE_SYSTEM_PROMPT` alone is ~9 KB ≈ ~2,000–2,250 tokens — **under the floor.** It only clears 4,096 once the learned-signals block adds ~1,900+ tokens (many approved refinements), or if the user runs Sonnet 4.6 (2,048-token floor, which the base roughly clears) / Opus. On the SHIPPED default (Haiku, threshold 0.85) with a light learned-signal set — Matt's own case today — caching may not engage at all. Net: **free upside where it applies, no harm where it doesn't, but the benefit is contingent, not guaranteed.** Measure the real token count with `count_tokens` before building; decide then whether it's worth it.
+2. **The "true RULE 1" path rebuilds the system prompt per-message** (authenticated + brand-matched, without the over-broad legacy signals — `:~6383`), so the cacheable prefix is NOT byte-identical across every email in a run; those messages write/miss their own entry. A naive "add cache_control everywhere" still caches the common non-RULE-1 prefix per account, but the design must account for this (and confirm there's no `datetime.now()` / unsorted-JSON silent invalidator in the prefix — none seen, but verify).
+
+**Cadence caveat:** the 5-minute TTL only amortizes WITHIN a run that classifies several emails back-to-back. A run that classifies 1 email pays the 1.25× write premium with no read → a small net loss on that email. Clear win for busy multi-email runs; marginal-to-negative for near-empty runs.
+
+**Scope & discipline:** additive to the API call only — **no change to what gets filtered, thresholds, models, or any decision.** Measure token-cost before/after against the eval harness cost line (`tools/eval_run.py`). It touches the live classify path, so it follows the standard 5-step rhythm (discussion → plan-gate → build+test → separate-model review → commit). Independent of the Sessions-15+ signal-weighting/FP work; sequence it whenever.
+
+---
+
 ## Suggested overall order and why
 
 1. **Session 1 (locking)** — it's the foundation; several later fixes write to the same files and shouldn't be built on the race-prone base.
