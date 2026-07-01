@@ -17,6 +17,8 @@ Covers the deterministic fixes:
 import sys
 import os
 
+import pytest
+
 SRC = os.path.join(os.path.dirname(__file__), "..", "payload", "MailWarden", "src")
 sys.path.insert(0, os.path.abspath(SRC))
 
@@ -29,6 +31,7 @@ sys.path.insert(0, os.path.abspath(APP))
 import utils  # noqa: E402
 import spam_filter  # noqa: E402
 import learn_signals  # noqa: E402
+import daily_report  # noqa: E402
 from mailwarden_app import config_io  # noqa: E402
 from mailwarden_app import dashboard  # noqa: E402
 
@@ -1181,6 +1184,79 @@ _EVASION_SIGNALS = {
 }
 
 
+def test_defaults_signals_pruned():
+    # fix (a-1): 4 over-broad shipped-default signals were removed from the sole
+    # git-tracked defaults file. The survivors must remain and JSON must parse
+    # (a stray trailing comma from the edit would raise here).
+    import json as _json
+    defaults = os.path.join(os.path.dirname(__file__), "..",
+                            "resources", "defaults", "signals.json")
+    with open(defaults) as f:
+        data = _json.load(f)          # invalid JSON (e.g. trailing comma) -> raises
+    sig = data["signals"]
+    retired = [
+        "Benign conversational text block (meeting scheduling, personal "
+        "reflection) prepended before promotional/scam content - used as "
+        "filter evasion",
+        "CSS class names using random nature/object word combinations (e.g., "
+        "'nebula-quartz', 'pebble-orbit', 'aurora-cinder', 'thistle-comet') in "
+        "HTML emails",
+        "Mismatch between casual/personal opening paragraphs and promotional "
+        "closing content",
+        "Points/rewards expiration urgency with specific dollar amounts ($100)",
+    ]
+    for s in retired:
+        assert s not in sig["hard_signals"]
+        assert s not in sig["soft_signals"]
+    # Survivors: the one remaining hard (Homoglyph) and all 5 remaining soft.
+    assert sig["hard_signals"] == [
+        "Homoglyph substitution in subject lines: 'I' replaced with 'l' "
+        "(pIan, TooI, compIimentary), '0' replaced with 'O' (0nly, 35OOWatt, 1OO)"
+    ]
+    assert sig["soft_signals"] == [
+        "Artificial scarcity claims with specific round numbers: 'Total "
+        "allocation: 500 sets', 'Total allocation: 800 kits'",
+        "Subject line pattern: urgency word + 'Today' or 'Tomorrow' combined "
+        "with brand impersonation",
+        "Body text offering premium gifts as apology for fabricated service "
+        "failures (lost packages, service issues)",
+        "Phrases like 'You may qualify', 'eligible recipients', 'residents in "
+        "your area' combined with free item offers",
+        "Medicare kit offers combined with coverage plan change notifications",
+    ]
+
+
+def test_rule1_parenthesized_precedence():
+    # fix (a-1): RULE 1's prose antecedent must be parenthesized so it reads
+    # (DKIM=pass OR DMARC=pass) AND match — agreeing with the deterministic twin
+    # is_authenticated_brand_matched, and never making DKIM-pass-alone sufficient.
+    prompt = spam_filter.BASE_SYSTEM_PROMPT
+    assert ("(DKIM=pass OR DMARC=pass) AND a cryptographically authenticated "
+            "domain matches") in prompt
+    # The old ambiguous, unparenthesized form must be gone.
+    assert "If DKIM=pass OR DMARC=pass AND a cryptographically" not in prompt
+
+
+def test_learned_signals_block_has_subordination():
+    # fix (a-1): the learned-signals block must state that spam-arguing learned
+    # signals are subordinate to a RULE-1 sender, with an EXPLICIT curate carve-out
+    # (or curate rules silently break). The sentence must precede {learned_signals}.
+    prompt = spam_filter.BASE_SYSTEM_PROMPT
+    heading = "## Additional signals from learned patterns"
+    subordination = ("no shipped-default or user-learned signal that argues a "
+                     "message is bad-actor spam")
+    exception = ("EXCEPTION: an explicit USER PREFERENCE (curate) rule reflects "
+                 "the recipient's own choice not to receive a kind of legitimate "
+                 "mail and still applies")
+    assert subordination in prompt
+    assert exception in prompt
+    # Positioned between the heading and the {learned_signals} placeholder.
+    i_head = prompt.index(heading)
+    i_sub = prompt.index(subordination)
+    i_ph = prompt.index("{learned_signals}")
+    assert i_head < i_sub < i_ph
+
+
 def test_fpauth_padding_strips_leading_zero_width_and_whitespace():
     # 232 zero-width non-joiners interleaved with spaces, then real content.
     padded = ("‌ " * 232) + "Janet, I hate to interrupt your Saturday."
@@ -1248,26 +1324,24 @@ def test_fpauth_subdomain_and_parent_alignment():
     assert not spam_filter._domain_is_brand_match("", "example.com")
 
 
-def test_fpauth_suppression_removes_only_evasion_signal():
-    # With suppression ON, the over-broad evasion hard/soft signals are gone,
-    # but the concrete CSS / homoglyph / rewards signals REMAIN.
-    p_on = spam_filter.build_classifier_prompt(
-        _EVASION_SIGNALS, None, suppress_evasion_signals=True)
-    assert "used as filter evasion" not in p_on
-    assert "casual/personal opening paragraphs" not in p_on
-    assert "CSS class names using random" in p_on
-    assert "Homoglyph substitution" in p_on
-    assert "Points/rewards expiration urgency" in p_on
-
-
-def test_fpauth_default_prompt_unchanged_keeps_evasion_signal():
-    # Default (no suppression) is byte-identical to the historical behavior and
-    # still contains the evasion signal — so unauthenticated mail is unaffected.
-    p_default = spam_filter.build_classifier_prompt(_EVASION_SIGNALS, None)
-    p_explicit_off = spam_filter.build_classifier_prompt(
-        _EVASION_SIGNALS, None, suppress_evasion_signals=False)
-    assert p_default == p_explicit_off
-    assert "used as filter evasion" in p_default
+def test_fpauth_build_prompt_no_suppress_param():
+    # fix (a-1): the runtime suppression band-aid is retired. build_classifier_prompt
+    # no longer accepts suppress_evasion_signals, and the marker helpers are gone.
+    # RULE-1 dominance now lives entirely in the prompt wording, so learned signals
+    # are ALWAYS injected unfiltered (their subordination is stated in the prompt).
+    import inspect
+    params = inspect.signature(spam_filter.build_classifier_prompt).parameters
+    assert "suppress_evasion_signals" not in params
+    assert list(params) == ["signals", "account_name"]
+    assert not hasattr(spam_filter, "_EVASION_SIGNAL_MARKERS")
+    assert not hasattr(spam_filter, "_is_overbroad_evasion_signal")
+    # Every learned signal is present now — nothing is filtered out at build time.
+    p = spam_filter.build_classifier_prompt(_EVASION_SIGNALS, None)
+    assert "used as filter evasion" in p
+    assert "casual/personal opening paragraphs" in p
+    assert "CSS class names using random" in p
+    assert "Homoglyph substitution" in p
+    assert "Points/rewards expiration urgency" in p
 
 
 # ---------------------------------------------------------------------------
@@ -3901,3 +3975,186 @@ def test_w4_dry_run_leaves_command_unseen(monkeypatch):
     spam_filter.run_filter(force=True)
     assert not _seen_store_calls(conn_calls), \
         "Dry-run command must remain UNSEEN"
+
+
+# ---------------------------------------------------------------------------
+# fix (a-1): one-time in-memory scrub of the 4 retired shipped-default signals.
+# Existing installs whose memory/signals.json inherited them must stop surfacing
+# them on every load, across all five read paths (spam_filter, learn_signals,
+# config_io, app_entrypoint-reuses-spam_filter, daily_report). EXACT-match only.
+# ---------------------------------------------------------------------------
+
+_RETIRED_4 = [
+    "Benign conversational text block (meeting scheduling, personal reflection) "
+    "prepended before promotional/scam content - used as filter evasion",
+    "CSS class names using random nature/object word combinations (e.g., "
+    "'nebula-quartz', 'pebble-orbit', 'aurora-cinder', 'thistle-comet') in "
+    "HTML emails",
+    "Mismatch between casual/personal opening paragraphs and promotional "
+    "closing content",
+    "Points/rewards expiration urgency with specific dollar amounts ($100)",
+]
+_USER_SIGNAL = "User-taught: mail from evil-scammer.example demanding gift cards"
+
+
+def _write_retired_signals_file(path):
+    import json as _json
+    data = {
+        "version": "1.1",
+        "signals": {
+            # 2 retired hard + the user's own hard signal.
+            "hard_signals": [_RETIRED_4[0], _RETIRED_4[1], _USER_SIGNAL],
+            # 2 retired soft + the user's own soft signal.
+            "soft_signals": [_RETIRED_4[2], _RETIRED_4[3], _USER_SIGNAL],
+        },
+        "ai_refinements": [{"status": "active", "headline": "x"}],
+    }
+    with open(path, "w") as f:
+        _json.dump(data, f)
+
+
+def _assert_scrubbed(out):
+    sig = out["signals"]
+    for s in _RETIRED_4:
+        assert s not in sig["hard_signals"]
+        assert s not in sig["soft_signals"]
+    # The user's own signal survives in BOTH lists.
+    assert _USER_SIGNAL in sig["hard_signals"]
+    assert _USER_SIGNAL in sig["soft_signals"]
+
+
+def test_scrub_removes_retired_from_spam_filter_load(tmp_path, monkeypatch):
+    p = tmp_path / "signals.json"
+    _write_retired_signals_file(p)
+    monkeypatch.setattr(spam_filter, "SIGNALS_PATH", p)
+    _assert_scrubbed(spam_filter.load_signals())
+
+
+def test_scrub_removes_retired_from_learn_signals_load(tmp_path, monkeypatch):
+    p = tmp_path / "signals.json"
+    _write_retired_signals_file(p)
+    monkeypatch.setattr(learn_signals, "SIGNALS_PATH", p)
+    _assert_scrubbed(learn_signals.load_signals())
+
+
+def test_scrub_removes_retired_from_config_io_load(tmp_path, monkeypatch):
+    p = tmp_path / "signals.json"
+    _write_retired_signals_file(p)
+    monkeypatch.setattr(config_io.paths, "SIGNALS_PATH", p)
+    _assert_scrubbed(config_io.load_signals())
+
+
+def test_scrub_removes_retired_from_daily_report_load(tmp_path, monkeypatch):
+    p = tmp_path / "signals.json"
+    _write_retired_signals_file(p)
+    monkeypatch.setattr(daily_report, "SIGNALS_PATH", p)
+    _assert_scrubbed(daily_report.load_signals())
+
+
+def test_scrub_helper_exact_match_only():
+    # A signal that merely CONTAINS a retired substring is a genuine user signal
+    # and must NOT be collateral — guards against the old fuzzy-marker behavior.
+    near_miss = "filter evasion via a new trick we just discovered"
+    data = {"signals": {"hard_signals": [near_miss, _RETIRED_4[0]],
+                        "soft_signals": [near_miss]}}
+    out = spam_filter.scrub_retired_signals(data)
+    assert near_miss in out["signals"]["hard_signals"]
+    assert near_miss in out["signals"]["soft_signals"]
+    assert _RETIRED_4[0] not in out["signals"]["hard_signals"]
+
+
+def test_scrub_preserves_non_signal_keys():
+    data = {
+        "version": "1.1",
+        "signals": {
+            "hard_signals": [_RETIRED_4[0]],
+            "soft_signals": [],
+            "known_sending_infrastructure": ["venpp.com"],
+            "trusted_infrastructure": ["imap.example.com"],
+        },
+        "ai_refinements": [{"status": "active", "headline": "keep me"}],
+    }
+    out = spam_filter.scrub_retired_signals(data)
+    assert out["version"] == "1.1"
+    assert out["signals"]["known_sending_infrastructure"] == ["venpp.com"]
+    assert out["signals"]["trusted_infrastructure"] == ["imap.example.com"]
+    assert out["ai_refinements"] == [{"status": "active", "headline": "keep me"}]
+    # And the retired one is still stripped from the signal list.
+    assert out["signals"]["hard_signals"] == []
+
+
+# ---------------------------------------------------------------------------
+# fix (a-1): curate-vs-RULE1 regression guard (LIVE model call; skip-gated).
+# 06_jeffries is a true RULE-1 sender (DKIM=pass, brand-matched hakeemjeffries.com)
+# that classifies PASS/NOT_SPAM with no curate rule. With an UNMISTAKABLE curate
+# preference against political fundraising, the owner's own choice must still junk
+# it — proving the new RULE-1 subordination sentence's curate EXCEPTION works.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not os.environ.get("ANTHROPIC_API_KEY"),
+                    reason="live curate-vs-RULE1 regression needs ANTHROPIC_API_KEY")
+def test_curate_preference_overrides_rule1_when_unmistakable():
+    import json as _json
+    defaults = os.path.join(os.path.dirname(__file__), "..",
+                            "resources", "defaults", "signals.json")
+    with open(defaults) as f:
+        signals = _json.load(f)
+    # Synthetic, active curate preference — the owner is done with fundraising mail.
+    signals["ai_refinements"] = [{
+        "status": "active",
+        "verdict": "spam",
+        "rule_class": "curate",
+        "headline": "Political fundraising asking for donations",
+    }]
+    cfg_path = os.path.expanduser("~/MailWarden/config/config.json")
+    anthro = {}
+    if os.path.isfile(cfg_path):
+        with open(cfg_path) as f:
+            anthro = (_json.load(f).get("anthropic", {}) or {})
+    api_key = os.environ.get("ANTHROPIC_API_KEY") or anthro.get("api_key", "")
+    model = anthro.get("model") or "claude-haiku-4-5-20251001"
+    raw = (_FIXTURES / "06_jeffries.eml").read_bytes()
+    res = spam_filter.classify_eml_offline(
+        raw, signals, api_key=api_key, model=model, threshold=0.85)
+    assert res["final_decision"] == "JUNK", (
+        f"An unmistakable curate preference must still junk an authenticated, "
+        f"brand-matched RULE-1 sender; got {res['final_decision']} "
+        f"(reason: {res.get('reason')})")
+
+
+# ---------------------------------------------------------------------------
+# fix (a-1): curate-carve-out prompt guard (OFFLINE, deterministic, no API).
+# The live test above proves the curate EXCEPTION end-to-end but is skip-gated
+# (needs ANTHROPIC_API_KEY), so normal CI never exercises it. This test pins the
+# two production strings the carve-out depends on, straight out of
+# build_classifier_prompt — no network — so a regression that deletes EITHER half
+# is caught by the free suite:
+#   (a) the rendered "USER PREFERENCE (curate)" instruction for an active curate
+#       refinement (spam_filter.py ~L3056-3062), and
+#   (b) the RULE-1 subordination sentence's curate EXCEPTION that exempts curate
+#       from RULE-1 (BASE_SYSTEM_PROMPT ~L2897).
+# ---------------------------------------------------------------------------
+
+def test_curate_carve_out_rendered_in_prompt_offline():
+    # One active, in-scope (no scope -> "all") curate refinement — the exact
+    # schema build_classifier_prompt consumes (status/verdict/rule_class/headline).
+    signals = {"signals": {}, "ai_refinements": [{
+        "status": "active",
+        "verdict": "spam",
+        "rule_class": "curate",
+        "headline": "Political fundraising asking for donations",
+    }]}
+    prompt = spam_filter.build_classifier_prompt(signals, "owner@example.com")
+
+    # (a) The curate rendering branch. This distinctive phrase appears ONLY in the
+    # "USER PREFERENCE (curate)" line; if that branch is removed, the refinement
+    # renders as a "LEARNED THREAT PATTERN" instead and this assertion fails.
+    assert "USER PREFERENCE (curate): Political fundraising asking for donations" in prompt
+    assert "chosen NOT to receive this kind of LEGITIMATE mail" in prompt
+
+    # (b) The RULE-1 carve-out sentence baked into BASE_SYSTEM_PROMPT. This phrase
+    # appears ONLY in that subordination sentence; if the curate EXCEPTION is
+    # removed, curate stops overriding RULE-1 and this assertion fails.
+    assert ("an explicit USER PREFERENCE (curate) rule reflects the recipient's "
+            "own choice not to receive a kind of legitimate mail and still "
+            "applies") in prompt

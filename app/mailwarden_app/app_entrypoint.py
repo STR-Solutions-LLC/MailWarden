@@ -374,6 +374,9 @@ def _run_classify_eml() -> int:
             if c and c.is_file():
                 with c.open(encoding="utf-8") as f:
                     signals = _json.load(f)
+                # fix (a-1): strip retired shipped-default signals in-memory
+                # (reuses the shared helper; this raw path bypasses load_signals).
+                signals = spam_filter.scrub_retired_signals(signals)
                 signals_src = str(c)
                 break
         except Exception as e:

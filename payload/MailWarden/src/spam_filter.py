@@ -178,10 +178,35 @@ def save_last_filter_run(when: datetime) -> None:
         raise
 
 
+# Retired shipped-default signals (fix a-1). Stripped in-memory on every load so
+# existing installs whose memory/signals.json inherited them stop surfacing them
+# without a forced disk rewrite. EXACT-match only — never substring — so a
+# genuine user-taught signal is never collateral. Keep in sync across the 4 copies.
+_RETIRED_DEFAULT_SIGNALS = frozenset({
+    "Benign conversational text block (meeting scheduling, personal reflection) prepended before promotional/scam content - used as filter evasion",
+    "CSS class names using random nature/object word combinations (e.g., 'nebula-quartz', 'pebble-orbit', 'aurora-cinder', 'thistle-comet') in HTML emails",
+    "Mismatch between casual/personal opening paragraphs and promotional closing content",
+    "Points/rewards expiration urgency with specific dollar amounts ($100)",
+})
+
+
+def scrub_retired_signals(data: dict) -> dict:
+    """Strip retired shipped-default signals in-memory. Returns the same dict."""
+    if not isinstance(data, dict):
+        return data
+    sig = data.get("signals")
+    if isinstance(sig, dict):
+        for key in ("hard_signals", "soft_signals"):
+            vals = sig.get(key)
+            if isinstance(vals, list):
+                sig[key] = [s for s in vals if s not in _RETIRED_DEFAULT_SIGNALS]
+    return data
+
+
 def load_signals() -> dict:
     try:
         with open(SIGNALS_PATH, "r") as f:
-            return json.load(f)
+            return scrub_retired_signals(json.load(f))
     except (FileNotFoundError, json.JSONDecodeError):
         return {"signals": {}}
 
@@ -2761,7 +2786,7 @@ own mail server. It is trustworthy. The signal lists further below are
 SUBORDINATE to these three rules.
 
 RULE 1 — AUTHENTICATED AND BRAND-MATCHED  ->  NOT_SPAM (stop here).
-If DKIM=pass OR DMARC=pass AND a cryptographically authenticated domain matches
+If (DKIM=pass OR DMARC=pass) AND a cryptographically authenticated domain matches
 the sender/brand the email presents itself as (same domain, a subdomain, or the
 parent domain — e.g. content "Hakeem Jeffries" + authenticated hakeemjeffries.com,
 or content "Women's March" + authenticated womensmarch.com), classify NOT_SPAM
@@ -2869,6 +2894,7 @@ never use any of these to override a RULE 1 authenticated, brand-matched sender)
    amplifiloyality.com, visitlibertycity.com.
 
 ## Additional signals from learned patterns
+The same subordination applies to spam signals here: no shipped-default or user-learned signal that argues a message is bad-actor spam — however specific or new — may override a RULE 1 authenticated, brand-matched sender; only RULE 1's own override clause (a concrete, verifiable threat) may do so. EXCEPTION: an explicit USER PREFERENCE (curate) rule reflects the recipient's own choice not to receive a kind of legitimate mail and still applies — junk mail that unmistakably matches such a preference even from an authenticated, brand-matched sender.
 {learned_signals}
 
 ## Conservative defaults
@@ -2929,12 +2955,12 @@ def is_authenticated_brand_matched(auth: dict) -> bool:
     authenticated (DKIM=pass OR DMARC=pass) AND at least one authenticated
     domain aligns with the From domain (same domain, a subdomain, or the parent).
 
-    ``auth`` is the dict returned by ``utils.summarize_authentication``. This is
-    the gate for auth-gated suppression of over-broad learned "evasion" signals
-    — it changes NO prompt wording and does NOT force a verdict; it only decides
-    whether the legacy filter-evasion learned signals are injected for THIS
-    email. Unauthenticated mail (Instagram/Dashlane in the corpus) returns False,
-    so its prompt is byte-for-byte unchanged.
+    ``auth`` is the dict returned by ``utils.summarize_authentication``. It does
+    NOT force a verdict or change any prompt wording — RULE 1's dominance is
+    now purely prompt-driven (see BASE_SYSTEM_PROMPT). This function currently
+    has no production caller: it is kept as the deterministic gate that fix
+    session (a-2, DKIM verification) will feed a verified auth verdict into,
+    per the audit's locked decisions. Its unit tests remain load-bearing.
     """
     if not isinstance(auth, dict):
         return False
@@ -2947,70 +2973,20 @@ def is_authenticated_brand_matched(auth: dict) -> bool:
     return False
 
 
-# Substring markers that identify the over-broad legacy learned signals about
-# "benign text prepended / preview manipulation / filter evasion". These are the
-# signals that wrongly junk authenticated, brand-matched bulk mail (which very
-# commonly uses padded/personal-sounding preview text). Matched case-insensitively
-# against each learned hard/soft signal string; ALL markers are about preheader/
-# preview/evasion framing, never about a concrete scam mechanic, so suppressing
-# them for a RULE-1 sender cannot let real spam through (unauthenticated spam
-# never reaches the suppression path, and concrete scam signals are not matched).
-_EVASION_SIGNAL_MARKERS = (
-    "filter evasion",
-    "evade filter",
-    "evade bayesian",
-    "fool bayesian",
-    "preview manipulation",
-    "preview text",
-    "preheader",
-    "prepended before promotional",
-    "prepended before scam",
-    "benign conversational text block",
-    "personal opening paragraphs",
-    "casual/personal opening",
-    "conversational text",
-)
-
-
-def _is_overbroad_evasion_signal(signal_text: str) -> bool:
-    """True if a learned hard/soft signal is one of the over-broad
-    'benign-text-prepended / preview-manipulation / filter-evasion' signals
-    that must be suppressed for genuinely authenticated, brand-matched senders.
-    """
-    s = (signal_text or "").lower()
-    return any(marker in s for marker in _EVASION_SIGNAL_MARKERS)
-
-
-def build_classifier_prompt(signals: dict, account_name: str = None,
-                            suppress_evasion_signals: bool = False) -> str:
+def build_classifier_prompt(signals: dict, account_name: str = None) -> str:
     """Build the full system prompt by injecting learned signals.
 
     When ``account_name`` (the account username/email) is given, only learned
     refinements whose scope includes that account — or "all", or that have no
     scope (treated as "all" for backward compatibility) — are included. This is
     what stops a rule taught for one inbox (P1) from leaking onto the others.
-
-    When ``suppress_evasion_signals`` is True (set by callers for a genuinely
-    authenticated AND brand-matched sender — true RULE 1, see
-    ``is_authenticated_brand_matched``), the legacy over-broad learned signals
-    about "benign text prepended / preview manipulation / filter evasion" are NOT
-    injected. This is a deterministic, code-level guard: it removes only those
-    specific over-broad signals for RULE-1 senders, changes no prompt wording,
-    and leaves the unauthenticated boundary untouched (so Instagram/Dashlane,
-    which are unauthenticated, are unaffected). It also protects existing installs
-    whose signals.json already learned the bad signal — the guard lives in code,
-    not data.
     """
     learned_parts = []
     sig = signals.get("signals", {})
 
     for s in sig.get("hard_signals", []):
-        if suppress_evasion_signals and _is_overbroad_evasion_signal(s):
-            continue
         learned_parts.append(f"- LEARNED HARD SIGNAL: {s}")
     for s in sig.get("soft_signals", []):
-        if suppress_evasion_signals and _is_overbroad_evasion_signal(s):
-            continue
         learned_parts.append(f"- LEARNED SOFT SIGNAL: {s}")
 
     infra = sig.get("known_sending_infrastructure", [])
@@ -3758,19 +3734,7 @@ def classify_eml_offline(raw_email: bytes, signals: dict, *,
     # No soft pre-classifier context exists anymore: a non-hard, non-listed
     # message is routed to the AI to judge from the SERVER-VERIFIED authentication
     # block and content (production parity with run_filter).
-    # Auth-gated suppression (fix b): for a genuinely authenticated AND
-    # brand-matched sender (true RULE 1), do NOT inject the over-broad legacy
-    # "filter-evasion" learned signals into the prompt — deterministic, per-email.
-    _from_domain = (msg_data.get("from_email", "") or "").split("@", 1)[1] \
-        if "@" in (msg_data.get("from_email", "") or "") else ""
-    _auth = summarize_authentication({
-        "Authentication-Results": msg_data.get("auth_results", ""),
-        "Received-SPF": msg_data.get("received_spf", ""),
-        "DKIM-Signature": msg_data.get("dkim_signature", ""),
-    }, from_domain=_from_domain)
-    system_prompt = build_classifier_prompt(
-        signals, account_name,
-        suppress_evasion_signals=is_authenticated_brand_matched(_auth))
+    system_prompt = build_classifier_prompt(signals, account_name)
 
     if not api_key:
         out["ai"] = {"error": "no_api_key"}
@@ -6368,26 +6332,9 @@ USER'S FOLLOW-UP:
                     # No soft pre-classifier context exists anymore: non-hard,
                     # non-listed mail is judged by the AI from the SERVER-VERIFIED
                     # authentication block and content.
-                    # Auth-gated suppression (fix b): for a genuinely authenticated
-                    # AND brand-matched sender (true RULE 1), rebuild the prompt for
-                    # THIS message WITHOUT the over-broad legacy "filter-evasion"
-                    # learned signals. Otherwise reuse the per-account prompt built
-                    # above unchanged (no behavior/perf change for non-RULE-1 mail).
-                    _msg_from_domain = (msg_data.get("from_email", "") or "").split("@", 1)[1] \
-                        if "@" in (msg_data.get("from_email", "") or "") else ""
-                    _msg_auth = summarize_authentication({
-                        "Authentication-Results": msg_data.get("auth_results", ""),
-                        "Received-SPF": msg_data.get("received_spf", ""),
-                        "DKIM-Signature": msg_data.get("dkim_signature", ""),
-                    }, from_domain=_msg_from_domain)
-                    msg_system_prompt = system_prompt
-                    if is_authenticated_brand_matched(_msg_auth):
-                        msg_system_prompt = build_classifier_prompt(
-                            signals, account.get("username", ""),
-                            suppress_evasion_signals=True)
                     # Classify via Claude API
                     result, api_response = classify_email(
-                        client, msg_system_prompt, msg_data, model, max_tokens, logger,
+                        client, system_prompt, msg_data, model, max_tokens, logger,
                     )
 
                     # Record token usage

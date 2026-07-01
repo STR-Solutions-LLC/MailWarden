@@ -85,10 +85,35 @@ def load_config() -> dict:
         return json.load(f)
 
 
+# Retired shipped-default signals (fix a-1). Stripped in-memory on every load so
+# existing installs whose memory/signals.json inherited them stop surfacing them
+# without a forced disk rewrite. EXACT-match only — never substring — so a
+# genuine user-taught signal is never collateral. Keep in sync across the 4 copies.
+_RETIRED_DEFAULT_SIGNALS = frozenset({
+    "Benign conversational text block (meeting scheduling, personal reflection) prepended before promotional/scam content - used as filter evasion",
+    "CSS class names using random nature/object word combinations (e.g., 'nebula-quartz', 'pebble-orbit', 'aurora-cinder', 'thistle-comet') in HTML emails",
+    "Mismatch between casual/personal opening paragraphs and promotional closing content",
+    "Points/rewards expiration urgency with specific dollar amounts ($100)",
+})
+
+
+def scrub_retired_signals(data: dict) -> dict:
+    """Strip retired shipped-default signals in-memory. Returns the same dict."""
+    if not isinstance(data, dict):
+        return data
+    sig = data.get("signals")
+    if isinstance(sig, dict):
+        for key in ("hard_signals", "soft_signals"):
+            vals = sig.get(key)
+            if isinstance(vals, list):
+                sig[key] = [s for s in vals if s not in _RETIRED_DEFAULT_SIGNALS]
+    return data
+
+
 def load_signals() -> dict:
     try:
         with open(SIGNALS_PATH, "r") as f:
-            return json.load(f)
+            return scrub_retired_signals(json.load(f))
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 

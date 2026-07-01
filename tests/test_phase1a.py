@@ -490,7 +490,10 @@ def test_classifier_renders_protect_as_threat_pattern():
          "headline": "PayPal credential phish", "rationale": "Fake login link."}]}
     out = spam_filter.build_classifier_prompt(signals, account_name=None)
     assert "LEARNED THREAT PATTERN: PayPal credential phish" in out
-    assert "USER PREFERENCE" not in out
+    # A protect refinement must NOT render as a curate USER-PREFERENCE line.
+    # (Scoped to the rendered refinement line: the BASE prompt itself now mentions
+    # "USER PREFERENCE (curate)" in RULE 1's curate carve-out sentence — fix a-1.)
+    assert "USER PREFERENCE (curate): PayPal credential phish" not in out
 
 
 def test_base_prompt_has_whole_context_directive():
