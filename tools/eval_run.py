@@ -11,6 +11,8 @@ Usage:
   tests/.venv/bin/python tools/eval_run.py --offline        # free: pre-classifier only
   tests/.venv/bin/python tools/eval_run.py --out /tmp/r.txt # save full report
   tests/.venv/bin/python tools/eval_run.py --yes            # skip cost prompt
+  tests/.venv/bin/python tools/eval_run.py --model claude-sonnet-4-6  # override shipped model
+  tests/.venv/bin/python tools/eval_run.py --full            # add per-email verdict listing
 
 Reads corpus from ~/Desktop/MailWarden-Benchmark/ (three labeled folders).
 API key is read from $ANTHROPIC_API_KEY or ~/MailWarden/config/config.json.
@@ -31,17 +33,63 @@ DEFAULT_SIGNALS = REPO / "resources" / "defaults" / "signals.json"
 CONFIG = Path.home() / "MailWarden" / "config" / "config.json"
 
 # Shipped defaults — hardcoded so this harness measures the out-of-box experience,
-# not your personal tuned config.
+# not your personal tuned config. --model overrides SHIPPED_MODEL for A/B runs.
 SHIPPED_MODEL = "claude-haiku-4-5-20251001"
 SHIPPED_THRESHOLD = 0.85
-COST_PER_EMAIL = 0.0043   # ~Haiku 4.5 ballpark; actual varies
+
+# Ballpark per-email token estimate, derived from this install's real
+# lifetime average (~/MailWarden/memory/token_usage.json). Used only to
+# size the pre-run cost confirmation; actual usage varies per email.
+AVG_INPUT_TOKENS_PER_EMAIL = 1950
+AVG_OUTPUT_TOKENS_PER_EMAIL = 225
+
+# $ per million tokens (input, output). Dev-tool estimate only — not the
+# source of truth for billing; do not import this elsewhere.
+PRICING_PER_MTOK = {
+    "claude-haiku-4-5": (1.0, 5.0),    # matches any claude-haiku-4-5* id
+    "claude-sonnet-4-6": (3.0, 15.0),  # exact match only
+}
+
+
+def _pricing_for_model(model):
+    """Return (input_$/MTok, output_$/MTok) for a model id, or None if unknown."""
+    if model.startswith("claude-haiku-4-5"):
+        return PRICING_PER_MTOK["claude-haiku-4-5"]
+    if model == "claude-sonnet-4-6":
+        return PRICING_PER_MTOK["claude-sonnet-4-6"]
+    return None
+
+
+def estimate_cost(n_emails, model):
+    """Return (cost_usd_or_None, human_description) for a run of n_emails.
+
+    cost_usd is None when the model has no entry in PRICING_PER_MTOK — the
+    description still reports the token estimate in that case, tagged
+    "unknown pricing".
+    """
+    est_input = n_emails * AVG_INPUT_TOKENS_PER_EMAIL
+    est_output = n_emails * AVG_OUTPUT_TOKENS_PER_EMAIL
+    pricing = _pricing_for_model(model)
+    if pricing is None:
+        desc = (f"~{est_input:,} input / ~{est_output:,} output tokens "
+                f"on {model} (unknown pricing, ballpark tokens only)")
+        return None, desc
+    in_price, out_price = pricing
+    cost = (est_input / 1_000_000) * in_price + (est_output / 1_000_000) * out_price
+    desc = (f"~${cost:.2f}  (~{est_input:,} input / ~{est_output:,} output tokens "
+            f"on {model} @ ${in_price}/${out_price} per MTok, ballpark only)")
+    return cost, desc
 
 
 def run_eval(benchmark_dir, signals, api_key, model, threshold,
-             offline=False, verbose=False):
+             offline=False, verbose=False, full=False):
     """Core eval logic. Returns {lines: [str, ...], metrics: dict}.
 
     Separated from main() so tests can call it directly with a mock spam_filter.
+
+    ``full=False`` (default) preserves the exact report format from before
+    the --full flag existed — byte-identical --out files depend on this.
+    ``full=True`` appends a final section listing every corpus email.
     """
     import spam_filter
     from eval_corpus import build_corpus, score_results
@@ -121,6 +169,13 @@ def run_eval(benchmark_dir, signals, api_key, model, threshold,
     else:
         w("\nNo misclassifications.")
 
+    if full:
+        w(f"\nFull verdict listing ({len(items)}):")
+        rows = sorted(zip(items, verdicts), key=lambda pair: pair[0]["filename"])
+        for item, verdict in rows:
+            label_tag = "SPAM " if item["label"] == "spam" else "LEGIT"
+            w(f"  {label_tag}  {verdict:7}  {item['filename']}")
+
     return {"lines": lines, "metrics": metrics}
 
 
@@ -148,10 +203,20 @@ def main():
         "--verbose", action="store_true",
         help="print every email, not just misclassified ones"
     )
+    ap.add_argument(
+        "--model", default=None,
+        help=f"override the model used for classification (default: shipped "
+             f"model, {SHIPPED_MODEL})"
+    )
+    ap.add_argument(
+        "--full", action="store_true",
+        help="append a per-email verdict listing to the report"
+    )
     args = ap.parse_args()
 
-    # Shipped defaults — do not read model/threshold/signals from user config.
-    model = SHIPPED_MODEL
+    # Shipped defaults — do not read threshold/signals from user config.
+    # --model may override the shipped model for A/B comparisons.
+    model = args.model or SHIPPED_MODEL
     threshold = SHIPPED_THRESHOLD
     signals = {}
     try:
@@ -173,10 +238,9 @@ def main():
     if not args.offline and not args.yes:
         from eval_corpus import build_corpus
         items = build_corpus(Path(args.benchmark_dir))
-        est = len(items) * COST_PER_EMAIL
+        _, cost_desc = estimate_cost(len(items), model)
         print(f"Corpus: {len(items)} emails.")
-        print(f"Estimated cost: ~${est:.2f} "
-              f"(~${COST_PER_EMAIL}/email on {model}, ballpark only).")
+        print(f"Estimated cost: {cost_desc}.")
         answer = input("Proceed? [y/N] ").strip().lower()
         if answer not in ("y", "yes"):
             print("Aborted.")
@@ -190,6 +254,7 @@ def main():
         threshold=threshold,
         offline=args.offline,
         verbose=args.verbose,
+        full=args.full,
     )
 
     if args.out:
