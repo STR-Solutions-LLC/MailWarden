@@ -60,7 +60,18 @@ DEFAULT_CONFIG: dict = {
     "accounts": [],
     "anthropic": {
         "api_key": "",
+        # classify_mode "cascade" = two-model double-check: screen_model
+        # judges every email; confirm_model re-judges anything the screen
+        # would junk, and mail is junked only when both agree (rescue-only).
+        # "single" runs `model` on every email like pre-cascade releases.
+        # load_config's _deep_merge back-fills these keys onto older saved
+        # configs, so ALL existing installs move to the cascade on upgrade
+        # (Matt's decision, 2026-07-02); `model` is retained and used only
+        # when classify_mode == "single".
+        "classify_mode": "cascade",
         "model": "claude-haiku-4-5-20251001",
+        "screen_model": "claude-haiku-4-5-20251001",
+        "confirm_model": "claude-sonnet-4-6",
     },
     "filter": {
         "dry_run": True,

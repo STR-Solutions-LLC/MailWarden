@@ -13,6 +13,7 @@ Usage:
   tests/.venv/bin/python tools/eval_run.py --yes            # skip cost prompt
   tests/.venv/bin/python tools/eval_run.py --model claude-sonnet-4-6  # override shipped model
   tests/.venv/bin/python tools/eval_run.py --full            # add per-email verdict listing
+  tests/.venv/bin/python tools/eval_run.py --cascade         # two-model cascade (screen=--model/shipped, confirm=--confirm-model)
 
 Reads corpus from ~/Desktop/MailWarden-Benchmark/ (three labeled folders).
 API key is read from $ANTHROPIC_API_KEY or ~/MailWarden/config/config.json.
@@ -35,7 +36,13 @@ CONFIG = Path.home() / "MailWarden" / "config" / "config.json"
 # Shipped defaults — hardcoded so this harness measures the out-of-box experience,
 # not your personal tuned config. --model overrides SHIPPED_MODEL for A/B runs.
 SHIPPED_MODEL = "claude-haiku-4-5-20251001"
+SHIPPED_CONFIRM_MODEL = "claude-sonnet-4-6"
 SHIPPED_THRESHOLD = 0.85
+
+# Cost-estimate assumption for --cascade runs: the share of corpus emails the
+# screen model junks (each one costs a second, confirm-model call). Ballpark
+# only — a labeled benchmark corpus is spam-heavy, so assume half.
+ASSUMED_CONFIRM_FRACTION = 0.5
 
 # Ballpark per-email token estimate, derived from this install's real
 # lifetime average (~/MailWarden/memory/token_usage.json). Used only to
@@ -60,12 +67,17 @@ def _pricing_for_model(model):
     return None
 
 
-def estimate_cost(n_emails, model):
+def estimate_cost(n_emails, model, cascade=False, confirm_model=None):
     """Return (cost_usd_or_None, human_description) for a run of n_emails.
 
     cost_usd is None when the model has no entry in PRICING_PER_MTOK — the
     description still reports the token estimate in that case, tagged
     "unknown pricing".
+
+    When ``cascade`` is True, a second-call term is added: the confirm model
+    is assumed to run on ASSUMED_CONFIRM_FRACTION of the corpus (the confirm
+    call fires only on screen-junk verdicts). Non-cascade output is
+    byte-identical to before the cascade existed.
     """
     est_input = n_emails * AVG_INPUT_TOKENS_PER_EMAIL
     est_output = n_emails * AVG_OUTPUT_TOKENS_PER_EMAIL
@@ -76,13 +88,33 @@ def estimate_cost(n_emails, model):
         return None, desc
     in_price, out_price = pricing
     cost = (est_input / 1_000_000) * in_price + (est_output / 1_000_000) * out_price
+    if cascade and confirm_model:
+        c_pricing = _pricing_for_model(confirm_model)
+        n_confirm = n_emails * ASSUMED_CONFIRM_FRACTION
+        c_input = n_confirm * AVG_INPUT_TOKENS_PER_EMAIL
+        c_output = n_confirm * AVG_OUTPUT_TOKENS_PER_EMAIL
+        if c_pricing is None:
+            desc = (f"~${cost:.2f} screen on {model} + unknown-priced confirm "
+                    f"({confirm_model}) on ~{int(n_confirm)} emails "
+                    f"(assumed {ASSUMED_CONFIRM_FRACTION:.0%} junk rate)")
+            return None, desc
+        c_in_price, c_out_price = c_pricing
+        c_cost = ((c_input / 1_000_000) * c_in_price
+                  + (c_output / 1_000_000) * c_out_price)
+        total = cost + c_cost
+        desc = (f"~${total:.2f}  (screen {model} on all {n_emails} ~${cost:.2f} "
+                f"+ confirm {confirm_model} on ~{int(n_confirm)} "
+                f"(assumed {ASSUMED_CONFIRM_FRACTION:.0%} junk rate) "
+                f"~${c_cost:.2f}, ballpark only)")
+        return total, desc
     desc = (f"~${cost:.2f}  (~{est_input:,} input / ~{est_output:,} output tokens "
             f"on {model} @ ${in_price}/${out_price} per MTok, ballpark only)")
     return cost, desc
 
 
 def run_eval(benchmark_dir, signals, api_key, model, threshold,
-             offline=False, verbose=False, full=False):
+             offline=False, verbose=False, full=False,
+             cascade=False, confirm_model=SHIPPED_CONFIRM_MODEL):
     """Core eval logic. Returns {lines: [str, ...], metrics: dict}.
 
     Separated from main() so tests can call it directly with a mock spam_filter.
@@ -90,6 +122,11 @@ def run_eval(benchmark_dir, signals, api_key, model, threshold,
     ``full=False`` (default) preserves the exact report format from before
     the --full flag existed — byte-identical --out files depend on this.
     ``full=True`` appends a final section listing every corpus email.
+
+    ``cascade=True`` runs the two-model cascade through the REAL
+    classify_eml_offline cascade path (``model`` screens, ``confirm_model``
+    re-judges screen-junk verdicts). Non-cascade runs pass exactly the same
+    kwargs as before the flag existed — byte-identical reports.
     """
     import spam_filter
     from eval_corpus import build_corpus, score_results
@@ -115,18 +152,27 @@ def run_eval(benchmark_dir, signals, api_key, model, threshold,
     w(f"Corpus: {len(items)} emails  —  "
       f"{spam_count} spam ({inbox_spam} inbox, {provider_spam} provider-flagged), "
       f"{legit_count} legit")
-    w(f"Model:  {model}   threshold: {threshold}   offline: {offline}")
+    if cascade:
+        w(f"Model:  {model} -> confirm {confirm_model} (cascade)   "
+          f"threshold: {threshold}   offline: {offline}")
+    else:
+        w(f"Model:  {model}   threshold: {threshold}   offline: {offline}")
     w("=" * 80)
 
     verdicts = []
     for item in items:
         try:
-            res = spam_filter.classify_eml_offline(
-                item["raw"], signals,
+            kw = dict(
                 api_key=(api_key if not offline else ""),
                 model=model,
                 threshold=threshold,
                 run_dnsbl=False,
+            )
+            if cascade:
+                kw["classify_mode"] = "cascade"
+                kw["confirm_model"] = confirm_model
+            res = spam_filter.classify_eml_offline(
+                item["raw"], signals, **kw,
             )
             verdict = res.get("final_decision", "UNKNOWN")
         except Exception as e:
@@ -212,6 +258,16 @@ def main():
         "--full", action="store_true",
         help="append a per-email verdict listing to the report"
     )
+    ap.add_argument(
+        "--cascade", action="store_true",
+        help="two-model cascade: --model (or shipped model) screens every "
+             "email; --confirm-model re-judges screen-junk verdicts; junked "
+             "only when both agree"
+    )
+    ap.add_argument(
+        "--confirm-model", default=SHIPPED_CONFIRM_MODEL,
+        help=f"confirm model for --cascade (default: {SHIPPED_CONFIRM_MODEL})"
+    )
     args = ap.parse_args()
 
     # Shipped defaults — do not read threshold/signals from user config.
@@ -238,7 +294,9 @@ def main():
     if not args.offline and not args.yes:
         from eval_corpus import build_corpus
         items = build_corpus(Path(args.benchmark_dir))
-        _, cost_desc = estimate_cost(len(items), model)
+        _, cost_desc = estimate_cost(len(items), model,
+                                     cascade=args.cascade,
+                                     confirm_model=args.confirm_model)
         print(f"Corpus: {len(items)} emails.")
         print(f"Estimated cost: {cost_desc}.")
         answer = input("Proceed? [y/N] ").strip().lower()
@@ -255,6 +313,8 @@ def main():
         offline=args.offline,
         verbose=args.verbose,
         full=args.full,
+        cascade=args.cascade,
+        confirm_model=args.confirm_model,
     )
 
     if args.out:

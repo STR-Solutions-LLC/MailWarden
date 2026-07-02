@@ -257,3 +257,94 @@ def test_main_cli_without_full_flag_omits_section_from_out_file(tmp_path, monkey
     mod.main()
     text = out_file.read_text()
     assert "Full verdict listing" not in text
+
+
+# ─── --cascade ────────────────────────────────────────────────────────────────
+
+def test_run_eval_cascade_threads_mode_and_confirm_model(tmp_path, monkeypatch):
+    benchmark = make_benchmark(tmp_path, {"1-Spam": [("sp.eml", SPAM_EML)]})
+    mod = _load_eval_run()
+    calls = []
+    monkeypatch.setitem(sys.modules, "spam_filter", _fake_spam_filter(calls))
+
+    mod.run_eval(
+        benchmark_dir=benchmark, signals={}, api_key="fake",
+        model=mod.SHIPPED_MODEL, threshold=0.85, offline=False,
+        cascade=True, confirm_model="claude-sonnet-4-6",
+    )
+    assert calls[0]["classify_mode"] == "cascade"
+    assert calls[0]["confirm_model"] == "claude-sonnet-4-6"
+    assert calls[0]["model"] == mod.SHIPPED_MODEL
+
+
+def test_run_eval_non_cascade_kwargs_unchanged(tmp_path, monkeypatch):
+    """Without --cascade the classify kwargs are exactly the pre-cascade set —
+    no classify_mode / confirm_model keys at all (back-compat contract)."""
+    benchmark = make_benchmark(tmp_path, {"1-Spam": [("sp.eml", SPAM_EML)]})
+    mod = _load_eval_run()
+    calls = []
+    monkeypatch.setitem(sys.modules, "spam_filter", _fake_spam_filter(calls))
+
+    mod.run_eval(
+        benchmark_dir=benchmark, signals={}, api_key="fake",
+        model=mod.SHIPPED_MODEL, threshold=0.85, offline=False,
+    )
+    assert "classify_mode" not in calls[0]
+    assert "confirm_model" not in calls[0]
+
+
+def test_run_eval_cascade_header_names_both_models(tmp_path, monkeypatch):
+    benchmark = make_benchmark(tmp_path, {"1-Spam": [("sp.eml", SPAM_EML)]})
+    mod = _load_eval_run()
+    monkeypatch.setitem(sys.modules, "spam_filter", _fake_spam_filter())
+
+    result = mod.run_eval(
+        benchmark_dir=benchmark, signals={}, api_key="fake",
+        model=mod.SHIPPED_MODEL, threshold=0.85, offline=False,
+        cascade=True, confirm_model="claude-sonnet-4-6",
+    )
+    header = [ln for ln in result["lines"] if ln.startswith("Model:")][0]
+    assert mod.SHIPPED_MODEL in header
+    assert "claude-sonnet-4-6" in header
+    assert "cascade" in header
+
+
+def test_main_cli_cascade_flag_reaches_classifier(tmp_path, monkeypatch):
+    benchmark = make_benchmark(tmp_path, {"1-Spam": [("sp.eml", SPAM_EML)]})
+    mod = _load_eval_run()
+    calls = []
+    monkeypatch.setitem(sys.modules, "spam_filter", _fake_spam_filter(calls))
+    out_file = tmp_path / "report.txt"
+
+    monkeypatch.setattr(sys, "argv", [
+        "eval_run.py", "--offline", "--benchmark-dir", str(benchmark),
+        "--cascade", "--out", str(out_file),
+    ])
+    mod.main()
+    assert calls[0]["classify_mode"] == "cascade"
+    assert calls[0]["confirm_model"] == mod.SHIPPED_CONFIRM_MODEL
+    assert "cascade" in out_file.read_text()
+
+
+def test_estimate_cost_cascade_adds_confirm_term():
+    mod = _load_eval_run()
+    single, _ = mod.estimate_cost(10, "claude-haiku-4-5-20251001")
+    total, desc = mod.estimate_cost(
+        10, "claude-haiku-4-5-20251001",
+        cascade=True, confirm_model="claude-sonnet-4-6")
+    n_confirm = 10 * mod.ASSUMED_CONFIRM_FRACTION
+    expected_confirm = (
+        (n_confirm * mod.AVG_INPUT_TOKENS_PER_EMAIL / 1_000_000) * 3.0
+        + (n_confirm * mod.AVG_OUTPUT_TOKENS_PER_EMAIL / 1_000_000) * 15.0)
+    assert total == single + expected_confirm
+    assert "claude-sonnet-4-6" in desc
+    assert "junk rate" in desc
+
+
+def test_estimate_cost_non_cascade_output_byte_identical():
+    """cascade=False must produce exactly the pre-cascade estimate text."""
+    mod = _load_eval_run()
+    cost, desc = mod.estimate_cost(10, "claude-haiku-4-5-20251001")
+    cost2, desc2 = mod.estimate_cost(10, "claude-haiku-4-5-20251001",
+                                     cascade=False, confirm_model=None)
+    assert (cost, desc) == (cost2, desc2)

@@ -396,7 +396,17 @@ def _run_classify_eml() -> int:
         cfg = {}
     anthro = cfg.get("anthropic", {}) if isinstance(cfg, dict) else {}
     api_key = os.environ.get("ANTHROPIC_API_KEY", "") or anthro.get("api_key", "") or ""
-    model = model_override or anthro.get("model") or "claude-haiku-4-5-20251001"
+    # Follow the configured classification mode (same as the live filter).
+    # An explicit --model override forces a single-model run on that model.
+    classify_mode = anthro.get("classify_mode", "cascade")
+    confirm_model = anthro.get("confirm_model", "claude-sonnet-4-6")
+    if model_override:
+        model = model_override
+        classify_mode = "single"
+    elif classify_mode == "cascade":
+        model = anthro.get("screen_model") or "claude-haiku-4-5-20251001"
+    else:
+        model = anthro.get("model") or "claude-haiku-4-5-20251001"
     threshold = 0.85
     if threshold_override is not None:
         try:
@@ -419,6 +429,7 @@ def _run_classify_eml() -> int:
     res = spam_filter.classify_eml_offline(
         raw, signals,
         api_key=api_key, model=model, max_tokens=500,
+        classify_mode=classify_mode, confirm_model=confirm_model,
         threshold=threshold, account_name=account,
         run_dnsbl=run_dnsbl, logger=log,
     )
@@ -455,6 +466,20 @@ def _run_classify_eml() -> int:
     if usage:
         print(f"  tokens:     in={usage['input_tokens']} out={usage['output_tokens']} "
               f"model={usage['model']}")
+    cascade = res.get("cascade")
+    if cascade:
+        if cascade.get("confirm_called"):
+            stage2 = ("rescued (delivered)" if cascade.get("rescued")
+                      else "confirmed junk")
+            print(f"  cascade:    {cascade.get('screen_model')} junked -> "
+                  f"{cascade.get('confirm_model')} {stage2}")
+        else:
+            print(f"  cascade:    screen ({cascade.get('screen_model')}) "
+                  "passed it — confirm stage not needed")
+        usage2 = res.get("usage_confirm")
+        if usage2:
+            print(f"  tokens(2):  in={usage2['input_tokens']} "
+                  f"out={usage2['output_tokens']} model={usage2['model']}")
     print("-" * 64)
     final = res.get("final_decision")
     label = {"JUNK": "WOULD JUNK", "PASS": "WOULD PASS",

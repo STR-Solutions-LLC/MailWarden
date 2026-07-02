@@ -3728,6 +3728,39 @@ def clamp_confidence(value) -> float:
     return max(0.0, min(1.0, v))
 
 
+def _classify_create(client: anthropic.Anthropic, model: str, max_tokens: int,
+                     system_prompt: str, user_message: str,
+                     logger: logging.Logger):
+    """One messages.create for classification, temperature pinned to 0.
+
+    temperature=0 is the determinism pin from commit 344c0df — every model
+    that accepts it (the shipped defaults do) always gets it. Some newer
+    models 400-reject sampling parameters entirely; for those, retry ONCE
+    without temperature and warn that responses may not be deterministic.
+    Any other error propagates to the caller's existing handlers unchanged.
+    """
+    try:
+        return client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            temperature=0,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_message}],
+        )
+    except anthropic.BadRequestError as e:
+        if "temperature" not in str(e).lower():
+            raise
+        logger.warning(
+            f"Model {model} rejected temperature=0; retrying once without "
+            "temperature (responses may not be deterministic on this model)")
+        return client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_message}],
+        )
+
+
 def classify_email(client: anthropic.Anthropic, system_prompt: str,
                    msg_data: dict, model: str, max_tokens: int,
                    logger: logging.Logger,
@@ -3736,19 +3769,29 @@ def classify_email(client: anthropic.Anthropic, system_prompt: str,
     Returns (parsed_result_dict, raw_response) or (None, None).
 
     ``approved_domains`` (optional) is threaded through to build_user_message
-    (owner-approved sender domains); default None keeps the prompt unchanged."""
-    user_message = build_user_message(msg_data, approved_domains=approved_domains)
+    (owner-approved sender domains); default None keeps the prompt unchanged.
 
+    Thin wrapper: builds the sanitized user message once and delegates to
+    _classify_once (the single-call engine shared with the cascade)."""
+    user_message = build_user_message(msg_data, approved_domains=approved_domains)
+    return _classify_once(client, system_prompt, user_message, model,
+                          max_tokens, logger)
+
+
+def _classify_once(client: anthropic.Anthropic, system_prompt: str,
+                   user_message: str, model: str, max_tokens: int,
+                   logger: logging.Logger, site: str = "classify") -> tuple:
+    """One classification call on an ALREADY-BUILT user message.
+
+    Extracted verbatim from classify_email so the cascade's confirm stage can
+    re-judge the exact same sanitized message (no second build_user_message,
+    no new unsanitized surface). ``site`` only changes the log line so cascade
+    stages are attributable in the filter log."""
     for attempt in range(3):
         try:
-            logger.info(f"API call: model={model} site=classify")
-            response = client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                temperature=0,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_message}],
-            )
+            logger.info(f"API call: model={model} site={site}")
+            response = _classify_create(client, model, max_tokens,
+                                        system_prompt, user_message, logger)
             text = response.content[0].text.strip()
 
             # Try to parse JSON, handling possible markdown fences
@@ -3803,6 +3846,131 @@ def classify_email(client: anthropic.Anthropic, system_prompt: str,
     return None, None
 
 
+def _synthesize_rescue_result(screen_result: dict, confirm_result: dict | None,
+                              confirm_model: str) -> dict:
+    """Build the NOT_SPAM verdict returned when the confirm stage rescues a
+    screen-junked message.
+
+    Shaped exactly like a normal classification dict so every downstream
+    consumer (threshold check, log_decision, explain, learner) behaves
+    normally and the message is delivered. Confidence comes from the confirm
+    verdict when it produced one, else from the screen verdict; signals_hit
+    is kept from the screen so the log shows what the screen model saw."""
+    if confirm_result is not None and confirm_result.get("decision") == "NOT_SPAM":
+        confidence = clamp_confidence(confirm_result.get("confidence", 0))
+        reasoning = (confirm_result.get("reasoning", "") or "")
+        detail = f"confirm model said NOT_SPAM: {reasoning}" if reasoning \
+            else "confirm model said NOT_SPAM"
+    elif confirm_result is not None:
+        # SPAM but below threshold — the confirm stage was not sure enough.
+        confidence = clamp_confidence(confirm_result.get("confidence", 0))
+        detail = "confirm model was not confident enough to junk"
+    else:
+        # Confirm call failed (API error / unparseable) — fail open to deliver.
+        confidence = clamp_confidence(screen_result.get("confidence", 0))
+        detail = "confirm call failed; failing open to deliver"
+    return {
+        "decision": "NOT_SPAM",
+        "confidence": confidence,
+        "signals_hit": screen_result.get("signals_hit", []),
+        "reasoning": (f"Rescued by cascade confirm stage ({confirm_model}): "
+                      f"screen model junked but {detail}."),
+    }
+
+
+def classify_email_cascade(client: anthropic.Anthropic, system_prompt: str,
+                           msg_data: dict, screen_model: str,
+                           confirm_model: str, max_tokens: int,
+                           threshold: float, logger: logging.Logger,
+                           approved_domains: set = None) -> tuple:
+    """Two-stage cascade classification (screen -> confirm, rescue-only).
+
+    Stage 1 (``screen_model``) judges every email exactly like classify_email.
+    Stage 2 (``confirm_model``) runs ONLY when the screen verdict would junk
+    the message (SPAM at/above ``threshold``); the message is junked only if
+    the confirm stage ALSO says SPAM at/above threshold. The rescue-only rule
+    is structural: the confirm call is never made when the screen delivers,
+    so it can never add junk to a message the screen passed.
+
+    Both stages judge the exact same user message (one build_user_message
+    call), so the confirm stage reuses the same sanitization/prompt-hardening
+    path as the screen stage.
+
+    Returns (result, calls, meta):
+      result — final classification dict, or None when the SCREEN call failed
+               (fail-open, identical to classify_email's failure contract)
+      calls  — list of (model, api_response_or_None), one per API call made,
+               for per-model token accounting
+      meta   — {"screen_model", "confirm_model", "confirm_called", "rescued",
+                "screen_decision", "confirm_decision"}
+    """
+    user_message = build_user_message(msg_data, approved_domains=approved_domains)
+    meta = {"screen_model": screen_model, "confirm_model": confirm_model,
+            "confirm_called": False, "rescued": False,
+            "screen_decision": None, "confirm_decision": None}
+
+    screen_result, screen_resp = _classify_once(
+        client, system_prompt, user_message, screen_model, max_tokens,
+        logger, site="classify_screen")
+    calls = [(screen_model, screen_resp)]
+
+    if screen_result is None:
+        # Screen failure: fail open exactly like single-model mode (caller
+        # delivers / retries next run).
+        return None, calls, meta
+
+    meta["screen_decision"] = screen_result.get("decision")
+    screen_would_junk = (
+        screen_result.get("decision") == "SPAM"
+        and clamp_confidence(screen_result.get("confidence", 0)) >= threshold)
+    if not screen_would_junk:
+        # Screen delivers -> no confirm call: verdict byte-identical to
+        # single-model mode and no second-model cost on passed mail.
+        return screen_result, calls, meta
+
+    meta["confirm_called"] = True
+    confirm_result, confirm_resp = _classify_once(
+        client, system_prompt, user_message, confirm_model, max_tokens,
+        logger, site="classify_confirm")
+    calls.append((confirm_model, confirm_resp))
+    if confirm_result is not None:
+        meta["confirm_decision"] = confirm_result.get("decision")
+
+    confirm_would_junk = (
+        confirm_result is not None
+        and confirm_result.get("decision") == "SPAM"
+        and clamp_confidence(confirm_result.get("confidence", 0)) >= threshold)
+    if confirm_would_junk:
+        # Both stages agree -> junk, reported with the confirm verdict.
+        return confirm_result, calls, meta
+
+    # RESCUE: the confirm stage delivered (NOT_SPAM, or SPAM below threshold,
+    # or the call failed -> fail open). Only ever reached from a screen-junk.
+    meta["rescued"] = True
+    logger.info(
+        f"  CASCADE RESCUE: {screen_model} junked but {confirm_model} did "
+        "not — delivering")
+    return (_synthesize_rescue_result(screen_result, confirm_result,
+                                      confirm_model),
+            calls, meta)
+
+
+def _cascade_action_suffix(meta: dict) -> str:
+    """Human-readable cascade attribution appended to the decisions.log
+    ``action`` field. Empty when the confirm stage never ran.
+
+    log_decision does NOT sanitize ``action``, so the model names (which come
+    from user-editable config) are passed through _sanitize_decision_log_field
+    here to keep the line-oriented log unforgeable."""
+    if not meta or not meta.get("confirm_called"):
+        return ""
+    s = _sanitize_decision_log_field(meta.get("screen_model", ""))
+    c = _sanitize_decision_log_field(meta.get("confirm_model", ""))
+    if meta.get("rescued"):
+        return f" (cascade: {s} junked, {c} rescued -> delivered)"
+    return f" (cascade: {s}+{c} both junked)"
+
+
 def _ensure_list_sets(d: dict) -> dict:
     """Return a copy of an allow/block-list dict with the lookup sets the
     check_* helpers expect, computing them from the raw lists when absent.
@@ -3838,6 +4006,8 @@ def _ensure_list_sets(d: dict) -> dict:
 def classify_eml_offline(raw_email: bytes, signals: dict, *,
                          api_key: str = "",
                          model: str = "claude-haiku-4-5-20251001",
+                         classify_mode: str = "single",
+                         confirm_model: str = "claude-sonnet-4-6",
                          max_tokens: int = 500,
                          threshold: float = 0.85,
                          account_name: str = None,
@@ -3860,6 +4030,11 @@ def classify_eml_offline(raw_email: bytes, signals: dict, *,
     ``account_name`` is accepted now for forward-compatibility with per-account
     learned-rule scoping (P1); it is not yet used to filter the prompt.
 
+    ``classify_mode`` selects single-model ("single", default — behavior
+    byte-identical to before the cascade existed) or the two-model cascade
+    ("cascade": ``model`` screens, ``confirm_model`` re-judges screen-junk
+    verdicts; junked only when both agree — see classify_email_cascade).
+
     Returns a dict::
 
         {
@@ -3870,7 +4045,11 @@ def classify_eml_offline(raw_email: bytes, signals: dict, *,
           "final_decision": "JUNK" | "PASS" | "UNKNOWN",
           "decided_by": "pre-classifier" | "ai",
           "reason": str,
-          "usage": {input_tokens, output_tokens, model}   # only if AI was called
+          "usage": {input_tokens, output_tokens, model},  # only if AI was called
+          # cascade mode only:
+          "cascade": {screen_model, confirm_model, confirm_called, rescued,
+                      screen_decision, confirm_decision},
+          "usage_confirm": {input_tokens, output_tokens, model}  # if confirm ran
         }
     """
     if logger is None:
@@ -3988,10 +4167,20 @@ def classify_eml_offline(raw_email: bytes, signals: dict, *,
         return out
 
     client = anthropic.Anthropic(api_key=api_key, timeout=60.0, max_retries=4)
-    result, api_response = classify_email(
-        client, system_prompt, msg_data, model, max_tokens, logger,
-        approved_domains=approved_domains,
-    )
+    cascade_calls = None
+    if classify_mode == "cascade":
+        result, cascade_calls, cascade_meta = classify_email_cascade(
+            client, system_prompt, msg_data, model, confirm_model,
+            max_tokens, threshold, logger,
+            approved_domains=approved_domains,
+        )
+        api_response = cascade_calls[0][1]
+        out["cascade"] = cascade_meta
+    else:
+        result, api_response = classify_email(
+            client, system_prompt, msg_data, model, max_tokens, logger,
+            approved_domains=approved_domains,
+        )
 
     if result is None:
         out["ai"] = {"error": "classification_failed"}
@@ -4022,6 +4211,22 @@ def classify_eml_offline(raw_email: bytes, signals: dict, *,
             }
         except Exception:
             pass
+
+    # Cascade: also surface the confirm call's usage (second entry in the
+    # per-call list). ``usage`` keeps its pre-cascade shape (the screen call)
+    # for back-compat; NO persistence here — this path never writes
+    # token_usage.json (that is run_filter's job on the live path only).
+    if cascade_calls is not None and len(cascade_calls) > 1:
+        c_model, c_resp = cascade_calls[1]
+        if c_resp is not None and hasattr(c_resp, "usage"):
+            try:
+                out["usage_confirm"] = {
+                    "input_tokens": c_resp.usage.input_tokens,
+                    "output_tokens": c_resp.usage.output_tokens,
+                    "model": c_model,
+                }
+            except Exception:
+                pass
 
     return out
 
@@ -4808,6 +5013,12 @@ def run_filter(force: bool = False):
     client = anthropic.Anthropic(api_key=api_config.get("api_key", ""), timeout=60.0, max_retries=4)
     model = api_config.get("model", "claude-haiku-4-5-20251001")
     max_tokens = api_config.get("max_tokens", 500)
+    # Two-model cascade (shipped default). The fallback here is "cascade" to
+    # match DEFAULT_CONFIG — ALL installs move to the cascade on upgrade
+    # (Matt, 2026-07-02); `model` above is used only in "single" mode.
+    classify_mode = api_config.get("classify_mode", "cascade")
+    screen_model = api_config.get("screen_model", "claude-haiku-4-5-20251001")
+    confirm_model = api_config.get("confirm_model", "claude-sonnet-4-6")
 
     total_evaluated = 0
     total_spam = 0
@@ -6737,17 +6948,33 @@ USER'S FOLLOW-UP:
                     # non-listed mail is judged by the AI from the SERVER-VERIFIED
                     # authentication block and content.
                     # Classify via Claude API
-                    result, api_response = classify_email(
-                        client, system_prompt, msg_data, model, max_tokens, logger,
-                        approved_domains=approved_domains,
-                    )
+                    cascade_meta = None
+                    if classify_mode == "cascade":
+                        result, cascade_calls, cascade_meta = classify_email_cascade(
+                            client, system_prompt, msg_data, screen_model,
+                            confirm_model, max_tokens, threshold, logger,
+                            approved_domains=approved_domains,
+                        )
+                        # Record token usage for BOTH stages, each against the
+                        # model that produced it.
+                        for _c_model, _c_resp in cascade_calls:
+                            if _c_resp and hasattr(_c_resp, 'usage'):
+                                record_token_usage(token_usage,
+                                    _c_resp.usage.input_tokens,
+                                    _c_resp.usage.output_tokens, _c_model,
+                                    delta=token_delta)
+                    else:
+                        result, api_response = classify_email(
+                            client, system_prompt, msg_data, model, max_tokens, logger,
+                            approved_domains=approved_domains,
+                        )
 
-                    # Record token usage
-                    if api_response and hasattr(api_response, 'usage'):
-                        record_token_usage(token_usage,
-                            api_response.usage.input_tokens,
-                            api_response.usage.output_tokens, model,
-                            delta=token_delta)
+                        # Record token usage
+                        if api_response and hasattr(api_response, 'usage'):
+                            record_token_usage(token_usage,
+                                api_response.usage.input_tokens,
+                                api_response.usage.output_tokens, model,
+                                delta=token_delta)
 
                     if result is None:
                         logger.error(f"  Classification failed for {msg_id}, will retry next run")
@@ -6782,6 +7009,11 @@ USER'S FOLLOW-UP:
                         logger.info(
                             f"  NOT SPAM (confidence: {confidence:.2f})"
                         )
+
+                    # Cascade attribution: make every confirm/rescue visible in
+                    # decisions.log (model names sanitized inside the helper —
+                    # log_decision does not sanitize `action`).
+                    action += _cascade_action_suffix(cascade_meta)
 
                     # Log the decision
                     log_decision(account_name, msg_data, result, action)

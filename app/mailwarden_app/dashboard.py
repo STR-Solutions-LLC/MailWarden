@@ -31,11 +31,35 @@ from . import theme
 from . import validators
 
 
+# Classification-mode selector: (label, classify_mode, model_value).
+# model_value is the single-model id, or None for the cascade entry — the
+# cascade's per-stage models live in config (anthropic.screen_model /
+# anthropic.confirm_model, config-file-only by design; Matt, 2026-07-02).
+# Labels are Matt's approved final wording — do not edit without approval.
 MODEL_CHOICES = [
-    ("Claude Haiku — fastest & cheapest (recommended)", "claude-haiku-4-5-20251001"),
-    ("Claude Sonnet — more accurate, more expensive", "claude-sonnet-4-6"),
-    ("Claude Opus — most accurate, most expensive", "claude-opus-4-7"),
+    ("Two-model double-check (recommended)", "cascade", None),
+    ("Claude Haiku only — cheapest", "single", "claude-haiku-4-5-20251001"),
+    ("Claude Sonnet only — more accurate, costs more", "single", "claude-sonnet-4-6"),
+    ("Claude Opus only — most accurate, most expensive", "single", "claude-opus-4-7"),
 ]
+
+# Advisory shown under the mode dropdown. Matt's approved final wording.
+MODEL_ADVISORY_TEXT = (
+    "Double-check: Haiku screens all mail; Sonnet re-checks anything flagged "
+    "junk. Mail is junked only when both agree. Single-model modes skip the "
+    "second check."
+)
+
+
+def apply_model_choice(anthro: dict, mode: str, model_value):
+    """Write a MODEL_CHOICES selection onto the anthropic config block.
+
+    Sets classify_mode always; sets `model` only for a single-model choice
+    (the cascade entry leaves `model` untouched so switching back to a
+    single mode restores the user's previous single-model pick)."""
+    anthro["classify_mode"] = mode
+    if mode == "single" and model_value is not None:
+        anthro["model"] = model_value
 
 
 def scope_from_toggle_state(account_usernames, on_usernames):
@@ -1985,12 +2009,21 @@ class CheckEmailTab(ttk.Frame):
             anthro = cfg.get("anthropic", {}) or {}
             api_key = os.environ.get("ANTHROPIC_API_KEY", "") \
                 or anthro.get("api_key", "") or ""
-            model = anthro.get("model") or "claude-haiku-4-5-20251001"
+            # Follow the configured classification mode so this screen's
+            # answer matches what the live filter actually does. In cascade
+            # mode the screen model is anthropic.screen_model, not .model.
+            classify_mode = anthro.get("classify_mode", "cascade")
+            confirm_model = anthro.get("confirm_model", "claude-sonnet-4-6")
+            if classify_mode == "cascade":
+                model = anthro.get("screen_model") or "claude-haiku-4-5-20251001"
+            else:
+                model = anthro.get("model") or "claude-haiku-4-5-20251001"
             threshold = (cfg.get("filter", {}) or {}).get(
                 "confidence_threshold", 0.85)
 
             res = spam_filter.classify_eml_offline(
                 raw_bytes, signals, api_key=api_key, model=model,
+                classify_mode=classify_mode, confirm_model=confirm_model,
                 threshold=threshold, account_name=None,
                 whitelist=whitelist, blacklist=blacklist)
             self.app.after(0, self._render_result, res, threshold)
@@ -3204,20 +3237,25 @@ class SettingsTab(ttk.Frame):
         self._model_saved_label.grid(row=0, column=2, sticky=tk.W, padx=(8, 0))
         self._model_saved_after = None
 
-        ttk.Label(ai_frame, text="Confidence threshold:").grid(row=1, column=0, sticky=tk.W, padx=(0, 8), pady=4)
+        # Cascade advisory (Matt's approved wording, defined at module level).
+        ttk.Label(ai_frame, text=MODEL_ADVISORY_TEXT, foreground="#555",
+                  wraplength=440, justify=tk.LEFT).grid(
+            row=1, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
+
+        ttk.Label(ai_frame, text="Confidence threshold:").grid(row=2, column=0, sticky=tk.W, padx=(0, 8), pady=4)
         self._threshold_var = tk.DoubleVar(value=0.85)
         scale = ttk.Scale(ai_frame, from_=0.70, to=0.99, orient=tk.HORIZONTAL,
                            variable=self._threshold_var, length=240,
                            command=lambda _v: self._threshold_label.config(
                                text=f"{self._threshold_var.get():.2f}"))
-        scale.grid(row=1, column=1, sticky=tk.W, pady=4)
+        scale.grid(row=2, column=1, sticky=tk.W, pady=4)
         self._threshold_label = ttk.Label(ai_frame, text="0.85")
-        self._threshold_label.grid(row=1, column=2, padx=(8, 0))
+        self._threshold_label.grid(row=2, column=2, padx=(8, 0))
 
-        ttk.Label(ai_frame, text="Max emails per run:").grid(row=2, column=0, sticky=tk.W, padx=(0, 8), pady=4)
+        ttk.Label(ai_frame, text="Max emails per run:").grid(row=3, column=0, sticky=tk.W, padx=(0, 8), pady=4)
         self._maxrun_var = tk.IntVar(value=100)
         ttk.Spinbox(ai_frame, from_=1, to=1000, textvariable=self._maxrun_var,
-                     width=10).grid(row=2, column=1, sticky=tk.W, pady=4)
+                     width=10).grid(row=3, column=1, sticky=tk.W, pady=4)
 
         # Menu bar + report + global pause
         misc = ttk.LabelFrame(self._f, text="Menu bar and schedule",
@@ -3308,17 +3346,25 @@ class SettingsTab(ttk.Frame):
         config = config_io.load_config()
         self._api_var.set(config.get("anthropic", {}).get("api_key", ""))
         default_model = "claude-haiku-4-5-20251001"
-        current_model = config.get("anthropic", {}).get("model", default_model)
-        for label, value in MODEL_CHOICES:
-            if value == current_model:
-                self._model_var.set(label)
-                break
-        else:
-            # Unmatched/missing model → fall back to the Haiku entry (the
-            # functional default), never Sonnet. Look it up by value so this
-            # stays correct even if MODEL_CHOICES order changes.
+        anthro = config.get("anthropic", {})
+        classify_mode = anthro.get("classify_mode", "cascade")
+        current_model = anthro.get("model", default_model)
+        if classify_mode == "cascade":
             self._model_var.set(
-                next(l for l, v in MODEL_CHOICES if v == default_model))
+                next(l for l, m, v in MODEL_CHOICES if m == "cascade"))
+        else:
+            for label, mode, value in MODEL_CHOICES:
+                if mode == "single" and value == current_model:
+                    self._model_var.set(label)
+                    break
+            else:
+                # Unmatched/missing model → fall back to the Haiku-only entry
+                # (the functional single-model default), never Sonnet. Look it
+                # up by value so this stays correct even if MODEL_CHOICES
+                # order changes.
+                self._model_var.set(
+                    next(l for l, m, v in MODEL_CHOICES
+                         if m == "single" and v == default_model))
         self._threshold_var.set(config.get("filter", {}).get("confidence_threshold", 0.85))
         self._threshold_label.config(text=f"{self._threshold_var.get():.2f}")
         self._maxrun_var.set(config.get("filter", {}).get("max_emails_per_run", 100))
@@ -3342,36 +3388,39 @@ class SettingsTab(ttk.Frame):
         # these keys on a fresh read under the lock (C7).
         api_key = self._api_var.get().strip()
         model_label = self._model_var.get()
-        model_value = next((v for label, v in MODEL_CHOICES
-                            if label == model_label), None)
+        choice = next(((m, v) for label, m, v in MODEL_CHOICES
+                       if label == model_label), None)
         threshold = round(float(self._threshold_var.get()), 2)
         max_per_run = int(self._maxrun_var.get())
 
         def _apply(config):
-            config.setdefault("anthropic", {})["api_key"] = api_key
-            if model_value is not None:
-                config["anthropic"]["model"] = model_value
+            anthro = config.setdefault("anthropic", {})
+            anthro["api_key"] = api_key
+            if choice is not None:
+                apply_model_choice(anthro, choice[0], choice[1])
             config.setdefault("filter", {})["confidence_threshold"] = threshold
             config.setdefault("filter", {})["max_emails_per_run"] = max_per_run
         config_io.update_config(_apply)
         self._api_status.config(text="Saved.")
 
     def _on_model_selected(self, _event=None):
-        """Persist the model immediately when the dropdown changes.
+        """Persist the classification mode immediately when the dropdown changes.
 
-        Maps the selected display label back to its model VALUE via
-        MODEL_CHOICES (never saves the human label), then reuses the same
-        config-save mechanism as the API-row Save button so the two paths
-        always agree on key and storage.
+        Maps the selected display label back to its (classify_mode, model)
+        pair via MODEL_CHOICES (never saves the human label), then reuses the
+        same config-save mechanism as the API-row Save button so the two
+        paths always agree on keys and storage.
         """
         selected = self._model_var.get()
-        model_value = next(
-            (v for label, v in MODEL_CHOICES if label == selected), None)
-        if model_value is None:
+        choice = next(
+            ((m, v) for label, m, v in MODEL_CHOICES if label == selected),
+            None)
+        if choice is None:
             return
-        # C7: set ONLY anthropic.model on a fresh read under the lock.
+        # C7: set ONLY the mode/model keys on a fresh read under the lock.
         def _set(config):
-            config.setdefault("anthropic", {})["model"] = model_value
+            apply_model_choice(config.setdefault("anthropic", {}),
+                               choice[0], choice[1])
         config_io.update_config(_set)
         self._show_model_saved()
 

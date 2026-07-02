@@ -116,6 +116,51 @@ def test_load_config_does_not_overwrite_user_filter_values(patched_config_path):
     assert result["filter"]["interval_minutes"] == 30
 
 
+# ── cascade config (two-model double-check) ──────────────────────────────────
+
+def test_default_config_ships_cascade():
+    """Fresh installs get the two-model cascade with the pinned stage models.
+    confirm_model MUST stay claude-sonnet-4-6 (newer models 400-reject the
+    temperature=0 determinism pin — regression guard)."""
+    a = DEFAULT_CONFIG["anthropic"]
+    assert a["classify_mode"] == "cascade"
+    assert a["screen_model"] == "claude-haiku-4-5-20251001"
+    assert a["confirm_model"] == "claude-sonnet-4-6"
+    assert a["model"] == "claude-haiku-4-5-20251001"
+
+
+def test_load_config_force_upgrades_old_installs_to_cascade(patched_config_path):
+    """Pre-cascade configs (anthropic has api_key+model only) are flipped to
+    cascade by the _deep_merge back-fill (Matt's force-upgrade decision,
+    2026-07-02) while retaining the user's api_key and single-mode model."""
+    old = {
+        "accounts": [],
+        "anthropic": {"api_key": "sk-test", "model": "claude-sonnet-4-6"},
+    }
+    patched_config_path.write_text(json.dumps(old))
+    result = load_config()
+    a = result["anthropic"]
+    assert a["classify_mode"] == "cascade"
+    assert a["screen_model"] == "claude-haiku-4-5-20251001"
+    assert a["confirm_model"] == "claude-sonnet-4-6"
+    # The user's previous choices are retained, not clobbered.
+    assert a["api_key"] == "sk-test"
+    assert a["model"] == "claude-sonnet-4-6"
+
+
+def test_load_config_respects_explicit_single_mode(patched_config_path):
+    """A user who later re-selects a single mode keeps it across loads —
+    the back-fill only fills MISSING keys."""
+    cfg = {
+        "accounts": [],
+        "anthropic": {"api_key": "sk-test", "classify_mode": "single",
+                      "model": "claude-haiku-4-5-20251001"},
+    }
+    patched_config_path.write_text(json.dumps(cfg))
+    result = load_config()
+    assert result["anthropic"]["classify_mode"] == "single"
+
+
 # ── _validate_port ───────────────────────────────────────────────────────────
 
 from mailwarden_app.setup_assistant import _validate_port as vp  # noqa: E402

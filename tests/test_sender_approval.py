@@ -195,7 +195,12 @@ def _approve_harness(monkeypatch, *, msg_data, dry_run=False,
     cfg = {
         "filter": {"dry_run": dry_run, "confidence_threshold": 0.85,
                    "max_emails_per_run": 50, "log_level": "INFO"},
-        "anthropic": {"api_key": "", "model": "x", "max_tokens": 1},
+        # classify_mode pinned to "single": these tests stub classify_email
+        # and count its calls; without the pin, run_filter's shipped-default
+        # cascade would route to (unstubbed) classify_email_cascade. The
+        # cascade branch has its own run_filter harness in test_cascade.py.
+        "anthropic": {"api_key": "", "model": "x", "max_tokens": 1,
+                      "classify_mode": "single"},
         "smtp": {"host": "smtp.example.com", "username": "owner@example.com",
                  "from_address": "owner@example.com"},
         "summary": {"recipient_address": "owner@example.com"},
