@@ -348,3 +348,75 @@ def test_estimate_cost_non_cascade_output_byte_identical():
     cost2, desc2 = mod.estimate_cost(10, "claude-haiku-4-5-20251001",
                                      cascade=False, confirm_model=None)
     assert (cost, desc) == (cost2, desc2)
+
+
+# ─── graymail (4-Graymail) report lines ───────────────────────────────────────
+
+def test_report_no_graymail_folder_has_no_graymail_lines(tmp_path, monkeypatch):
+    """Format guard: a graymail-free corpus report mentions graymail nowhere."""
+    benchmark = make_benchmark(tmp_path, {
+        "1-Spam": [("sp.eml", SPAM_EML)],
+        "2-Legitimate-Newsletters-and-Marketing": [("lg.eml", LEGIT_EML)],
+    })
+    mod = _load_eval_run()
+    monkeypatch.setitem(sys.modules, "spam_filter", _fake_spam_filter())
+
+    result = mod.run_eval(
+        benchmark_dir=benchmark, signals={}, api_key="fake",
+        model="claude-haiku-4-5-20251001", threshold=0.85, offline=False,
+        full=True,
+    )
+    assert not any("raymail" in ln for ln in result["lines"])
+
+
+def test_report_graymail_folder_adds_separate_line(tmp_path, monkeypatch):
+    from test_eval_corpus import GRAYMAIL_EML
+    benchmark = make_benchmark(tmp_path, {
+        "1-Spam": [("sp.eml", SPAM_EML)],
+        "2-Legitimate-Newsletters-and-Marketing": [("lg.eml", LEGIT_EML)],
+        "4-Graymail": [("gray.eml", GRAYMAIL_EML)],
+    })
+    mod = _load_eval_run()
+    monkeypatch.setitem(sys.modules, "spam_filter", _fake_spam_filter())
+
+    result = mod.run_eval(
+        benchmark_dir=benchmark, signals={}, api_key="fake",
+        model="claude-haiku-4-5-20251001", threshold=0.85, offline=False,
+        full=True,
+    )
+    lines = result["lines"]
+    # corpus summary names graymail separately
+    corpus_line = [ln for ln in lines if ln.startswith("Corpus:")][0]
+    assert "1 graymail" in corpus_line
+    assert "1 legit" in corpus_line  # graymail must not inflate legit
+    # dedicated metric line, and headline metrics untouched
+    assert any(ln.startswith("Graymail (scored separately): 0/1 junked")
+               for ln in lines)
+    assert "False positives:            0" in lines
+    # full listing tags it GRAY
+    assert any("GRAY " in ln and "gray.eml" in ln for ln in lines)
+
+
+def test_report_graymail_junked_is_not_false_positive(tmp_path, monkeypatch):
+    """A junked graymail shows on the graymail line, never as an FP."""
+    from test_eval_corpus import GRAYMAIL_EML
+    # fake classifier junks 'spammer' Froms; craft graymail from 'spammer' so
+    # the fake junks it.
+    junky_graymail = GRAYMAIL_EML.replace(
+        b"updates@graymailer.com", b"spammer@graymailer.com")
+    benchmark = make_benchmark(tmp_path, {
+        "1-Spam": [("sp.eml", SPAM_EML)],
+        "4-Graymail": [("gray.eml", junky_graymail)],
+    })
+    mod = _load_eval_run()
+    monkeypatch.setitem(sys.modules, "spam_filter", _fake_spam_filter())
+
+    result = mod.run_eval(
+        benchmark_dir=benchmark, signals={}, api_key="fake",
+        model="claude-haiku-4-5-20251001", threshold=0.85, offline=False,
+    )
+    lines = result["lines"]
+    assert any(ln.startswith("Graymail (scored separately): 1/1 junked")
+               for ln in lines)
+    assert "False positives:            0" in lines
+    assert "\nNo misclassifications." in lines

@@ -1,0 +1,25 @@
+Return-Path: <service@paypa1-secure.com>
+Received: from relay2.paypa1-secure.com (relay2.paypa1-secure.com [185.243.112.44])
+	by mx4.baycrestmail.com with ESMTPS id A38928;
+	Mon, 15 Jun 2026 09:14:22 -0400
+Received: from vps-190412.hostbargain.net (vps-190412.hostbargain.net [185.243.112.44])
+	by mx4.baycrestmail.com with ESMTPS id A33497;
+	Mon, 15 Jun 2026 09:14:20 -0400
+From: PayPal Service <service@paypa1-secure.com>
+To: mrosen@baycrestmail.com
+Subject: Your account access has been limited - Case ID PP-4471902
+Date: Mon, 15 Jun 2026 09:14:19 -0400
+Message-ID: <20260615091419.7F2A1@paypa1-secure.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Dear Customer,
+
+We noticed unusual activity in your account. Your access has been
+limited until you confirm your information.
+
+Confirm now: http://paypa1-secure.com/webapps/limit/resolve
+
+If you don't confirm within 24 hours your account will be suspended.
+
+PayPal Customer Service

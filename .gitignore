@@ -87,6 +87,10 @@ tests/_out/
 # Local-only test fixtures and agent tooling — never commit (contains real personal email/PII)
 tests/fixtures/
 *.eml
+# EXCEPTION: hand-built synthetic eval fixtures carry NO real mail/PII (ground
+# truth by construction) and are committed so the phish set is reproducible.
+!tools/eval_synthetic/
+!tools/eval_synthetic/*.eml
 .claude/
 .claude-mpm/
 # Local MCP server config and trusty tooling — never commit

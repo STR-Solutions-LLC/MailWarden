@@ -15,7 +15,9 @@ Usage:
   tests/.venv/bin/python tools/eval_run.py --full            # add per-email verdict listing
   tests/.venv/bin/python tools/eval_run.py --cascade         # two-model cascade (screen=--model/shipped, confirm=--confirm-model)
 
-Reads corpus from ~/Desktop/MailWarden-Benchmark/ (three labeled folders).
+Reads corpus from ~/Desktop/MailWarden-Benchmark/ (three labeled folders,
+plus the optional 4-Graymail folder, which is scored separately and excluded
+from recall/precision/FP).
 API key is read from $ANTHROPIC_API_KEY or ~/MailWarden/config/config.json.
 """
 import argparse
@@ -143,15 +145,19 @@ def run_eval(benchmark_dir, signals, api_key, model, threshold,
         return {"lines": lines, "metrics": {}}
 
     spam_count = sum(1 for i in items if i["label"] == "spam")
-    legit_count = len(items) - spam_count
+    graymail_count = sum(1 for i in items if i["label"] == "graymail")
+    legit_count = len(items) - spam_count - graymail_count
     inbox_spam = sum(
         1 for i in items if i["label"] == "spam" and i["source"] == "inbox"
     )
     provider_spam = spam_count - inbox_spam
 
+    # Graymail suffix appears ONLY when 4-Graymail is non-empty, so a
+    # graymail-free corpus still produces byte-identical reports.
+    graymail_suffix = f", {graymail_count} graymail" if graymail_count else ""
     w(f"Corpus: {len(items)} emails  —  "
       f"{spam_count} spam ({inbox_spam} inbox, {provider_spam} provider-flagged), "
-      f"{legit_count} legit")
+      f"{legit_count} legit{graymail_suffix}")
     if cascade:
         w(f"Model:  {model} -> confirm {confirm_model} (cascade)   "
           f"threshold: {threshold}   offline: {offline}")
@@ -180,12 +186,18 @@ def run_eval(benchmark_dir, signals, api_key, model, threshold,
             w(f"  ERROR on {item['filename']}: {e}")
         verdicts.append(verdict)
 
-        is_spam = item["label"] == "spam"
-        correct = (verdict == "JUNK") == is_spam
-        if verbose or not correct:
-            tag = "  " if correct else "XX"
-            label_tag = "SPAM " if is_spam else "LEGIT"
-            w(f"{tag} [{label_tag}] {item['filename'][:55]:57} -> {verdict}")
+        if item["label"] == "graymail":
+            # Graymail has no wrong answer — never flagged XX, shown only
+            # in verbose mode.
+            if verbose:
+                w(f"   [GRAY ] {item['filename'][:55]:57} -> {verdict}")
+        else:
+            is_spam = item["label"] == "spam"
+            correct = (verdict == "JUNK") == is_spam
+            if verbose or not correct:
+                tag = "  " if correct else "XX"
+                label_tag = "SPAM " if is_spam else "LEGIT"
+                w(f"{tag} [{label_tag}] {item['filename'][:55]:57} -> {verdict}")
 
     w("=" * 80)
     metrics = score_results(items, verdicts)
@@ -201,6 +213,10 @@ def run_eval(benchmark_dir, signals, api_key, model, threshold,
     w(f"Precision (of junked mail): {metrics['precision']:.1%}  "
       f"({metrics['tp']}/{metrics['tp'] + metrics['fp']}  junked total)")
     w(f"False positives:            {metrics['false_positives']}")
+    if metrics.get("graymail_total", 0) > 0:
+        w(f"Graymail (scored separately): {metrics['graymail_junked']}"
+          f"/{metrics['graymail_total']} junked  "
+          f"[excluded from recall/precision/FP]")
 
     if metrics["misclassified"]:
         w(f"\nMisclassified ({len(metrics['misclassified'])}):")
@@ -219,7 +235,12 @@ def run_eval(benchmark_dir, signals, api_key, model, threshold,
         w(f"\nFull verdict listing ({len(items)}):")
         rows = sorted(zip(items, verdicts), key=lambda pair: pair[0]["filename"])
         for item, verdict in rows:
-            label_tag = "SPAM " if item["label"] == "spam" else "LEGIT"
+            if item["label"] == "spam":
+                label_tag = "SPAM "
+            elif item["label"] == "graymail":
+                label_tag = "GRAY "
+            else:
+                label_tag = "LEGIT"
             w(f"  {label_tag}  {verdict:7}  {item['filename']}")
 
     return {"lines": lines, "metrics": metrics}

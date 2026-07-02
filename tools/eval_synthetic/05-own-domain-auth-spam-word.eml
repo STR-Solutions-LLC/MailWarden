@@ -1,0 +1,28 @@
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+ d=brightoffersdaily.com; i=@brightoffersdaily.com; q=dns/txt;
+ s=eval2026; t=1782864000; h=from : to : subject : date : message-id;
+ bh=MNiAPgS8SQa/1KOt9l2A2fKyMLJv1JDjC5ukciKJWWg=;
+ b=OFeNXuZLirfRILEcwoK0AWmi0EkwmiHelA58c/pKxJ4w+movEqwEdiGQAWoGqudb5Ddl7
+ K9JjRnHqhsHr2QxM3rj6wtggv68s+/Omk7C/uMuklNVo33qHyQmNzFLp4O0KiuPqAxhmK4T
+ hf0YHQ5jS0lTlRjMWkD9yt+pv9lVg2z17FBezDzJJ2lG7CXKE50bf5w+OnjMVCNiniId/Fo
+ VRYsyoDYZVKCIkDa80GfGGcDx+nDNcvLLWLwyCyXzXAnU76sSFBR7ARxUbj55W57yJh8SqU
+ 2rTeqSG2ezhcSoSGGjr5X1AzVJMdBwaJp5p+bc+BATAmnVFrvtdDjoXqMqmw==
+Return-Path: <deals@brightoffersdaily.com>
+Received: from mail.brightoffersdaily.com (mail.brightoffersdaily.com [162.240.117.55])
+	by mx4.baycrestmail.com with ESMTPS id A94720;
+	Fri, 19 Jun 2026 11:47:02 -0400
+From: Bright Offers Daily <deals@brightoffersdaily.com>
+To: mrosen@baycrestmail.com
+Subject: You qualify for up to $5,000/month working from home
+Date: Fri, 19 Jun 2026 11:47:00 -0400
+Message-ID: <campaign-88123@brightoffersdaily.com>
+List-Unsubscribe: <mailto:unsub@brightoffersdaily.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Hundreds in your area are already earning $5,000 or more every month
+from home with this one simple system. Spots are limited.
+
+Start today: http://brightoffersdaily.com/go/88123
+
+You are receiving this because you opted in to a partner offer.

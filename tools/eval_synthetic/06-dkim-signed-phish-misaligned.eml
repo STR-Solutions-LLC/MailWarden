@@ -1,0 +1,27 @@
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=mailblastpro.net;
+ i=@mailblastpro.net; q=dns/txt; s=eval2026; t=1782864000; h=from : to
+ : subject : date : message-id;
+ bh=LHYTronwtthfsNsa3Wk63qwRZMaPrn44m26AJDCM45c=;
+ b=G+Rr2spLHZqdnNWmwnp8R1ytI5uwzZKfM4DCGosiQE+DmgAlEw35dGdTs1Wpe1k1ogmVf
+ tUTU0FeywWv3oq4pbJ2KVp8JePyGVkXGF66x18RRZRU9IC8j5y5t43rmNtfpD74/t0w5kLW
+ 59fLcNsRTUQydGKLUuJWdJniBGrqcGWqfwW/TjL/hsnjfsKNbBFiKJh8OpAPA7RaEz9rCY5
+ Jf3KarsLFPMuQumzsJCZ9tFs5ysi8ydR0VarNT6tsbSvBTU8jiY3Fi4ZCQVRzOZElGDs0r/
+ jd+NbhNNEaSOWwVjcLJ/+j5cAsfgI+SYfq9BhsTGbN6imkg5xvbwp5oXBRGw==
+Return-Path: <bounce-8812@mailblastpro.net>
+Received: from out3.mailblastpro.net (out3.mailblastpro.net [192.243.59.18])
+	by mx4.baycrestmail.com with ESMTPS id A14264;
+	Sat, 20 Jun 2026 14:20:11 -0400
+From: PayPal Security <security@paypal.com>
+To: mrosen@baycrestmail.com
+Subject: Unusual login attempt blocked - confirm your details
+Date: Sat, 20 Jun 2026 14:20:09 -0400
+Message-ID: <blast-2201847@mailblastpro.net>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+We blocked a login attempt from an unrecognized device.
+
+Please confirm your account details to restore full access:
+http://mailblastpro.net/r/pp/confirm?c=2201847
+
+PayPal Security

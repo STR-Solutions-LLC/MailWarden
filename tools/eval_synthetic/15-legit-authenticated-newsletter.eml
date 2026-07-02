@@ -1,0 +1,24 @@
+Return-Path: <bounces+news@nordwestoutfitters.com>
+Received: from o1.email.nordwestoutfitters.com (o1.email.nordwestoutfitters.com [167.89.54.101])
+	by mx4.baycrestmail.com with ESMTPS id A28582;
+	Mon, 29 Jun 2026 09:00:12 -0400
+Authentication-Results: mx4.baycrestmail.com;
+	spf=pass (sender IP is 167.89.54.101) smtp.mailfrom=email.nordwestoutfitters.com;
+	dkim=pass header.d=nordwestoutfitters.com;
+	dmarc=pass action=none header.from=nordwestoutfitters.com
+From: NordWest Outfitters <news@nordwestoutfitters.com>
+To: mrosen@baycrestmail.com
+Subject: The Summer Clearance Event starts now - up to 60% off
+Date: Mon, 29 Jun 2026 09:00:09 -0400
+Message-ID: <nwo-sum26-991@nordwestoutfitters.com>
+List-Unsubscribe: <mailto:unsubscribe@nordwestoutfitters.com>, <https://nordwestoutfitters.com/email/unsubscribe>
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+
+<html><body>
+<h1>Summer Clearance: up to 60% off</h1>
+<p>Hurry - our biggest sale of the season ends Sunday! Shop hiking,
+camping, and paddle gear at clearance prices.</p>
+<p><a href="https://nordwestoutfitters.com/sale">Shop the sale</a></p>
+<p><a href="https://nordwestoutfitters.com/email/unsubscribe">Unsubscribe</a> | NordWest Outfitters, 4410 Cascade Ave, Portland OR</p>
+</body></html>

@@ -45,6 +45,15 @@ SPAM_FLAG_EML = (
     b"Wire money now."
 )
 
+GRAYMAIL_EML = (
+    b"From: updates@graymailer.com\r\n"
+    b"To: user@example.com\r\n"
+    b"Subject: Your weekly product update\r\n"
+    b"Message-ID: <g1@graymailer.com>\r\n"
+    b"\r\n"
+    b"Things you did not ask about but we sent anyway."
+)
+
 
 # ─── helper ─────────────────────────────────────────────────────────────────────
 
@@ -175,6 +184,32 @@ def test_build_corpus_missing_folder_skipped(tmp_path):
     assert len(items) == 1
 
 
+# ─── graymail (4-Graymail) tests ────────────────────────────────────────────────
+
+def test_build_corpus_graymail_label(tmp_path):
+    benchmark = make_benchmark(tmp_path, {
+        "4-Graymail": [("gray.eml", GRAYMAIL_EML)],
+    })
+    from eval_corpus import build_corpus
+    items = build_corpus(benchmark)
+    assert len(items) == 1
+    assert items[0]["label"] == "graymail"
+    assert items[0]["source"] == "inbox"
+
+
+def test_build_corpus_graymail_not_in_spam_or_legit(tmp_path):
+    benchmark = make_benchmark(tmp_path, {
+        "1-Spam": [("bad.eml", SPAM_EML)],
+        "2-Legitimate-Newsletters-and-Marketing": [("news.eml", LEGIT_EML)],
+        "4-Graymail": [("gray.eml", GRAYMAIL_EML)],
+    })
+    from eval_corpus import build_corpus
+    items = build_corpus(benchmark)
+    assert sum(1 for i in items if i["label"] == "spam") == 1
+    assert sum(1 for i in items if i["label"] == "legit") == 1
+    assert sum(1 for i in items if i["label"] == "graymail") == 1
+
+
 # ─── score_results tests ────────────────────────────────────────────────────────
 
 def _item(label, source="inbox"):
@@ -271,6 +306,41 @@ def test_score_precision_with_tp_and_fp():
     assert m["precision"] == 0.5
     assert m["recall"] == 1.0
     assert m["false_positives"] == 1
+
+
+def test_score_graymail_excluded_from_recall_precision():
+    # Junked graymail is NOT a false positive and does not touch recall.
+    labeled = [_item("spam"), _item("legit"), _item("graymail")]
+    verdicts = ["JUNK", "PASS", "JUNK"]
+    from eval_corpus import score_results
+    m = score_results(labeled, verdicts)
+    assert m["false_positives"] == 0
+    assert m["recall"] == 1.0
+    assert m["precision"] == 1.0
+    assert m["graymail_total"] == 1
+    assert m["graymail_junked"] == 1
+    assert m["misclassified"] == []
+
+
+def test_score_graymail_passed_not_counted():
+    labeled = [_item("graymail")]
+    verdicts = ["PASS"]
+    from eval_corpus import score_results
+    m = score_results(labeled, verdicts)
+    assert m["graymail_total"] == 1
+    assert m["graymail_junked"] == 0
+    assert m["fn"] == 0
+    assert m["misclassified"] == []
+
+
+def test_score_total_legit_excludes_graymail():
+    labeled = [_item("legit"), _item("legit"), _item("graymail")]
+    verdicts = ["PASS", "PASS", "PASS"]
+    from eval_corpus import score_results
+    m = score_results(labeled, verdicts)
+    assert m["total_legit"] == 2
+    assert m["total_spam"] == 0
+    assert m["graymail_total"] == 1
 
 
 # ─── eval_run.py smoke tests (added after Task 1 passes) ────────────────────────
