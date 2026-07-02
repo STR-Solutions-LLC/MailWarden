@@ -126,6 +126,10 @@ def _run_diagnose() -> int:
         "certifi", "distro", "idna", "jiter", "sniffio",
         "typing_extensions", "docstring_parser",
         "et_xmlfile", "annotated_types",
+        # local DKIM verification (audit a-2) + DNS backend. If either is
+        # missing from the bundle, local DKIM verification / DNSBL silently
+        # no-op; this gate hard-fails the build instead.
+        "dkim", "dns.resolver",
         # stdlib the filter scripts import — py2app modulegraph
         # can drop these if the main app code does not use them.
         "email", "email.mime", "email.mime.text", "email.mime.multipart",

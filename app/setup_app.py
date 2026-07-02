@@ -150,6 +150,13 @@ OPTIONS = {
         "idna",
         "jiter",
         "docstring_parser",
+        # local DKIM verification (audit a-2) + its DNS backend. Both are
+        # lazily imported INSIDE functions (utils.verify_dkim_locally,
+        # _dkim_get_txt, check_ip_reputation) — exactly the pattern py2app's
+        # modulegraph drops. Without these, ModuleNotFoundError at runtime and
+        # local DKIM verification / DNSBL silently no-op in the shipped app.
+        "dkim",
+        "dns",
         # spreadsheet import/export (Dashboard Whitelist/Blacklist tab)
         "openpyxl",
         "et_xmlfile",

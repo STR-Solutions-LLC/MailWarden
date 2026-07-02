@@ -4262,3 +4262,330 @@ def test_curate_carve_out_rendered_in_prompt_offline():
     assert ("an explicit USER PREFERENCE (curate) rule reflects the recipient's "
             "own choice not to receive a kind of legitimate mail and still "
             "applies") in prompt
+
+
+# ---------------------------------------------------------------------------
+# Audit session (a-2) — LOCAL DKIM VERIFICATION.
+#
+# Bluehost-class hosts stamp no Authentication-Results, so legit DKIM-signed
+# transactional mail reached the classifier fully unauthenticated. We now verify
+# the sender's OWN DKIM signature with dkimpy and feed the proven domain into
+# summarize_authentication like a provider dkim=pass. All tests are NETWORK-FREE:
+# messages are signed at test time with the inline throwaway test key
+# (_DKIM_TEST_PRIVKEY below) and DNS is served by an in-memory dnsfunc —
+# dkimpy's REAL cryptographic path runs, only the DNS lookup is faked.
+# ---------------------------------------------------------------------------
+import email as _email  # noqa: E402
+import dns.exception as _dns_exc  # noqa: E402
+
+# Test-only DKIM keypair, embedded inline so the a-2 tests are fully self-
+# contained (tests/fixtures/ is gitignored — PII policy — so a fixture file
+# would never be committed). This is a THROWAWAY 1024-bit key used only to sign
+# synthetic in-memory messages; it protects nothing. The private and public
+# halves are a matched PAIR — if you regenerate one, regenerate both:
+#   openssl genrsa 1024 > key.pem
+#   _DKIM_TEST_PRIVKEY  = key.pem contents
+#   _DKIM_TEST_P        = openssl rsa -in key.pem -pubout -outform DER | base64
+_DKIM_TEST_PRIVKEY = b"""-----BEGIN PRIVATE KEY-----
+MIICdgIBADANBgkqhkiG9w0BAQEFAASCAmAwggJcAgEAAoGBANq2YgXmCqAGN2Xk
+4F8/L7fNT6css0cyG4uGRplPs0/0uIMjv/DKIns+/pbV6O4IfD3RWXZ9wcFdJKVU
+/f4DUwwXeDFOc5hW/OrDQa/3XwS0ElYT8NhX5YXwJCFphe9o7QlGdnvrfh4SZy/7
+BRVFUNLOz5OpWvkPEhsGA3/xCD0HAgMBAAECgYEAxtewEMrPeCOOtB28+/tXZ9TK
+iSOzrpPYxSYEA5iZXqUQJ3IWLFWpucFQ91NtXRPr2Mv/eSHmSOVkzseR0CG3moVj
+EPgZrRk3X83UuDRF99CyFL9CBJuJS69M9xovs1n21Zb/TYUBx8srPOg6PaGUYRXL
+9zSHQjrw+mc4p8yUV2kCQQDv87OXiwRfWBUAcGc5EE+3Xhdo1U2O47J3qIwumtei
+ZJ3F0dXvignoe4OR5qQwIqeR2wM/GgOrNgRybK8cep0NAkEA6VcIQ46OaZPBl5wA
+tTTn7IT+daoByKI9gaGtsr66mjsIZS4ikbu/cwe5pW7UkusN5Xgelt3stLgvV0HM
+3i1FYwJAchRVD/lh7Mp9waWvDaw5mh471vWCWCrdEJKrgwTO/EAF2qT2p1njeAow
+9U7IRLJVJL0RgBCoKeAWoSgW4N1SiQJAQo/wLI1S9K0QkXYQAaEI88BwchJAFgKp
+9vuu+AlOY8apO2uwss/S6jZu79Ew1IQ235mnaDQAXQEZiBOeJFbXrwJAEVJS9bb3
+sg5DTCZEamPgBst86ysSk3Z/A9dfNlluOQWXuHw2DdwpkKR2u66GhwkRkONL3C8f
+dhHs7ismdpm0wg==
+-----END PRIVATE KEY-----
+"""
+_DKIM_TEST_P = (
+    b"MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDatmIF5gqgBjdl5OBfPy+3zU+nLLNHMhuL"
+    b"hkaZT7NP9LiDI7/wyiJ7Pv6W1ejuCHw90Vl2fcHBXSSlVP3+A1MMF3gxTnOYVvzqw0Gv918E"
+    b"tBJWE/DYV+WF8CQhaYXvaO0JRnZ7634eEmcv+wUVRVDSzs+TqVr5DxIbBgN/8Qg9BwIDAQAB")
+
+
+def _dkim_pubrecord():
+    return b"v=DKIM1; k=rsa; p=" + _DKIM_TEST_P
+
+
+def _dkim_qname(selector, domain):
+    return (selector + "._domainkey." + domain + ".").encode()
+
+
+def _build_unsigned(from_addr, domain, body=b"Legit transactional body.\r\n"):
+    hdrs = [
+        ("From", from_addr),
+        ("To", "user@recipient.test"),
+        ("Subject", "Your receipt"),
+        ("Date", "Mon, 01 Jul 2026 10:00:00 -0000"),
+        ("Message-ID", "<msg@%s>" % domain),
+    ]
+    return b"".join(("%s: %s\r\n" % (k, v)).encode() for k, v in hdrs) + b"\r\n" + body
+
+
+def _sign(raw_unsigned, selector, domain):
+    import dkim
+    return dkim.sign(raw_unsigned, selector.encode(), domain.encode(),
+                     _DKIM_TEST_PRIVKEY, canonicalize=(b'relaxed', b'relaxed'))
+
+
+def _signed_eml(domain="senderdomain.test", selector="sel", from_addr=None):
+    from_addr = from_addr or ("news@%s" % domain)
+    base = _build_unsigned(from_addr, domain)
+    return _sign(base, selector, domain) + base
+
+
+def _good_dnsfunc(*pairs):
+    """dnsfunc serving the test public record for each (selector, domain);
+    unknown qnames -> None (missing key)."""
+    table = {_dkim_qname(sel, dom): _dkim_pubrecord() for sel, dom in pairs}
+
+    def _f(name, timeout=5):
+        return table.get(name)
+    return _f
+
+
+# --- Test 1 --------------------------------------------------------------
+def test_a2_verify_dkim_locally_valid_signature():
+    raw = _signed_eml("senderdomain.test", "sel")
+    doms = utils.verify_dkim_locally(raw, _dnsfunc=_good_dnsfunc(("sel", "senderdomain.test")))
+    assert doms == ["senderdomain.test"]
+
+
+# --- Test 2 --------------------------------------------------------------
+def test_a2_verify_dkim_locally_brand_match_end_to_end():
+    raw = _signed_eml("senderdomain.test", "sel", from_addr="news@senderdomain.test")
+    verified = utils.verify_dkim_locally(raw, _dnsfunc=_good_dnsfunc(("sel", "senderdomain.test")))
+    summary = utils.summarize_authentication(
+        {"DKIM-Signature": "v=1; a=rsa-sha256; d=senderdomain.test; s=sel; b=xx"},
+        from_domain="senderdomain.test", locally_verified=verified)
+    assert summary["dkim"] == "pass"
+    assert "senderdomain.test" in summary["authenticated_domains"]
+    assert spam_filter.is_authenticated_brand_matched(summary) is True
+
+
+# --- Test 3 --------------------------------------------------------------
+def test_a2_verify_dkim_locally_verified_but_no_brand_match():
+    raw = _signed_eml("esp.test", "sel", from_addr="news@brand.test")
+    verified = utils.verify_dkim_locally(raw, _dnsfunc=_good_dnsfunc(("sel", "esp.test")))
+    assert verified == ["esp.test"]
+    summary = utils.summarize_authentication(
+        {"DKIM-Signature": "v=1; d=esp.test; s=sel; b=xx"},
+        from_domain="brand.test", locally_verified=verified)
+    assert "esp.test" in summary["authenticated_domains"]
+    assert spam_filter.is_authenticated_brand_matched(summary) is False
+
+
+# --- Test 4 --------------------------------------------------------------
+def test_a2_verify_dkim_locally_invalid_signature():
+    base = _build_unsigned("news@senderdomain.test", "senderdomain.test")
+    sig = _sign(base, "sel", "senderdomain.test")
+    tampered = sig + base.replace(b"Legit", b"EVIL-")  # body no longer matches bh=
+    doms = utils.verify_dkim_locally(tampered, _dnsfunc=_good_dnsfunc(("sel", "senderdomain.test")))
+    assert doms == []
+
+
+# --- Test 5 --------------------------------------------------------------
+def test_a2_verify_dkim_locally_dns_timeout_no_verdict():
+    raw = _signed_eml("senderdomain.test", "sel")
+
+    def _timeout_dnsfunc(name, timeout=5):
+        raise _dns_exc.Timeout("simulated")
+    assert utils.verify_dkim_locally(raw, _dnsfunc=_timeout_dnsfunc) == []
+
+
+# --- Test 6 --------------------------------------------------------------
+def test_a2_verify_dkim_locally_missing_key():
+    raw = _signed_eml("senderdomain.test", "sel")
+
+    def _empty_dnsfunc(name, timeout=5):
+        return None  # NXDOMAIN / no key published
+    assert utils.verify_dkim_locally(raw, _dnsfunc=_empty_dnsfunc) == []
+
+
+# --- Test 7 --------------------------------------------------------------
+def test_a2_verify_dkim_locally_no_signature_header():
+    unsigned = _build_unsigned("news@senderdomain.test", "senderdomain.test")
+    calls = []
+
+    def _counting_dnsfunc(name, timeout=5):
+        calls.append(name)
+        return _dkim_pubrecord()
+    assert utils.verify_dkim_locally(unsigned, _dnsfunc=_counting_dnsfunc) == []
+    assert calls == []  # no DKIM-Signature -> zero DNS lookups
+
+
+# --- Test 8 --------------------------------------------------------------
+def test_a2_verify_dkim_locally_multiple_signatures():
+    base = _build_unsigned("news@brand.test", "brand.test")
+    sig_brand = _sign(base, "sel", "brand.test")
+    sig_esp = _sign(base, "esp", "esp.test")
+    raw = sig_esp + sig_brand + base  # two DKIM-Signature headers
+    both = utils.verify_dkim_locally(
+        raw, _dnsfunc=_good_dnsfunc(("sel", "brand.test"), ("esp", "esp.test")))
+    assert both == ["brand.test", "esp.test"]
+    # Only the ESP key resolves -> only the ESP d= is proven.
+    esp_only = utils.verify_dkim_locally(raw, _dnsfunc=_good_dnsfunc(("esp", "esp.test")))
+    assert esp_only == ["esp.test"]
+
+
+# --- Test 9 --------------------------------------------------------------
+def test_a2_verify_dkim_locally_dns_cache_one_lookup(monkeypatch):
+    utils.clear_dkim_dns_cache()
+
+    class _FakeAnswer:
+        strings = [_DKIM_TEST_P and (b"v=DKIM1; k=rsa; p=" + _DKIM_TEST_P)]
+
+    calls = {"n": 0}
+
+    class _FakeResolver:
+        def resolve(self, name, rdtype):
+            calls["n"] += 1
+            return [_FakeAnswer()]
+    monkeypatch.setattr("dns.resolver.Resolver", _FakeResolver)
+    a = utils._dkim_get_txt(b"sel._domainkey.senderdomain.test.")
+    b = utils._dkim_get_txt(b"sel._domainkey.senderdomain.test.")
+    assert a == b and a is not None
+    assert calls["n"] == 1  # second call served from cache
+    utils.clear_dkim_dns_cache()
+
+
+# --- Test 10 -------------------------------------------------------------
+def test_a2_verify_dkim_locally_circuit_breaker(monkeypatch):
+    utils.clear_dkim_dns_cache()
+    calls = {"n": 0}
+
+    class _TimeoutResolver:
+        def resolve(self, name, rdtype):
+            calls["n"] += 1
+            raise _dns_exc.Timeout("simulated")
+    monkeypatch.setattr("dns.resolver.Resolver", _TimeoutResolver)
+    # Distinct qnames so the cache never short-circuits; only the breaker does.
+    for i in range(5):
+        assert utils._dkim_get_txt(("s%d._domainkey.d.test." % i).encode()) is None
+    # Breaker trips at _DKIM_DNS_TIMEOUT_LIMIT (3): no lookups after that.
+    assert calls["n"] == utils._DKIM_DNS_TIMEOUT_LIMIT
+    utils.clear_dkim_dns_cache()
+
+
+# --- Test 11 -------------------------------------------------------------
+def test_a2_verify_dkim_locally_dkimpy_missing_is_no_verdict(monkeypatch):
+    raw = _signed_eml("senderdomain.test", "sel")
+    monkeypatch.setitem(sys.modules, "dkim", None)  # `import dkim` -> ImportError
+    assert utils.verify_dkim_locally(raw, _dnsfunc=_good_dnsfunc(("sel", "senderdomain.test"))) == []
+
+
+# --- Test 12 -------------------------------------------------------------
+def test_a2_summarize_auth_locally_verified_sets_pass_domain_and_drops_claim():
+    s = utils.summarize_authentication(
+        {"DKIM-Signature": "v=1; a=rsa-sha256; d=senderdomain.test; s=sel; b=xx"},
+        from_domain="senderdomain.test", locally_verified=["senderdomain.test"])
+    assert s["dkim"] == "pass"
+    assert "senderdomain.test" in s["authenticated_domains"]
+    assert s["locally_verified_domains"] == ["senderdomain.test"]
+    # The now-proven domain must NOT appear as an unverified claim.
+    assert "senderdomain.test" not in s["claimed_unverified_domains"]
+
+
+# --- Test 13 -------------------------------------------------------------
+def test_a2_summarize_auth_default_arg_unchanged():
+    headers = {"DKIM-Signature": "v=1; d=claimed.test; s=sel; b=xx"}
+    without = utils.summarize_authentication(headers, from_domain="claimed.test")
+    # Omitting the new arg must reproduce today's semantics exactly.
+    assert without["dkim"] == "none"
+    assert without["authenticated_domains"] == []
+    assert without["locally_verified_domains"] == []
+    assert without["claimed_unverified_domains"] == ["claimed.test"]
+
+
+# --- Test 14 -------------------------------------------------------------
+def test_a2_trigger_no_trusted_dkim_verdict_runs_verification(monkeypatch):
+    seen = {}
+
+    def _fake_verify(raw, *a, **k):
+        seen["raw"] = raw
+        return ["proven.test"]
+    monkeypatch.setattr(spam_filter, "verify_dkim_locally", _fake_verify)
+    md = {"auth_results": "", "dkim_signature": "v=1; d=proven.test; s=sel; b=xx",
+          "_raw_bytes": b"RAWBYTES"}
+    assert spam_filter._locally_verified_dkim(md) == ["proven.test"]
+    assert seen["raw"] == b"RAWBYTES"
+
+
+# --- Test 15 -------------------------------------------------------------
+def test_a2_trigger_trusted_verdict_skips(monkeypatch):
+    calls = {"n": 0}
+
+    def _fake_verify(raw, *a, **k):
+        calls["n"] += 1
+        return ["should.not.happen"]
+    monkeypatch.setattr(spam_filter, "verify_dkim_locally", _fake_verify)
+    for ar in ("dkim=pass header.d=x.test", "x; dkim=fail; y"):
+        md = {"auth_results": ar, "dkim_signature": "v=1; d=x.test; s=s; b=xx",
+              "_raw_bytes": b"RAW"}
+        assert spam_filter._locally_verified_dkim(md) == []
+    assert calls["n"] == 0  # trusted server verdict present -> never verify locally
+
+
+# --- Test 16 -------------------------------------------------------------
+def test_a2_trigger_missing_raw_bytes_or_sig_skips(monkeypatch):
+    def _boom(*a, **k):
+        raise AssertionError("verify must not run")
+    monkeypatch.setattr(spam_filter, "verify_dkim_locally", _boom)
+    # No DKIM-Signature.
+    assert spam_filter._locally_verified_dkim(
+        {"auth_results": "", "dkim_signature": "", "_raw_bytes": b"RAW"}) == []
+    # No raw bytes.
+    assert spam_filter._locally_verified_dkim(
+        {"auth_results": "", "dkim_signature": "v=1; d=x.test; b=xx"}) == []
+
+
+# --- Test 17 -------------------------------------------------------------
+def test_a2_build_user_message_renders_local_verification(monkeypatch):
+    raw = _signed_eml("senderdomain.test", "sel", from_addr="news@senderdomain.test")
+    monkeypatch.setattr(spam_filter, "verify_dkim_locally",
+                        lambda *a, **k: ["senderdomain.test"])
+    md = spam_filter.extract_email_data(raw)
+    prompt = spam_filter.build_user_message(md)
+    assert "DKIM: pass" in prompt
+    assert "cryptographically PROVEN" in prompt
+    assert "senderdomain.test" in prompt
+    assert "DKIM verified cryptographically by MailWarden itself" in prompt
+    assert "UNVERIFIED DKIM-Signature CLAIM" not in prompt
+
+
+# --- Test 18 -------------------------------------------------------------
+def test_a2_is_authenticated_brand_matched_fires_on_locally_verified_summary():
+    s = utils.summarize_authentication(
+        {"DKIM-Signature": "v=1; d=senderdomain.test; s=sel; b=xx"},
+        from_domain="senderdomain.test", locally_verified=["senderdomain.test"])
+    assert spam_filter.is_authenticated_brand_matched(s) is True
+
+
+# --- Test 19 -------------------------------------------------------------
+def test_a2_command_auth_gate_ignores_local_dkim(monkeypatch):
+    # A message that WOULD locally verify (no A-R, has a DKIM-Signature) must
+    # still fail the owner-command auth gate: local DKIM is prompt-only, never
+    # command authentication. Prove verify_dkim_locally is never even invoked.
+    def _boom(*a, **k):
+        raise AssertionError("command gate must not use local DKIM verification")
+    monkeypatch.setattr(spam_filter, "verify_dkim_locally", _boom)
+    raw = _signed_eml("owner.test", "sel", from_addr="owner@owner.test")
+    mime_msg = _email.message_from_bytes(raw, policy=_email.policy.compat32)
+    md = {"auth_results": "", "received_spf": "",
+          "dkim_signature": "v=1; d=owner.test; s=sel; b=xx", "_mime_msg": mime_msg}
+    account = {"username": "owner@owner.test", "imap_host": "mail.example-imap.test"}
+    config = {"smtp": {"host": "mail.example-smtp.test"}}
+    assert spam_filter._command_auth_ok(md, "owner@owner.test", account, config) is False
+
+
+# --- Test 20 -------------------------------------------------------------
+def test_a2_extract_email_data_retains_raw_bytes():
+    raw = _signed_eml("senderdomain.test", "sel")
+    md = spam_filter.extract_email_data(raw)
+    assert md["_raw_bytes"] is raw  # identity, not a reserialization

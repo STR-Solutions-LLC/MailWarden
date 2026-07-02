@@ -119,7 +119,11 @@ esac
 # shellcheck disable=SC1091
 source "$BUILD_VENV/bin/activate"
 pip install --quiet --upgrade pip setuptools wheel
-pip install --quiet py2app rumps anthropic openpyxl
+# dnspython + dkimpy are runtime deps of the filter (local DKIM verification,
+# audit a-2). Both pure-Python (no native wheels → no universal2 fusion). They
+# are NOT transitive deps of anything above, so name them explicitly or the
+# bundle ships without them and local DKIM verification / DNSBL silently no-op.
+pip install --quiet py2app rumps anthropic openpyxl dnspython dkimpy
 # pyobjc-framework-ServiceManagement is REQUIRED at runtime by
 # smappservice_install.py (v1.6.0 SMAppService migration). It is NOT a
 # transitive dep of rumps or any other package above, so it must be named

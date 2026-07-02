@@ -207,7 +207,8 @@ def check_auth_results(headers: dict) -> dict:
     return {"signal": None, "detail": ""}
 
 
-def summarize_authentication(headers: dict, from_domain: str = "") -> dict:
+def summarize_authentication(headers: dict, from_domain: str = "",
+                             locally_verified: list = None) -> dict:
     """Summarize SPF/DKIM/DMARC results + the cryptographically VERIFIED sending
     domain(s) for the AI classifier (F3). HOST-AGNOSTIC.
 
@@ -235,8 +236,16 @@ def summarize_authentication(headers: dict, from_domain: str = "") -> dict:
     ``authenticated_domains`` is empty — the classifier then judges on other
     evidence (and, per policy, leans toward NOT_SPAM).
 
+    Local DKIM (audit a-2): the optional ``locally_verified`` list carries
+    domains proven by MailWarden's OWN cryptographic DKIM verification
+    (``verify_dkim_locally``), used only for hosts that stamp no usable
+    Authentication-Results. Passing it treats those domains as a real DKIM pass
+    (added to ``authenticated_domains``, sets ``dkim`` to "pass", drops them from
+    the unverified-claim line). Default None ⇒ byte-identical output to before.
+
     Returns a dict: spf, dkim, dmarc, dmarc_from, spf_mailfrom,
-    claimed_dkim_domain, authenticated_domains (sorted), from_domain.
+    claimed_dkim_domain, authenticated_domains (sorted), locally_verified_domains,
+    from_domain.
     """
     auth = str(headers.get("Authentication-Results", "") or "")
     received_spf = str(headers.get("Received-SPF", "") or "")
@@ -293,6 +302,21 @@ def summarize_authentication(headers: dict, from_domain: str = "") -> dict:
     if spf == "pass" and spf_mailfrom:
         authenticated.add(spf_mailfrom)
 
+    # Locally-verified DKIM domains (audit a-2). Caller contract: pass ONLY
+    # domains proven by MailWarden's own cryptographic verification
+    # (utils.verify_dkim_locally), and ONLY when no trusted Authentication-
+    # Results dkim verdict exists (see spam_filter._locally_verified_dkim). A
+    # local pass is a REAL pass: it authenticates the domain AND sets the dkim
+    # scalar to "pass" so the summary is internally consistent and the domain
+    # drops out of the claimed_unverified list below. This is deliberately NOT
+    # reachable from the owner-command auth gate, which never passes this arg.
+    local = sorted({d.lower().lstrip("@").rstrip(".")
+                    for d in (locally_verified or []) if d})
+    for d in local:
+        authenticated.add(d)
+    if local and dkim != "pass":
+        dkim = "pass"
+
     # Unverified DKIM-Signature d= CLAIM(s). A DKIM-Signature header is sender-
     # written and proves nothing on its own — a domain is PROVEN only when its OWN
     # signature passed (added per-clause above) or via aligned DMARC/SPF. We never
@@ -317,6 +341,7 @@ def summarize_authentication(headers: dict, from_domain: str = "") -> dict:
         "claimed_dkim_domain": claimed_dkim,
         "claimed_unverified_domains": claimed_unverified,
         "authenticated_domains": sorted(authenticated),
+        "locally_verified_domains": local,
         "from_domain": (from_domain or "").lower().lstrip("@").rstrip("."),
     }
 
@@ -532,6 +557,136 @@ def check_ip_reputation(sending_ip: str, timeout: float = 3.0) -> dict:
         result = {"signal": None, "detail": "", "hits": []}
     _dnsbl_cache[sending_ip] = result
     return result
+
+
+# ---------------------------------------------------------------------------
+# Local DKIM verification (audit session a-2)
+# (c) 2026 STR Solutions, LLC. All rights reserved.
+# ---------------------------------------------------------------------------
+#
+# Bluehost-class shared mail hosts stamp NO Authentication-Results, so a
+# legitimately DKIM-signed transactional message reaches the classifier fully
+# unauthenticated and its d= domain reads as a suspicious "UNVERIFIED CLAIM".
+# We fix that by cryptographically verifying the sender's OWN DKIM signature
+# ourselves (dkimpy) and feeding the proven domain into summarize_authentication
+# exactly like a provider dkim=pass — see spam_filter._locally_verified_dkim for
+# the trigger gate (runs ONLY when no trusted A-R dkim verdict exists).
+#
+# Security posture: this authenticates domains for the CLASSIFIER prompt only.
+# It is deliberately NOT wired into the owner-command auth gate
+# (_command_auth_ok) — our own resolver's view is weaker provenance than the
+# receiving server's crypto or the server-written Received chain, and a wrong
+# command-auth is a config-mutation risk. A DNS failure, timeout, missing key,
+# rotated key, or ANY error yields NO VERDICT (empty list) — never a "fail".
+
+_dkim_dns_cache: dict = {}          # qname(str) -> bytes|None; per-process (one filter wake)
+_dkim_dns_timeouts = 0              # consecutive-timeout circuit-breaker counter
+_DKIM_DNS_TIMEOUT_LIMIT = 3         # disable local verification after this many in a row
+
+
+def clear_dkim_dns_cache() -> None:
+    """Reset the per-process DKIM DNS cache and circuit breaker (mirrors
+    clear_dnsbl_cache). Used by tests to isolate cases."""
+    global _dkim_dns_timeouts
+    _dkim_dns_cache.clear()
+    _dkim_dns_timeouts = 0
+
+
+def _dkim_get_txt(name, timeout=5):
+    """dnsfunc for dkimpy: cached, lifetime-bounded TXT lookup.
+
+    dkimpy passes ``name`` as bytes (b'selector._domainkey.domain.'). Returns
+    the TXT record as bytes, or None (dkimpy turns a None key into a failed
+    verification = no verdict). Consecutive dns.exception.Timeout events feed a
+    circuit breaker: once _DKIM_DNS_TIMEOUT_LIMIT is reached, every further
+    lookup short-circuits to None without touching the network, bounding a
+    dead-resolver wake. ANY exception -> None (fail safe)."""
+    global _dkim_dns_timeouts
+    key = name.decode("utf-8", "replace") if isinstance(name, (bytes, bytearray)) else str(name)
+    if key in _dkim_dns_cache:
+        return _dkim_dns_cache[key]
+    if _dkim_dns_timeouts >= _DKIM_DNS_TIMEOUT_LIMIT:
+        return None
+    try:
+        import dns.resolver
+        import dns.exception
+    except ImportError:
+        return None
+    try:
+        r = dns.resolver.Resolver()
+        r.timeout = timeout
+        r.lifetime = timeout
+        answers = r.resolve(key, "TXT")
+        txt = b"".join(list(answers)[0].strings)
+        _dkim_dns_cache[key] = txt
+        _dkim_dns_timeouts = 0
+        return txt
+    except dns.exception.Timeout:
+        _dkim_dns_timeouts += 1
+        return None
+    except Exception:
+        # NXDOMAIN, NoAnswer, malformed record, resolver misconfig, etc.
+        _dkim_dns_cache[key] = None
+        return None
+
+
+def verify_dkim_locally(raw_email: bytes, max_signatures: int = 3,
+                        dns_timeout: float = 5.0, budget_seconds: float = 10.0,
+                        logger=None, _dnsfunc=None) -> list:
+    """Cryptographically verify the message's OWN DKIM signature(s) (a-2).
+
+    Returns the sorted, lowercased list of d= domains whose signature actually
+    verified. Returns [] on ANY error — missing dkimpy/dnspython, malformed
+    message or signature, DNS timeout / NXDOMAIN / rotated key, tripped circuit
+    breaker, or exhausted wall-clock budget. NO VERDICT is ever "fail": a
+    failure simply contributes no authenticated domain, so the classifier
+    behaves exactly as it does today for unauthenticated mail.
+
+    Timeout/retry policy: dns_timeout (5s) caps each TXT lookup's total time
+    (dnspython lifetime — no application-level retries on top). At most
+    max_signatures (3) signatures are verified. budget_seconds (10s) caps total
+    wall-clock across all signatures so filtering cannot hang. _dnsfunc is a
+    test seam; production uses _dkim_get_txt (cached + circuit-broken)."""
+    if not raw_email:
+        return []
+    try:
+        import dkim
+    except ImportError:
+        if logger is not None:
+            logger.warning("verify_dkim_locally: dkimpy not installed — no verdict")
+        return []
+    dnsfunc = _dnsfunc or _dkim_get_txt
+
+    # Count DKIM-Signature headers to know how many indices to try.
+    try:
+        parsed = email.message_from_bytes(raw_email, policy=email.policy.compat32)
+        n_sigs = len(parsed.get_all("DKIM-Signature") or [])
+    except Exception:
+        return []
+    if n_sigs == 0:
+        return []
+
+    import time as _time
+    deadline = _time.monotonic() + budget_seconds
+    verified: set = set()
+    limit = min(n_sigs, max_signatures)
+    for idx in range(limit):
+        if _time.monotonic() >= deadline:
+            break
+        try:
+            d = dkim.DKIM(raw_email, timeout=dns_timeout)
+            ok = d.verify(idx=idx, dnsfunc=dnsfunc)
+        except Exception:
+            # dkim.DKIMException (bad message/signature/key) or anything else.
+            continue
+        if ok and getattr(d, "domain", None):
+            dom = d.domain
+            if isinstance(dom, (bytes, bytearray)):
+                dom = dom.decode("utf-8", "replace")
+            dom = dom.strip().lstrip("@").rstrip(".").lower()
+            if dom:
+                verified.add(dom)
+    return sorted(verified)
 
 
 # ---------------------------------------------------------------------------

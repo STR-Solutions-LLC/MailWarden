@@ -33,7 +33,7 @@ from utils import (
     check_header_signals, _extract_sending_ip,
     summarize_authentication, host_spam_verdict,
     random_token, select_trusted_auth_results,
-    clear_dnsbl_cache,
+    clear_dnsbl_cache, verify_dkim_locally,
 )
 from learn_signals import save_signals
 
@@ -3141,6 +3141,13 @@ def _format_authentication_block(auth: dict, msg_data: dict) -> str:
         "trustworthy; NOT part of the email content below):",
         f"  SPF: {auth['spf']}    DKIM: {auth['dkim']}    DMARC: {auth['dmarc']}",
     ]
+    local_verified = auth.get("locally_verified_domains") or []
+    if local_verified:
+        lines.append(
+            "  (DKIM verified cryptographically by MailWarden itself — the "
+            "receiving host stamped no usable Authentication-Results. Locally "
+            "verified d= domain(s): " + ", ".join(local_verified) + ". Treat "
+            "exactly like a provider dkim=pass.)")
     if auth.get("arc") and auth.get("arc") != "none":
         lines.append(f"  (ARC chain verdict from your mail server: arc={auth['arc']} "
                      f"— context only, NOT a proof of the sender.)")
@@ -3186,6 +3193,29 @@ def _extract_link_domains(html_body: str) -> list:
             seen.add(d)
             domains.append(d)
     return domains[:10]
+
+
+def _locally_verified_dkim(msg_data: dict) -> list:
+    """Audit a-2 trigger gate for local DKIM verification.
+
+    Runs cryptographic self-verification ONLY when ALL hold:
+      1. the TRUSTED Authentication-Results carries no dkim= verdict at all
+         (pass OR fail — we never contradict the receiving server), which is
+         exactly the Bluehost-class "no A-R" case that produced the false
+         positives;
+      2. a DKIM-Signature header actually exists;
+      3. the original raw bytes were retained (extract_email_data).
+    Any other state returns [] — today's behavior. Never reached by the
+    owner-command auth gate, which builds its summary without this helper."""
+    ar = msg_data.get("auth_results") or ""
+    if re.search(r'\bdkim\s*=', ar, re.IGNORECASE):
+        return []
+    if not (msg_data.get("dkim_signature") or "").strip():
+        return []
+    raw = msg_data.get("_raw_bytes")
+    if not raw:
+        return []
+    return verify_dkim_locally(raw)
 
 
 def build_user_message(msg_data: dict) -> str:
@@ -3248,7 +3278,8 @@ def build_user_message(msg_data: dict) -> str:
         "Authentication-Results": msg_data.get("auth_results", ""),
         "Received-SPF":           msg_data.get("received_spf", ""),
         "DKIM-Signature":         msg_data.get("dkim_signature", ""),
-    }, from_domain=from_domain)
+    }, from_domain=from_domain,
+        locally_verified=_locally_verified_dkim(msg_data))
     auth_block = _format_authentication_block(auth, msg_data)
 
     # --- Link domain extraction (advisory) ----------------------------------
@@ -3472,6 +3503,11 @@ def extract_email_data(raw_email: bytes, own_hosts=None) -> dict:
         # Retain parsed Message object so parse_forwarded_email can walk MIME
         # structure for rfc822 attachments without re-parsing raw bytes.
         "_mime_msg": msg,
+        # Retain ORIGINAL bytes for local DKIM verification (audit a-2). DKIM
+        # canonicalization requires the exact wire bytes — re-serializing msg
+        # refolds headers and breaks signatures. Private key like _mime_msg;
+        # msg_data is never JSON-serialized/pickled wholesale.
+        "_raw_bytes": raw_email,
     }
 
 
