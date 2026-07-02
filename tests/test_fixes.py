@@ -3530,8 +3530,13 @@ def test_s7_json_salvage_recovers_embedded_json():
 
 def test_s7_clean_json_unaffected_by_salvage():
     """A clean JSON response (no prose) must still parse correctly after the
-    salvage code is added."""
-    raw_response_text = '{"decision": "PASS", "confidence": 0.1, "explanation": "ok"}'
+    salvage code is added.
+
+    (F4 update: the fixture's decision was "PASS" — a value the classifier
+    never emits; strict validation now rightly rejects unknown verdicts, so
+    the fixture uses the real "NOT_SPAM". The test's intent — clean JSON is
+    untouched by the salvage path — is unchanged.)"""
+    raw_response_text = '{"decision": "NOT_SPAM", "confidence": 0.1, "explanation": "ok"}'
 
     class _FakeContent:
         text = raw_response_text
@@ -3558,7 +3563,7 @@ def test_s7_clean_json_unaffected_by_salvage():
         _FakeClient(), "system", md, "test-model", 256, logger
     )
     assert result is not None
-    assert result.get("decision") == "PASS"
+    assert result.get("decision") == "NOT_SPAM"
 
 
 def test_temperature_pinned_classify_email_sends_temperature_zero():

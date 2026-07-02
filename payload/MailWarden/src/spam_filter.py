@@ -65,6 +65,9 @@ LEARNER_LOG_PATH = PROJECT_ROOT / "logs" / "learner.log"
 PENDING_SIGNALS_PATH = PROJECT_ROOT / "memory" / "pending_signals.json"
 REFINEMENTS_LOG_PATH = PROJECT_ROOT / "memory" / "signal_refinements.log"
 TOKEN_USAGE_PATH = PROJECT_ROOT / "memory" / "token_usage.json"
+# F4(c): unparseable/invalid classification responses are captured here as
+# best-effort debug artifacts. Writes never affect the verdict, never raise.
+PARSE_FAILURES_DIR = PROJECT_ROOT / "memory" / "classify_parse_failures"
 # Persistent lifetime counters that survive pruning of decisions.log and
 # pending_signals.json. When old records are pruned away, their tallies are
 # rolled up here so the Dashboard's lifetime totals (and the daily report's
@@ -3332,6 +3335,31 @@ def _format_authentication_block(auth: dict, msg_data: dict) -> str:
                      "freely; NOT proven: d=" + ", ".join(claimed_unverified) + ")")
     lines.append(f"  The From: address domain is: {auth.get('from_domain') or '(unknown)'}")
 
+    # F2: surface the deterministic RULE 1 gate as a stated fact. The model
+    # previously had to re-derive brand-match in prose and sometimes missed
+    # it; is_authenticated_brand_matched is the SAME deterministic test that
+    # gates the OWNER-APPROVED block. This is trusted, server-verified data
+    # (it lives in this block, outside <untrusted_email>) and restates RULE
+    # 1's concrete-threat override verbatim — it does NOT change any rule.
+    # IMPORTANT: the gate proves authentication + From-domain ALIGNMENT only,
+    # not brand-content consistency — a phish that authenticates its OWN
+    # throwaway From domain while impersonating a brand in the content (the
+    # eponanfc/"McAfee" case) trips this gate but must stay RULE 2 spam, so
+    # the line explicitly leaves RULE 2 intact rather than declaring NOT_SPAM.
+    if is_authenticated_brand_matched(auth):
+        lines.append(
+            "  RULE 1 SATISFIED (deterministic, server-verified): this message "
+            "is cryptographically authenticated (DKIM=pass OR DMARC=pass) AND "
+            "an authenticated domain matches the From domain (same domain, a "
+            "subdomain, or the parent) — you do NOT need to re-derive this. "
+            "If the sender/brand the content presents is this domain, RULE 1 "
+            "applies: NOT_SPAM, and the ONLY thing that can override it is a "
+            "CONCRETE, VERIFIABLE threat in the body (a link whose domain is "
+            "unrelated to the sender, or a request to send money/credentials "
+            "to an unrelated party). This does NOT bypass RULE 2: if the "
+            "content claims a brand clearly UNRELATED to this authenticated "
+            "domain, RULE 2 still applies.")
+
     # Upstream provider spam assessment — PRESENT-ONLY, purely factual. Emitted
     # only when the sender's host actually stamped an X-Spam-* header; many
     # legitimate providers (AOL/Yahoo and others) do not, and that ABSENCE is
@@ -3728,6 +3756,67 @@ def clamp_confidence(value) -> float:
     return max(0.0, min(1.0, v))
 
 
+def _validate_classification(result) -> dict | None:
+    """F4(a): strict validation of a parsed classification response.
+
+    Returns a normalized copy, or None when the response cannot be trusted —
+    which callers treat as a parse failure and fail OPEN (deliver):
+      - must be a JSON object containing both "decision" and "confidence"
+        (the pre-F4 required-fields contract, unchanged);
+      - "decision" must be exactly "SPAM" or "NOT_SPAM" (a hallucinated
+        verdict like "JUNK"/"MAYBE" previously flowed downstream and silently
+        delivered via the SPAM==decision check; now it is an explicit failure
+        that gets raw-captured for diagnosis);
+      - "confidence" is coerced and clamped into [0.0, 1.0] (clamp_confidence);
+      - missing/malformed "signals_hit" / "reasoning" are tolerated and
+        normalized to [] / "".
+    """
+    if not isinstance(result, dict):
+        return None
+    if "decision" not in result or "confidence" not in result:
+        return None
+    if result.get("decision") not in ("SPAM", "NOT_SPAM"):
+        return None
+    out = dict(result)
+    out["confidence"] = clamp_confidence(result.get("confidence", 0))
+    sig = result.get("signals_hit")
+    out["signals_hit"] = sig if isinstance(sig, list) else []
+    reasoning = result.get("reasoning")
+    out["reasoning"] = reasoning if isinstance(reasoning, str) else ""
+    return out
+
+
+def _capture_parse_failure(raw_text, model: str, site: str, kind: str):
+    """F4(c): write the raw model response to a local debug artifact when
+    classification parsing/validation fails (e.g. the '$149 Slim Down'
+    Sonnet UNKNOWN, suspected empty-render artifact).
+
+    Best-effort by construction: the WHOLE body is inside one try/except, so
+    the capture can never raise and never influence the verdict. The raw text
+    is size-capped; the filename carries a timestamp plus a random suffix so
+    rapid successive failures never collide. A light retention guard keeps
+    only the newest ~100 artifacts."""
+    try:
+        PARSE_FAILURES_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        fname = f"{stamp}-{os.urandom(4).hex()}.txt"
+        body = (
+            f"captured: {datetime.now().isoformat()}\n"
+            f"model: {model}\n"
+            f"site: {site}\n"
+            f"kind: {kind}\n"
+            "--- raw response (capped at 20000 chars) ---\n"
+            + str(raw_text or "")[:20000]
+        )
+        (PARSE_FAILURES_DIR / fname).write_text(body, encoding="utf-8")
+        # Retention guard: drop the oldest artifacts beyond 100.
+        existing = sorted(PARSE_FAILURES_DIR.glob("*.txt"))
+        for old in existing[:-100]:
+            old.unlink()
+    except Exception:
+        pass
+
+
 def _classify_create(client: anthropic.Anthropic, model: str, max_tokens: int,
                      system_prompt: str, user_message: str,
                      logger: logging.Logger):
@@ -3783,10 +3872,21 @@ def _classify_once(client: anthropic.Anthropic, system_prompt: str,
                    logger: logging.Logger, site: str = "classify") -> tuple:
     """One classification call on an ALREADY-BUILT user message.
 
-    Extracted verbatim from classify_email so the cascade's confirm stage can
-    re-judge the exact same sanitized message (no second build_user_message,
-    no new unsanitized surface). ``site`` only changes the log line so cascade
-    stages are attributable in the filter log."""
+    Extracted from classify_email so the cascade's confirm stage can re-judge
+    the exact same sanitized message (no second build_user_message, no new
+    unsanitized surface). ``site`` only changes the log line so cascade
+    stages are attributable in the filter log.
+
+    F4 hardening (all failures still fail OPEN — deliver):
+      (a) responses are strict-validated via _validate_classification (both
+          the direct-parse and prose-salvage paths);
+      (b) exactly ONE retry on transient API failures (connection drops,
+          timeouts — APITimeoutError subclasses APIConnectionError — and
+          5xx InternalServerError); RateLimitError keeps its own backoff and
+          other APIErrors keep the immediate fail-open;
+      (c) the raw response text is captured to a local debug artifact when
+          parsing or validation fails (_capture_parse_failure)."""
+    transient_retried = False
     for attempt in range(3):
         try:
             logger.info(f"API call: model={model} site={site}")
@@ -3802,17 +3902,30 @@ def _classify_once(client: anthropic.Anthropic, system_prompt: str,
 
             result = json.loads(text)
 
-            # Validate required fields
-            if "decision" not in result or "confidence" not in result:
-                logger.error(f"API response missing required fields: {text}")
-                return None, None
+            # F4(a): strict validation (required fields, known decision,
+            # coerced confidence). Invalid = parse failure = fail-open.
+            validated = _validate_classification(result)
+            if validated is None:
+                logger.error(f"API response failed validation: {text}")
+                _capture_parse_failure(text, model, site, "validation")
+                return None, response
 
-            return result, response
+            return validated, response
 
         except anthropic.RateLimitError:
             wait = (2 ** attempt) * 5
             logger.warning(f"Rate limited, waiting {wait}s (attempt {attempt + 1}/3)")
             time.sleep(wait)
+        except (anthropic.APIConnectionError,
+                anthropic.InternalServerError) as e:
+            # F4(b): one retry on transient failures, then fail open.
+            if transient_retried:
+                logger.error(f"Transient API error persisted after one "
+                             f"retry: {e}")
+                return None, None
+            transient_retried = True
+            logger.warning(f"Transient API error; retrying once: {e}")
+            continue
         except anthropic.APIError as e:
             logger.error(f"API error: {e}")
             return None, None
@@ -3832,14 +3945,17 @@ def _classify_once(client: anthropic.Anthropic, system_prompt: str,
             if salvage:
                 try:
                     result = json.loads(salvage.group())
-                    if "decision" in result and "confidence" in result:
+                    # F4(a): the salvaged object gets the same validation.
+                    validated = _validate_classification(result)
+                    if validated is not None:
                         logger.warning(
                             f"JSON salvaged from prose response (original error: {e})"
                         )
-                        return result, response
+                        return validated, response
                 except json.JSONDecodeError:
                     pass
             logger.error(f"Failed to parse API response as JSON: {e}\nRaw: {text}")
+            _capture_parse_failure(text, model, site, "json_decode")
             return None, response
 
     logger.error("Max retries exceeded for rate limiting")
