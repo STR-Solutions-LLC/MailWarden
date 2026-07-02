@@ -23,7 +23,7 @@ from pathlib import Path
 
 import file_lock
 
-from utils import parse_from_address
+from utils import parse_from_address, extract_domain, random_token
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
@@ -33,6 +33,12 @@ WHITELIST_PATH = PROJECT_ROOT / "memory" / "whitelist.json"
 BLACKLIST_PATH = PROJECT_ROOT / "memory" / "blacklist.json"
 TOKEN_USAGE_PATH = PROJECT_ROOT / "memory" / "token_usage.json"
 REPORT_STATE_PATH = PROJECT_ROOT / "memory" / "report_state.json"
+# Token-keyed number->sender maps for report APPROVE replies (safe
+# sender-approval feature). Written here at report-send time; spam_filter.py
+# reads it when the owner replies "APPROVE <n>" to a [MWR-<token>] report.
+REPORT_APPROVALS_PATH = PROJECT_ROOT / "memory" / "report_approvals.json"
+# Report-approval tokens expire after this many days (locked product decision).
+REPORT_APPROVAL_MAX_AGE_DAYS = 30
 REPORT_BOUNDARY_HOUR = 8  # local clock hour the report "day" rolls over
 PENDING_SIGNALS_PATH = PROJECT_ROOT / "memory" / "pending_signals.json"
 # Persistent lifetime counters that survive pruning of decisions.log and
@@ -380,6 +386,82 @@ def save_report_state(data: dict):
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
         raise
+
+
+def load_report_approvals() -> dict:
+    """Read report_approvals.json. Caller holds the lock (mirrors load_report_state)."""
+    try:
+        with open(REPORT_APPROVALS_PATH, "r") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_report_approvals(data: dict):
+    """Atomic write of report_approvals.json. Caller holds the lock (mirrors save_report_state)."""
+    fd, tmp_path = tempfile.mkstemp(dir=REPORT_APPROVALS_PATH.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, REPORT_APPROVALS_PATH)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+def numbered_spam_entries(decisions: dict) -> list:
+    """The report's junked-mail entries in their RENDERED numbering order:
+    one unified 1..k space, moved entries first, then dry-run entries —
+    exactly the order build_report_body renders them."""
+    moved = [e for e in decisions.get("spam_entries", []) if not e.get("dry_run")]
+    dry = [e for e in decisions.get("spam_entries", []) if e.get("dry_run")]
+    return moved + dry
+
+
+def build_approval_entries(decisions: dict) -> dict:
+    """Number->sender map for one report's APPROVE tokens: {"1": {from_domain,
+    from, subject}, ...} keyed by the SAME numbers the report body renders."""
+    entries = {}
+    for i, e in enumerate(numbered_spam_entries(decisions), 1):
+        addr = parse_from_address(e.get("from", "")).get("address") or ""
+        entries[str(i)] = {
+            "from_domain": (extract_domain(addr) or "").lstrip("@"),
+            "from": e.get("from", ""),
+            "subject": e.get("subject", ""),
+        }
+    return entries
+
+
+def record_report_approvals(token: str, account: str, window_end,
+                            entries: dict, logger: logging.Logger):
+    """Write one report's number->sender map under its [MWR-<token>] key.
+    Tokens older than REPORT_APPROVAL_MAX_AGE_DAYS are pruned opportunistically
+    inside the same locked write. Best-effort: a failure here must never block
+    a report send."""
+    try:
+        with file_lock.locked(REPORT_APPROVALS_PATH):
+            data = load_report_approvals()
+            cutoff = datetime.now() - timedelta(days=REPORT_APPROVAL_MAX_AGE_DAYS)
+            for tok in list(data.keys()):
+                rec = data.get(tok)
+                try:
+                    created = datetime.fromisoformat(
+                        (rec or {}).get("created", ""))
+                    if created < cutoff:
+                        del data[tok]
+                except (ValueError, TypeError, AttributeError):
+                    del data[tok]  # malformed record -> drop
+            data[token] = {
+                "created": datetime.now().isoformat(),
+                "account": account,
+                "window_end": window_end.isoformat(),
+                "entries": entries,
+            }
+            save_report_approvals(data)
+    except Exception as e:
+        logger.error(f"Failed to record report approvals for [MWR-{token}]: {e}")
 
 
 def _parse_state_ts(value):
@@ -910,10 +992,16 @@ def build_report_body(config: dict, decisions: dict, last_run: datetime,
     if dry_run_entries:
         lines.append("SPAM DETECTED — DRY RUN, NOT MOVED")
         lines.append("-" * 39)
-        _render_spam_list(dry_run_entries)
+        # One unified 1..k numbering space across moved + dry-run entries, so
+        # an APPROVE <n> reply is unambiguous (safe sender-approval feature).
+        _render_spam_list(dry_run_entries, start_index=len(moved_entries) + 1)
         lines.append("-" * 39)
         lines.append("")
         lines.append("To review recent decisions, open MailWarden and view the Home tab.")
+
+    if moved_entries or dry_run_entries:
+        lines.append("")
+        lines.append("To rescue a sender, reply to this report with APPROVE and the item number (example: APPROVE 3). MailWarden will stop junking that sender's domain — but only when a message proves it really came from them.")
 
     if not moved_entries and not dry_run_entries:
         lines.append("No spam moved to Junk in the last 24 hours.")
@@ -1180,6 +1268,14 @@ def main(now=None):
             )
             subject = (f"MailWarden Report — {date_str} — "
                        f"{decisions['spam_moved']} moved to Junk")
+            # Safe sender-approval: reports that list junked entries get a
+            # short reply token; zero-entry reports write no token.
+            approval_entries = build_approval_entries(decisions)
+            if approval_entries:
+                approval_token = random_token()
+                subject += f" [MWR-{approval_token}]"
+                record_report_approvals(approval_token, name, window_end,
+                                        approval_entries, logger)
             try:
                 send_report(config, subject, body, logger)
                 advances[name] = {
@@ -1251,6 +1347,14 @@ def main(now=None):
             )
             subject = (f"MailWarden Report — {acct_name} — {date_str} — "
                        f"{acct_decisions['spam_moved']} moved to Junk")
+            # Safe sender-approval: reports that list junked entries get a
+            # short reply token; zero-entry reports write no token.
+            approval_entries = build_approval_entries(acct_decisions)
+            if approval_entries:
+                approval_token = random_token()
+                subject += f" [MWR-{approval_token}]"
+                record_report_approvals(approval_token, acct_name, window_end,
+                                        approval_entries, logger)
             try:
                 send_report(config, subject, body, logger, to_addr=acct_user)
                 advances[acct_name] = {

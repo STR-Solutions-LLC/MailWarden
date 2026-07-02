@@ -1332,7 +1332,7 @@ def test_fpauth_build_prompt_no_suppress_param():
     import inspect
     params = inspect.signature(spam_filter.build_classifier_prompt).parameters
     assert "suppress_evasion_signals" not in params
-    assert list(params) == ["signals", "account_name"]
+    assert list(params) == ["signals", "account_name", "approvals_active"]
     assert not hasattr(spam_filter, "_EVASION_SIGNAL_MARKERS")
     assert not hasattr(spam_filter, "_is_overbroad_evasion_signal")
     # Every learned signal is present now — nothing is filtered out at build time.
@@ -2763,7 +2763,8 @@ def _dry_run_filter_harness(monkeypatch, *, uids=None, msg_data=None,
     monkeypatch.setattr(spam_filter, "persist_progress",
                         lambda processed, tu, td: None)
     monkeypatch.setattr(spam_filter, "build_classifier_prompt",
-                        lambda signals, username=None: "PROMPT")
+                        lambda signals, username=None,
+                        approvals_active=False: "PROMPT")
     monkeypatch.setattr(spam_filter, "_maybe_send_dry_run_reminder",
                         lambda config, accounts, logger: None)
     # The command / SFID owner+auth gates would otherwise reject our synthetic

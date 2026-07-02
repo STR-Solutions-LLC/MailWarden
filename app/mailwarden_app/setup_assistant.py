@@ -517,6 +517,7 @@ class SetupAssistant(tk.Tk):
             ("processed_ids.json", paths.PROCESSED_IDS_PATH),
             ("token_usage.json", paths.TOKEN_USAGE_PATH),
             ("pending_signals.json", paths.PENDING_SIGNALS_PATH),
+            ("approved_senders.json", paths.MEMORY_DIR / "approved_senders.json"),
         ]
         paths.MEMORY_DIR.mkdir(parents=True, exist_ok=True)
         for src_name, dst_path in memory_defaults:

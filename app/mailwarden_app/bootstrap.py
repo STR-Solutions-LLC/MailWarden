@@ -277,7 +277,7 @@ def bootstrap_runtime() -> dict:
         if defaults_root:
             for name in ("signals.json", "whitelist.json", "blacklist.json",
                          "processed_ids.json", "token_usage.json",
-                         "pending_signals.json"):
+                         "pending_signals.json", "approved_senders.json"):
                 src = defaults_root / name
                 dst = paths.MEMORY_DIR / name
                 if src.exists() and not dst.exists():
