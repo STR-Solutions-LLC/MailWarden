@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
 # (c) 2026 STR Solutions, LLC. All rights reserved.
 """
-Step B — F2 (deterministic RULE 1 line) + F4 (classification hardening).
+Step B — F4 (classification hardening).
 
 All mocked, NO paid calls. Covers:
-  F2: the RULE 1 SATISFIED line in _format_authentication_block — present
-      exactly when is_authenticated_brand_matched(auth) is True, restates the
-      concrete-threat override, explicitly preserves RULE 2 (the eponanfc-
-      class own-throwaway-domain phish trips the gate but must stay RULE 2),
-      rides build_user_message OUTSIDE <untrusted_email>, and is absent for
-      unauthenticated mail (prompt unchanged there).
   F4(a): _validate_classification strictness + normalization, applied on both
       the direct-parse and prose-salvage paths; invalid = fail-open.
   F4(b): exactly ONE retry on transient APIError subclasses
@@ -46,23 +40,6 @@ RAW_NORMAL = (
     b"To: me@example.org\r\n"
     b"Subject: Win a prize today\r\n"
     b"Message-ID: <abc123@evil.com>\r\n"
-    b"\r\n"
-    b"Hello friend, this is a perfectly normal length body with plenty of real "
-    b"words in it. Thanks for reading.\r\n"
-)
-
-# Same message but cryptographically authenticated for its own From domain
-# (dkim=pass evil.com) — trips the deterministic RULE 1 gate. The Received
-# "by" host anchors the Authentication-Results as trusted (C5b: authserv-id
-# must share a registrable domain with the delivering host).
-RAW_AUTHED = (
-    b"From: Promo <promo@evil.com>\r\n"
-    b"To: me@example.org\r\n"
-    b"Subject: Win a prize today\r\n"
-    b"Message-ID: <abc123@evil.com>\r\n"
-    b"Received: from mail.evil.com by mx.example.org; "
-    b"Wed, 1 Jul 2026 10:00:00 +0000\r\n"
-    b"Authentication-Results: mx.example.org; dkim=pass header.d=evil.com\r\n"
     b"\r\n"
     b"Hello friend, this is a perfectly normal length body with plenty of real "
     b"words in it. Thanks for reading.\r\n"
@@ -132,72 +109,6 @@ def _bad_request(message):
         400, request=_httpx_request(),
         json={"error": {"type": "invalid_request_error", "message": message}})
     return anthropic.BadRequestError(message, response=resp, body=None)
-
-
-# ---------------------------------------------------------------------------
-# F2 — deterministic RULE 1 line
-# ---------------------------------------------------------------------------
-
-def _auth(dkim="pass", dmarc="none", from_domain="example.com",
-          authed=("example.com",)):
-    return {"spf": "none", "dkim": dkim, "dmarc": dmarc,
-            "from_domain": from_domain,
-            "authenticated_domains": list(authed)}
-
-
-def test_f2_line_present_when_gate_true():
-    block = spam_filter._format_authentication_block(_auth(), {})
-    assert "RULE 1 SATISFIED" in block
-    # Concrete-threat override restated verbatim from RULE 1.
-    assert "a link whose domain is unrelated to the sender" in block
-    assert "send money/credentials to an unrelated party" in block
-    # The gate proves From-alignment only — RULE 2 must be left intact for
-    # the eponanfc-class own-throwaway-domain phish.
-    assert "does NOT bypass RULE 2" in block
-
-
-def test_f2_line_absent_without_authentication():
-    block = spam_filter._format_authentication_block(
-        _auth(dkim="none", authed=()), {})
-    assert "RULE 1 SATISFIED" not in block
-
-
-def test_f2_line_absent_when_domains_do_not_align():
-    block = spam_filter._format_authentication_block(
-        _auth(from_domain="other.org"), {})
-    assert "RULE 1 SATISFIED" not in block
-
-
-def test_f2_line_matches_deterministic_gate_exactly():
-    """The line must fire IFF is_authenticated_brand_matched fires — same
-    gate, no re-derivation drift."""
-    cases = [
-        _auth(),                                      # dkim pass, aligned
-        _auth(dkim="none", dmarc="pass"),             # dmarc pass, aligned
-        _auth(authed=("sub.example.com",)),           # subdomain alignment
-        _auth(dkim="none", dmarc="none"),             # no auth
-        _auth(from_domain="brand.com"),               # not aligned
-        _auth(authed=()),                             # nothing authenticated
-    ]
-    for auth in cases:
-        expected = spam_filter.is_authenticated_brand_matched(auth)
-        block = spam_filter._format_authentication_block(auth, {})
-        assert ("RULE 1 SATISFIED" in block) is expected, auth
-
-
-def test_f2_rides_build_user_message_outside_untrusted_tags():
-    msg = spam_filter.build_user_message(_msg_data(RAW_AUTHED))
-    assert "RULE 1 SATISFIED" in msg
-    # Trusted framing: the line sits in the auth block BEFORE the untrusted
-    # content opens. (The preamble MENTIONS the tag name in prose, so anchor
-    # on the actual opening tag on its own line.)
-    open_tag = msg.index("\n<untrusted_email>")
-    assert msg.index("RULE 1 SATISFIED") < open_tag
-
-
-def test_f2_unauthenticated_prompt_unchanged():
-    msg = spam_filter.build_user_message(_msg_data(RAW_NORMAL))
-    assert "RULE 1 SATISFIED" not in msg
 
 
 # ---------------------------------------------------------------------------

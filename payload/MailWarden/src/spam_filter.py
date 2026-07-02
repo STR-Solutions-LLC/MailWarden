@@ -3335,31 +3335,6 @@ def _format_authentication_block(auth: dict, msg_data: dict) -> str:
                      "freely; NOT proven: d=" + ", ".join(claimed_unverified) + ")")
     lines.append(f"  The From: address domain is: {auth.get('from_domain') or '(unknown)'}")
 
-    # F2: surface the deterministic RULE 1 gate as a stated fact. The model
-    # previously had to re-derive brand-match in prose and sometimes missed
-    # it; is_authenticated_brand_matched is the SAME deterministic test that
-    # gates the OWNER-APPROVED block. This is trusted, server-verified data
-    # (it lives in this block, outside <untrusted_email>) and restates RULE
-    # 1's concrete-threat override verbatim — it does NOT change any rule.
-    # IMPORTANT: the gate proves authentication + From-domain ALIGNMENT only,
-    # not brand-content consistency — a phish that authenticates its OWN
-    # throwaway From domain while impersonating a brand in the content (the
-    # eponanfc/"McAfee" case) trips this gate but must stay RULE 2 spam, so
-    # the line explicitly leaves RULE 2 intact rather than declaring NOT_SPAM.
-    if is_authenticated_brand_matched(auth):
-        lines.append(
-            "  RULE 1 SATISFIED (deterministic, server-verified): this message "
-            "is cryptographically authenticated (DKIM=pass OR DMARC=pass) AND "
-            "an authenticated domain matches the From domain (same domain, a "
-            "subdomain, or the parent) — you do NOT need to re-derive this. "
-            "If the sender/brand the content presents is this domain, RULE 1 "
-            "applies: NOT_SPAM, and the ONLY thing that can override it is a "
-            "CONCRETE, VERIFIABLE threat in the body (a link whose domain is "
-            "unrelated to the sender, or a request to send money/credentials "
-            "to an unrelated party). This does NOT bypass RULE 2: if the "
-            "content claims a brand clearly UNRELATED to this authenticated "
-            "domain, RULE 2 still applies.")
-
     # Upstream provider spam assessment — PRESENT-ONLY, purely factual. Emitted
     # only when the sender's host actually stamped an X-Spam-* header; many
     # legitimate providers (AOL/Yahoo and others) do not, and that ABSENCE is
