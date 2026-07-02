@@ -27,6 +27,8 @@ payload/MailWarden/memory/*.lock
 payload/MailWarden/.claude-mpm/
 payload/MailWarden/memory/decisions.log
 payload/MailWarden/memory/eula_sent.json
+# Parse-failure debug capture (raw email content) — never commit
+payload/MailWarden/memory/
 
 # Append-only refinement-event log (~/MailWarden/memory/signal_refinements.log).
 # Runtime/dev artifact — never commit. Bare name matches it in any directory.
