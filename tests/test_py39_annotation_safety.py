@@ -1,6 +1,12 @@
 # (c) 2026 STR Solutions, LLC. All rights reserved.
 """
-Python 3.9 annotation-safety guard for SHIPPED runtime files.
+Python 3.9 syntax-safety guard for SHIPPED runtime files.
+
+Two independent 3.10+/3.11+ syntax traps live here because they share one root
+cause and one scope: source that the newer test-venv interpreter accepts but
+the bundled Python 3.9 rejects (or mis-evaluates) at import, crashing the app
+at launch. The first is PEP 604 union annotations; the second is possessive
+quantifiers / atomic groups in regex literals (see the second section below).
 
 Why this exists
 ---------------
@@ -196,3 +202,146 @@ def test_guard_detects_subscripted_builtin_alias() -> None:
 def test_shipped_file_set_is_non_empty() -> None:
     """Guard against a broken glob silently scanning nothing."""
     assert _shipped_files(), "no shipped files discovered — check SHIPPED_PATTERNS"
+
+
+# ---------------------------------------------------------------------------
+# Second trap: possessive quantifiers / atomic groups in regex literals.
+#
+# ``re`` gained possessive quantifiers (``a*+``, ``a++``, ``a?+``, ``a{m,n}+``)
+# and atomic groups (``(?>...)``) in Python 3.11. The bundled universal2
+# ``/usr/bin/python3`` is CPython 3.9.6, whose ``re`` raises
+# ``re.error: multiple repeat`` on that syntax *at import*, killing the app at
+# launch (exactly the spam_filter.py html_to_text hardening constants did this).
+# We AST-scan every ``re.<fn>(<str literal>, ...)`` call in shipped files and
+# fail on any pattern that uses this 3.11+ syntax.
+# ---------------------------------------------------------------------------
+
+# re functions whose FIRST positional arg is the pattern string. (``.sub`` etc.
+# on a *compiled* pattern take the replacement first, so we only match calls on
+# the ``re`` module itself — see _re_module_aliases.)
+_RE_PATTERN_FUNCS = {
+    "compile", "search", "match", "fullmatch",
+    "sub", "subn", "split", "findall", "finditer",
+}
+
+
+def _re_module_aliases(tree: ast.Module) -> set[str]:
+    """Names the ``re`` stdlib module is bound to in this file (handles
+    ``import re`` and ``import re as _re``)."""
+    aliases = {"re"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "re" and alias.asname:
+                    aliases.add(alias.asname)
+    return aliases
+
+
+def _possessive_or_atomic_spans(pattern: str) -> list[tuple[str, int]]:
+    """(kind, index) for every possessive quantifier / atomic group in a regex
+    source string. Honors backslash escapes and ``[...]`` classes so that
+    escaped literals like ``\\++`` (one-or-more literal '+') and class contents
+    like ``[*+?]`` are NOT flagged — only true 3.11+ syntax is."""
+    hits: list[tuple[str, int]] = []
+    i, n = 0, len(pattern)
+    in_class = False
+    brace_stack: list[int] = []
+    while i < n:
+        c = pattern[i]
+        if c == "\\":            # escaped char -> skip the pair
+            i += 2
+            continue
+        if in_class:
+            if c == "]":
+                in_class = False
+            i += 1
+            continue
+        if c == "[":
+            in_class = True
+            i += 1
+            continue
+        if c == "(" and pattern[i:i + 3] == "(?>":
+            hits.append(("atomic-group", i))
+            i += 3
+            continue
+        if c in "*+?":           # base quantifier; possessive iff followed by '+'
+            if i + 1 < n and pattern[i + 1] == "+":
+                hits.append(("possessive", i))
+                i += 2
+                continue
+            i += 1
+            continue
+        if c == "{":
+            brace_stack.append(i)
+            i += 1
+            continue
+        if c == "}":
+            if brace_stack:
+                start = brace_stack.pop()
+                inner = pattern[start + 1:i]
+                # Only a real {m,n} quantifier (digits/comma) can be possessive.
+                if inner and all(ch.isdigit() or ch == "," for ch in inner):
+                    if i + 1 < n and pattern[i + 1] == "+":
+                        hits.append(("possessive-brace", i))
+                        i += 2
+                        continue
+            i += 1
+            continue
+        i += 1
+    return hits
+
+
+def _regex_syntax_hits(tree: ast.Module) -> list[tuple[int, str, list[tuple[str, int]]]]:
+    """(lineno, pattern, spans) for shipped ``re.<fn>`` calls whose literal
+    pattern uses possessive/atomic syntax."""
+    aliases = _re_module_aliases(tree)
+    out: list[tuple[int, str, list[tuple[str, int]]]] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        func = node.func
+        if func.attr not in _RE_PATTERN_FUNCS:
+            continue
+        if not (isinstance(func.value, ast.Name) and func.value.id in aliases):
+            continue
+        if not node.args:
+            continue
+        first = node.args[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            spans = _possessive_or_atomic_spans(first.value)
+            if spans:
+                out.append((first.lineno, first.value, spans))
+    return out
+
+
+@pytest.mark.parametrize("path", _shipped_files(), ids=lambda p: os.path.relpath(p, REPO_ROOT))
+def test_shipped_file_has_no_py311_regex_syntax(path: str) -> None:
+    """No shipped regex literal may use possessive quantifiers or atomic groups
+    (Python 3.11+), which the bundled 3.9 ``re`` rejects at import."""
+    tree = _parse(path)
+    hits = _regex_syntax_hits(tree)
+    rel = os.path.relpath(path, REPO_ROOT)
+    assert not hits, (
+        f"{rel} uses Python 3.11+ regex syntax (possessive quantifiers or "
+        f"atomic groups) that the bundled /usr/bin/python3 (CPython 3.9) "
+        f"rejects at import with 're.error: multiple repeat' — a launch crash. "
+        f"Fix: use plain greedy quantifiers (\\s*+ -> \\s*); if backtracking is "
+        f"a real concern, use a manual linear scanner instead. Offenders: "
+        + "; ".join(f"line {ln}: {pat!r} {spans}" for ln, pat, spans in hits)
+    )
+
+
+def test_regex_guard_flags_possessive_and_atomic() -> None:
+    """The detector must catch each 3.11+ regex form (regression guard)."""
+    assert _possessive_or_atomic_spans(r"<\s*+br>")           # possessive *
+    assert _possessive_or_atomic_spans(r"a++b")               # possessive +
+    assert _possessive_or_atomic_spans(r"x?+")                # possessive ?
+    assert _possessive_or_atomic_spans(r"\d{2,3}+")           # possessive {m,n}
+    assert _possessive_or_atomic_spans(r"(?>ab)c")            # atomic group
+
+
+def test_regex_guard_ignores_39_safe_forms() -> None:
+    """Escaped literals, classes, and lazy/greedy quantifiers must NOT flag."""
+    for safe in (r"<\s*br>", r"\++", r"\*+", r"\?+", r"[*+?]",
+                 r"a*?b", r"a+?b", r"a??b", r"x{2,3}", r"(?:ab)+", r"foo\}+"):
+        assert _possessive_or_atomic_spans(safe) == [], safe

@@ -4863,11 +4863,20 @@ def test_html_to_text_adversarial_inputs_fast():
     import time as _time
     h2t = spam_filter.html_to_text
     br_input = ("<br" + " " * 4096) * 49
+    # A SINGLE long whitespace run inside a non-terminating <br…> — the worst
+    # case for _HTML_BR_RE. Its cost is O(m^2) in the run length m for any
+    # pattern that puts two adjacent \s* around an OPTIONAL separator
+    # (r'<\s*br\s*/?\s*>' did exactly this: 15.8s @ 100K on py3.9, minutes at
+    # the 500KB cap, reachable uncapped via parse_forwarded_email). The
+    # 4096-per-run br_input above does NOT expose it (m is small, repeated);
+    # only one giant run does. Fixed form r'<\s*br\s*(?:/\s*)?>' is linear.
+    br_single_run = "<br" + " " * 200_000 + "x"   # no '>': non-match, full backtrack
     cases = [
         # (input, expected_output)
         ("<" * 200_000, "<" * 200_000),   # no '>': nothing strips
         ("<script>" * 25_000, ""),        # unclosed blocks kept, tags strip
         (br_input, br_input.strip()),     # no '>': untouched except .strip()
+        (br_single_run, br_single_run),   # no '>': untouched (.strip() is a no-op)
     ]
     for data, expected in cases:
         t0 = _time.perf_counter()
@@ -4878,3 +4887,13 @@ def test_html_to_text_adversarial_inputs_fast():
             f"adversarial {len(data):,}-char input took {elapsed:.2f}s "
             f"(quadratic regression?)"
         )
+    # Dedicated TIGHT ceiling for the _HTML_BR_RE single-run worst case so a
+    # quadratic br rewrite cannot regress silently: the fixed pattern runs in
+    # ~5-10 ms at 200KB (both py3.9 and py3.12); the quadratic form took ~45s.
+    t0 = _time.perf_counter()
+    assert h2t(br_single_run) == br_single_run
+    br_elapsed = _time.perf_counter() - t0
+    assert br_elapsed < 1.0, (
+        f"_HTML_BR_RE single-run 200K-space input took {br_elapsed:.2f}s — "
+        f"quadratic regression (two adjacent \\s* around an optional separator?)"
+    )

@@ -4157,22 +4157,39 @@ def get_html_body(msg: email.message.Message) -> str:
 # must be linear-time. Every replacement below is EXACTLY semantics-
 # preserving (verified byte-identical old-vs-new over the full 119-email
 # corpus + all fixtures):
-#   - Possessive quantifiers (\s*+; Python 3.11+, the app bundles and builds
-#     with 3.12) eliminate backtracking. Safe here because each possessive
-#     class is disjoint from what follows it (whitespace vs 'b'/'/'/'>'),
-#     so greedy matching never needed to give characters back to succeed.
+#   - Greedy quantifiers (\s*) whose neighbours are disjoint keep matching
+#     linear WITHOUT possessive syntax. Each \s* is followed by a NON-
+#     whitespace literal ('b'/'/'/'>'/'(') and no \s* is nested inside another
+#     quantifier, so on a non-match the engine gives back whitespace one char
+#     at a time against a literal that can never be whitespace — O(n), never
+#     O(n^2). (Possessive quantifiers '\s*+' would encode that intent, but the
+#     shipped engine runs under the bundled universal2 /usr/bin/python3 =
+#     CPython 3.9.6, whose 're' raises "multiple repeat" on possessive/atomic
+#     syntax at import — a launch crash. Possessive quantifiers and atomic
+#     groups '(?>...)' are therefore FORBIDDEN in shipped code; the guard in
+#     tests/test_py39_annotation_safety.py enforces it.)
 #   - The generic tag-strip and the script/style block-strip become manual
 #     str.find scans (below) that replicate the old patterns' semantics
 #     exactly — including '<' characters INSIDE a tag span (real mail does
 #     this: MSO conditional comments like '<!--[if !mso]><!-->'), which is
 #     why a narrowed [^<>] character class was NOT usable.
-_HTML_BR_RE = re.compile(r'<\s*+br\s*+/?\s*+>', re.IGNORECASE)
+#   - The br pattern is '<\s*br\s*(?:/\s*)?>', NOT '<\s*br\s*/?\s*>'. The
+#     linearity above requires every \s* to be followed by a MANDATORY
+#     non-whitespace token. The naive '\s*/?\s*' violates that: two \s* runs
+#     separated only by an OPTIONAL '/', so one whitespace run splits O(m) ways
+#     between them and a non-match (a long unterminated '<br…') backtracks
+#     O(m^2) — measured minutes at the 500KB cap, reachable via
+#     parse_forwarded_email. Folding the '/' into '(?:/\s*)?' makes the '/'
+#     mandatory-to-enter the optional group, so the preceding \s* again sees a
+#     non-whitespace neighbour ('/' or '>'). Match set is identical (exhaustive
+#     cross-product proof) and it stays linear. Do NOT "simplify" it back.
+_HTML_BR_RE = re.compile(r'<\s*br\s*(?:/\s*)?>', re.IGNORECASE)
 _HTML_BLOCK_CLOSE_RE = re.compile(
-    r'<\s*+/\s*+(p|div|tr|li|h[1-6]|blockquote)\s*+>', re.IGNORECASE)
-_SCRIPT_STYLE_OPEN_HEAD_RE = re.compile(r'<\s*+(script|style)', re.IGNORECASE)
+    r'<\s*/\s*(p|div|tr|li|h[1-6]|blockquote)\s*>', re.IGNORECASE)
+_SCRIPT_STYLE_OPEN_HEAD_RE = re.compile(r'<\s*(script|style)', re.IGNORECASE)
 _SCRIPT_STYLE_CLOSE_RES = {
-    "script": re.compile(r'<\s*+/\s*+script\s*+>', re.IGNORECASE),
-    "style":  re.compile(r'<\s*+/\s*+style\s*+>', re.IGNORECASE),
+    "script": re.compile(r'<\s*/\s*script\s*>', re.IGNORECASE),
+    "style":  re.compile(r'<\s*/\s*style\s*>', re.IGNORECASE),
 }
 
 
