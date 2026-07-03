@@ -38,15 +38,23 @@ deterministic round-robin over sorted subdirs, each subdir's files sorted;
 stray top-level .eml files form one extra bucket taken last), so every sitting
 mixes all accounts instead of draining one.
 
-Per-sender cap (--per-domain-cap, default 3; 0 disables): at most N candidates
-per From-domain AND per normalized From display-name are ASKED per run. Hitting
-either cap only DEFERS the extra emails — they are NOT asked, NOTHING is written
-to the log, and they are LEFT in _harvest (they reappear in a later run). A cap
-NEVER auto-applies a label; the HARD RULE (one email = one human verdict) is
-absolute. The display-name counter catches political blasts that rotate the
-From-domain to evade blocking while keeping one display name; at worst it
-over-groups a generic name like "Customer Service", which only defers those to
-a later sitting — acceptable. An empty/missing display name is never grouped.
+Per-sender cap (--per-domain-cap, default 3; 0 disables): a per-sender LIFETIME
+representation cap — at most N examples of any one From-domain AND any one
+normalized From display-name end up in the corpus. It is enforced per run via
+counters SEEDED at startup from the emails already labeled into the corpus
+(the four class folders), then incremented on each ASK. So a sender that
+already has N corpus examples is deferred on its very first candidate this run,
+with zero asks, and — unlike the old per-run cap — re-running does NOT surface
+it again (the seed still reflects those N examples). Hitting either cap only
+DEFERS the extra emails: they are NOT asked, NOTHING is written to the log, and
+they are LEFT in _harvest. A cap NEVER auto-applies a label; the HARD RULE (one
+email = one human verdict) is absolute. The display-name counter catches
+political blasts that rotate the From-domain to evade blocking while keeping one
+display name; at worst it over-groups a generic name like "Customer Service",
+which only defers those — acceptable. An empty/missing display name is never
+grouped. Seeding is exception-safe per file (a malformed corpus .eml is skipped)
+and deterministic (sorted folders + files). With cap disabled (0/None) the
+corpus is not scanned at all.
 
 Browser preview (default ON, disable with --no-preview): each candidate is
 ALSO rendered to its own fresh temp HTML file (unique filename per candidate,
@@ -90,6 +98,9 @@ FOLDER_PERSONAL = "3-Legitimate-Personal"
 # Must match eval_corpus._GRAYMAIL_FOLDER exactly so the eval reader recognizes
 # this folder as the (separately-scored) graymail class.
 FOLDER_GRAYMAIL = "4-Graymail"
+# The four corpus class folders — scanned at startup to SEED the per-sender cap
+# so it counts LIFETIME corpus representation, not just this run's asks.
+CLASS_FOLDERS = (FOLDER_SPAM, FOLDER_NEWSLETTER, FOLDER_PERSONAL, FOLDER_GRAYMAIL)
 TRIAGE_LOG = "_triage_log.tsv"
 
 # Max candidates ASKED per From-domain AND per normalized From display-name per
@@ -495,20 +506,56 @@ def iter_candidates(harvest_dir: Path):
             yield f, ev
 
 
+def _seed_sender_counts(benchmark_dir: Path) -> tuple:
+    """Seed the per-domain and per-display-name cap counters from emails ALREADY
+    in the corpus, so the cap counts LIFETIME representation rather than only
+    this run's asks. Scans the four class folders under ``benchmark_dir`` and
+    parses each .eml's From with the SAME _from_domain / _from_display_name used
+    for candidates (so corpus and candidate sides can never drift).
+
+    Exception-safe PER FILE: a malformed/unreadable corpus .eml is skipped, never
+    crashes startup. Empty domain / empty display name are NEVER counted (the
+    empty-never-grouped rule). Deterministic: class folders in fixed order, files
+    sorted. Returns (domain_counts, name_counts)."""
+    domain_counts = {}
+    name_counts = {}
+    for folder in CLASS_FOLDERS:
+        d = benchmark_dir / folder
+        if not d.is_dir():
+            continue
+        for f in sorted(d.glob("*.eml")):
+            try:
+                msg = _email_stdlib.message_from_bytes(f.read_bytes())
+                dom = _from_domain(msg)
+                nm = _from_display_name(msg)
+            except Exception:
+                continue                       # skip a malformed corpus file
+            if dom:
+                domain_counts[dom] = domain_counts.get(dom, 0) + 1
+            if nm:
+                name_counts[nm] = name_counts.get(nm, 0) + 1
+    return domain_counts, name_counts
+
+
 def run_triage(harvest_dir: Path, benchmark_dir: Path, copy=False,
                limit=None, resume=False, prompt=input, out=print,
                preview=False, opener=None, per_domain_cap=None) -> dict:
     """Interactive loop. ``prompt``, ``out`` and ``opener`` are test seams.
 
-    ``per_domain_cap`` caps how many candidates are ASKED per From-domain AND
-    per normalized From display-name in this run. Hitting EITHER cap DEFERS the
-    extra candidate — it is not asked, nothing is written to the log, and it is
-    left in _harvest to reappear next run. A cap NEVER auto-labels; deferring is
-    a non-ask, so it cannot violate the HARD RULE. The display-name counter
-    catches blasts that rotate the From-domain but keep one display name. The
-    library/test default is None (no cap) so direct callers are unaffected; the
-    CLI supplies DEFAULT_PER_DOMAIN_CAP (0 disables). The end-of-run summary
-    reports the deferred tally so deferred mail never looks like it vanished.
+    ``per_domain_cap`` is a per-sender LIFETIME representation cap: at most N
+    examples of any one From-domain AND any one normalized From display-name in
+    the corpus. Counters are SEEDED at startup from the emails already labeled
+    into the corpus (via _seed_sender_counts) and then incremented on each ASK,
+    so a sender that already has N corpus examples is deferred on its first
+    candidate this run with zero asks, and re-running does not surface it again.
+    Hitting EITHER cap DEFERS the extra candidate — it is not asked, nothing is
+    written to the log, and it is left in _harvest. A cap NEVER auto-labels;
+    deferring is a non-ask, so it cannot violate the HARD RULE. The display-name
+    counter catches blasts that rotate the From-domain but keep one display name.
+    The library/test default is None (no cap) so direct callers are unaffected
+    AND the corpus is not scanned at all; the CLI supplies DEFAULT_PER_DOMAIN_CAP
+    (0 disables, also skipping the scan). The end-of-run summary reports the
+    deferred tally so deferred mail never looks like it vanished.
 
     ``preview`` additionally renders each candidate to its OWN sandboxed HTML
     file (a fresh filename per candidate, inside one temp dir — never the
@@ -529,8 +576,14 @@ def run_triage(harvest_dir: Path, benchmark_dir: Path, copy=False,
     counts = {"y": 0, "n": 0, "g": 0, "skip": 0}
     n_processed = 0
     deferred = 0
-    asked_per_domain = {}   # From-domain -> asks THIS run
-    asked_per_name = {}     # normalized From display-name -> asks THIS run
+    # Cap counters. When the cap is active, SEED from the corpus so the cap is a
+    # LIFETIME representation cap; when disabled (0/None), do NOT scan the corpus
+    # at all (zero behavior change for capless callers). Counters then increment
+    # on each ASK, on top of the seed.
+    if per_domain_cap:
+        asked_per_domain, asked_per_name = _seed_sender_counts(benchmark_dir)
+    else:
+        asked_per_domain, asked_per_name = {}, {}
 
     preview_dir = None
     if preview:
@@ -642,8 +695,9 @@ def main():
           f"legit={c['y']} spam={c['n']} graymail={c['g']} "
           f"skipped={c['skip']}.")
     if result["deferred"]:
-        print(f"{result['deferred']} more were held back by the per-sender cap "
-              f"(still in _harvest — rerun to label them).")
+        print(f"{result['deferred']} were held back — their senders already "
+              f"have enough labeled examples in the corpus "
+              f"(raise --per-domain-cap to include more).")
     print("Only your labeled items entered the corpus.")
     return 0
 

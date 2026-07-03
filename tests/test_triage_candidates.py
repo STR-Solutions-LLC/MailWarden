@@ -781,3 +781,107 @@ def test_cli_has_per_domain_cap_flag():
     src = (REPO / "tools" / "triage_candidates.py").read_text()
     assert "--per-domain-cap" in src
     assert "per_domain_cap=" in src
+
+
+# ─── lifetime cap: seed counters from the existing corpus ──────────────────────
+
+def _place_corpus(bench, folder, domain, name, count):
+    """Write `count` .eml into a corpus class folder to seed the cap."""
+    d = bench / folder
+    d.mkdir(parents=True, exist_ok=True)
+    for i in range(count):
+        (d / f"{folder}-{domain}-{i}.eml").write_bytes(_cand(domain, name=name))
+
+
+def test_seeded_from_corpus_defers_immediately(tmp_path):
+    """A sender that already has `cap` examples in the corpus is deferred on its
+    very first candidate this run — zero asks (the cap is now LIFETIME)."""
+    mod = _load()
+    bench = _benchmark(tmp_path)
+    _place_corpus(bench, mod.FOLDER_SPAM, "blast.com", "n", 3)
+    h = tmp_path / "_harvest" / "acct"
+    h.mkdir(parents=True)
+    (h / "cand.eml").write_bytes(_cand("blast.com", name="fresh"))
+
+    def never(*_):
+        raise AssertionError("should not ask — sender already at cap")
+
+    res = mod.run_triage(h.parent, bench, per_domain_cap=3,
+                         prompt=never, out=lambda *_: None)
+    assert res["processed"] == 0
+    assert res["deferred"] == 1
+    # candidate untouched in _harvest, nothing logged
+    assert (h / "cand.eml").exists()
+    assert not (bench / mod.TRIAGE_LOG).exists()
+
+
+def test_seeding_counts_display_name_across_rotated_domains(tmp_path):
+    """Seeding counts the normalized display name too: a blast that rotated its
+    domain but keeps one display name is deferred even from a brand-new domain
+    once the corpus already holds `cap` examples of that name."""
+    mod = _load()
+    bench = _benchmark(tmp_path)
+    # 3 corpus files: same display name, DIFFERENT domains each time
+    d = bench / mod.FOLDER_GRAYMAIL
+    d.mkdir(parents=True)
+    for i in range(3):
+        (d / f"g{i}.eml").write_bytes(_cand(f"seed{i}.com", name="Jamie Raskin"))
+    h = tmp_path / "_harvest" / "acct"
+    h.mkdir(parents=True)
+    (h / "cand.eml").write_bytes(_cand("brandnew.com", name="Jamie Raskin"))
+
+    def never(*_):
+        raise AssertionError("should not ask — display name already at cap")
+
+    res = mod.run_triage(h.parent, bench, per_domain_cap=3,
+                         prompt=never, out=lambda *_: None)
+    assert res["processed"] == 0      # deferred via the display-name seed
+    assert res["deferred"] == 1
+
+
+def test_malformed_corpus_eml_skipped_when_seeding(tmp_path):
+    """A malformed corpus .eml must not crash seeding; the good files still
+    seed their counts."""
+    mod = _load()
+    bench = _benchmark(tmp_path)
+    spam = bench / mod.FOLDER_SPAM
+    spam.mkdir(parents=True)
+    (spam / "good.eml").write_bytes(_cand("blast.com", name="n0"))
+    (spam / "bad.eml").write_bytes(b"\xff\xfe not an email at all \x00\x01")
+    domain_counts, name_counts = mod._seed_sender_counts(bench)
+    assert domain_counts.get("blast.com") == 1   # good file counted, no crash
+
+
+def test_none_cap_never_seeds_corpus(tmp_path, monkeypatch):
+    """With the cap disabled (library default None), _seed_sender_counts must
+    not be called at all — zero behavior change for capless callers."""
+    mod = _load()
+    called = []
+    monkeypatch.setattr(mod, "_seed_sender_counts",
+                        lambda *a, **k: called.append(1) or ({}, {}))
+    h = tmp_path / "_harvest" / "acct"
+    h.mkdir(parents=True)
+    (h / "c.eml").write_bytes(_cand("d.com"))
+    bench = _benchmark(tmp_path)
+    res = mod.run_triage(h.parent, bench, prompt=lambda *_: "skip",
+                         out=lambda *_: None)   # per_domain_cap defaults None
+    assert called == []                          # seeding NOT invoked
+    assert res["processed"] == 1
+
+
+def test_zero_cap_never_seeds_corpus(tmp_path, monkeypatch):
+    """--per-domain-cap 0 disables the cap and likewise skips the corpus scan."""
+    mod = _load()
+    called = []
+    monkeypatch.setattr(mod, "_seed_sender_counts",
+                        lambda *a, **k: called.append(1) or ({}, {}))
+    h = tmp_path / "_harvest" / "acct"
+    h.mkdir(parents=True)
+    for i in range(3):
+        (h / f"c{i}.eml").write_bytes(_cand("blast.com", name=f"n{i}"))
+    bench = _benchmark(tmp_path)
+    res = mod.run_triage(h.parent, bench, per_domain_cap=0,
+                         prompt=lambda *_: "skip", out=lambda *_: None)
+    assert called == []
+    assert res["processed"] == 3      # 0 => no cap, all asked
+    assert res["deferred"] == 0
