@@ -2695,7 +2695,7 @@ from datetime import datetime, timezone, timedelta  # noqa: E402
 
 
 def _dry_run_filter_harness(monkeypatch, *, uids=None, msg_data=None,
-                            dry_run=True, pending=None):
+                            dry_run=True, pending=None, analysis_text=None):
     """Drive spam_filter.run_filter(force=True) with all IO/network mocked.
 
     Returns a dict of call-recording spies so a test can assert which
@@ -2703,7 +2703,10 @@ def _dry_run_filter_harness(monkeypatch, *, uids=None, msg_data=None,
     UNSEEN UIDs the INBOX scan returns (default: none → empty message loop);
     ``msg_data`` is the parsed-email dict every fetched UID resolves to.
     ``pending`` overrides the pending-signals structure load_pending_signals
-    returns (default: no conversations).
+    returns (default: no conversations). ``analysis_text`` overrides the canned
+    Anthropic analysis body (default: the bare-label FP structure) so a test can
+    exercise Markdown-dressed analysis parsing. ``send_email_args`` records each
+    (subject, body) so a test can assert the exact ack copy sent.
     """
     import types
     calls = {
@@ -2712,6 +2715,7 @@ def _dry_run_filter_harness(monkeypatch, *, uids=None, msg_data=None,
         "save_signals": 0,
         "mark_uid_seen": 0,
         "send_email": 0,
+        "send_email_args": [],
         "save_blacklist": 0,
         "save_whitelist": 0,
         "persist_pending_merge": 0,
@@ -2790,13 +2794,15 @@ def _dry_run_filter_harness(monkeypatch, *, uids=None, msg_data=None,
     # messages.create records its kwargs (so a test can assert temperature=0)
     # and returns a canned analysis block. No `usage` attribute is exposed, so
     # the fp handlers' `hasattr(response, 'usage')` guard skips token recording.
+    _analysis = analysis_text if analysis_text is not None else (
+        "WHY IT WAS FLAGGED:\nx\n\n"
+        "PROPOSED CHANGE:\nnarrow it\n\n"
+        "TRADEOFF:\nlow\n\n"
+        "MY RECOMMENDATION:\napply\n")
+
     def _fake_create(**kwargs):
         calls["messages_create_kwargs"].append(kwargs)
-        content = types.SimpleNamespace(
-            text=("WHY IT WAS FLAGGED:\nx\n\n"
-                  "PROPOSED CHANGE:\nnarrow it\n\n"
-                  "TRADEOFF:\nlow\n\n"
-                  "MY RECOMMENDATION:\napply\n"))
+        content = types.SimpleNamespace(text=_analysis)
         return types.SimpleNamespace(content=[content])
 
     class _FakeClient:
@@ -2830,7 +2836,10 @@ def _dry_run_filter_harness(monkeypatch, *, uids=None, msg_data=None,
                         _spy("deliver_eula_if_needed", True))
     monkeypatch.setattr(spam_filter, "save_signals", _spy("save_signals"))
     monkeypatch.setattr(spam_filter, "mark_uid_seen", _spy("mark_uid_seen"))
-    monkeypatch.setattr(spam_filter, "send_email", _spy("send_email"))
+    def _send_email_spy(config, subject, body, logger, **k):
+        calls["send_email"] += 1
+        calls["send_email_args"].append((subject, body))
+    monkeypatch.setattr(spam_filter, "send_email", _send_email_spy)
     monkeypatch.setattr(spam_filter, "save_blacklist", _spy("save_blacklist"))
     monkeypatch.setattr(spam_filter, "save_whitelist", _spy("save_whitelist"))
     monkeypatch.setattr(spam_filter, "persist_pending_merge",
