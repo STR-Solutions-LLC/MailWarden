@@ -270,6 +270,22 @@ else
 fi
 
 # ----------------------------------------------------------------------------
+# Step 4.4 — stage the built .app OUTSIDE the repo tree before signing.
+# The repo lives in an iCloud-synced folder (~/Documents): FileProvider
+# re-stamps com.apple.FinderInfo/fpfs xattrs on bundle items continuously,
+# racing the (minutes-long) signing pass. Any such attr at seal time =
+# codesign "detritus not allowed" = an ad-hoc app = notary rejection
+# (lost this race twice on 2026-07-03 despite pre-sign xattr strips).
+# /private/tmp is never synced; ditto --noextattr --noqtn strips every
+# attribute in transit. All signing + packaging below uses the staged copy.
+# ----------------------------------------------------------------------------
+SIGN_STAGE="$(mktemp -d /private/tmp/mailwarden-sign-XXXXXX)"
+log "Staging .app outside the synced tree for signing ($SIGN_STAGE)..."
+/usr/bin/ditto --noextattr --noqtn "$BUILT_APP" "$SIGN_STAGE/MailWarden.app" \
+    || die "ditto staging failed"
+BUILT_APP="$SIGN_STAGE/MailWarden.app"
+
+# ----------------------------------------------------------------------------
 # Step 4.5 — codesign the .app.
 # If a Developer ID Application cert is available in the keychain, sign with
 # it now (required for SMAppService registration). Fall back to ad-hoc if not.
@@ -280,6 +296,13 @@ DEVID_CERT="Developer ID Application: STR Solutions, LLC (6BXSAHWH29)"
 if /usr/bin/security find-identity -v -p codesigning \
         | grep -qF "$DEVID_CERT"; then
     log "Developer ID cert found — signing .app with Developer ID Application..."
+    # Strip Finder info / resource forks / provenance xattrs BEFORE signing.
+    # Detritus on any bundle file breaks the code seal and the notary
+    # service rejects the whole .pkg (hit 2026-07-03: freshly-downloaded
+    # wheels carried provenance attrs; verification failed but was only a
+    # warning, so an effectively ad-hoc app shipped to notarization).
+    log "  Stripping extended attributes from the bundle..."
+    /usr/bin/xattr -cr "$BUILT_APP" 2>/dev/null || true
     # Apple's notary service requires every Mach-O binary inside the bundle
     # to be signed with --options runtime AND --timestamp. --deep alone does
     # not add timestamps to nested signatures, so we walk the bundle and sign
@@ -325,6 +348,18 @@ if /usr/bin/security find-identity -v -p codesigning \
             "$BUILT_APP/Contents/MacOS/MailWarden" 2>&1 | grep -v "replacing existing signature" || true
     fi
     # Finally, sign the .app bundle itself with entitlements
+    # Second strip IMMEDIATELY before the outer seal: this repo lives in an
+    # iCloud-synced folder (~/Documents), and FileProvider re-stamps
+    # com.apple.FinderInfo / com.apple.fileprovider.fpfs on bundle items
+    # WHILE the (minutes-long) inner signing loop runs. Any such attr at
+    # seal time = "detritus not allowed" = ad-hoc app = notary rejection.
+    # -d targets the two offenders explicitly (-c alone has been observed
+    # to leave them); provenance attrs are SIP-managed, unremovable, and
+    # tolerated by codesign.
+    log "  Stripping extended attributes again (iCloud FileProvider re-tags mid-build)..."
+    /usr/bin/xattr -rd com.apple.FinderInfo "$BUILT_APP" 2>/dev/null || true
+    /usr/bin/xattr -rd com.apple.fileprovider.fpfs "$BUILT_APP" 2>/dev/null || true
+    /usr/bin/xattr -cr "$BUILT_APP" 2>/dev/null || true
     log "  Signing outer .app bundle with entitlements + hardened runtime + timestamp..."
     /usr/bin/codesign --force \
         --options runtime \
@@ -332,8 +367,13 @@ if /usr/bin/security find-identity -v -p codesigning \
         --entitlements "$INSTALLER_ROOT/app/MailWarden.entitlements" \
         --sign "$DEVID_CERT" \
         "$BUILT_APP" 2>&1 | grep -v "replacing existing signature" || true
-    /usr/bin/codesign --verify --deep --strict "$BUILT_APP" 2>&1 \
-        | head -5 || log "  (verification warning; build continues)"
+    # Verification is a HARD GATE on the Developer ID path: a broken seal
+    # here is exactly what the notary rejects, so failing loudly now saves
+    # a wasted 10-minute notarization round-trip (and can never ship an
+    # ad-hoc-signed app as if it were signed).
+    if ! /usr/bin/codesign --verify --deep --strict "$BUILT_APP"; then
+        die "codesign verification FAILED — notarization would reject this bundle. Do not ship."
+    fi
     log "  Developer ID codesign complete"
 else
     log "Developer ID cert NOT found — falling back to ad-hoc sign."
@@ -349,10 +389,13 @@ fi
 # Step 5 — stage the .app into a component .pkg.
 # ----------------------------------------------------------------------------
 log "Staging component .pkg..."
-STAGE="$INSTALLER_ROOT/build/pkg-root"
+# pkg-root also lives OUTSIDE the synced tree (same FileProvider re-tagging
+# hazard as Step 4.4 — detritus stamped between cp and pkgbuild would embed
+# broken-seal files in the payload). ditto preserves the signed app exactly.
+STAGE="$SIGN_STAGE/pkg-root"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/Applications"
-cp -R "$BUILT_APP" "$STAGE/Applications/MailWarden.app"
+/usr/bin/ditto "$BUILT_APP" "$STAGE/Applications/MailWarden.app"
 
 pkgbuild \
     --root "$STAGE" \
