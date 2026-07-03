@@ -577,7 +577,7 @@ def _run_filter_cascade_harness(monkeypatch, client):
     monkeypatch.setattr(spam_filter, "load_report_approvals_store",
                         lambda logger: {})
 
-    def _log_decision(account_name, msg_data, result, action):
+    def _log_decision(account_name, msg_data, result, action, rule_ids=None):
         captured["decisions"].append((result, action))
     monkeypatch.setattr(spam_filter, "log_decision", _log_decision)
 

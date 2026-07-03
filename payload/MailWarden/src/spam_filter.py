@@ -3144,6 +3144,160 @@ _HARD_SIGNALS_ANCHOR = (
 )
 
 
+def _derive_signal_id(category: str, text: str) -> str:
+    """F5: deterministic stable ID for a bare-string default/learned signal.
+
+    The default signal lists (hard_signals, soft_signals, the two infrastructure
+    lines) are plain strings with no stored ID. Rather than migrate every
+    installed signals.json (there is no signals.json migration machinery — the
+    config-only deep-merge does not descend into lists), we DERIVE the ID from
+    the signal's category + text. Same content -> same ``S-<8hex>`` on every
+    install, no write required."""
+    h = hashlib.sha1(f"{category}\x00{text.strip()}".encode("utf-8")).hexdigest()
+    return f"S-{h[:8]}"
+
+
+# F5 attribution instruction — appended to the learned-signal block ONLY when at
+# least one learned rule is present. Static developer text (no untrusted
+# content). Kept out of BASE_SYSTEM_PROMPT so the shipped-defaults/eval prompt
+# (which has zero ai_refinements) is byte-identical to the pre-F5 render.
+_ATTRIBUTION_INSTRUCTION = (
+    "\n\nRULE ATTRIBUTION (auditing only — this MUST NOT change your decision): "
+    "each learned rule above is tagged with a bracketed identifier such as "
+    "[R-20240101-abcd]. In your JSON response, additionally include a field "
+    "\"matched_rules\" whose value is a JSON array of the exact bracketed "
+    "identifiers of any rule above that materially influenced your decision "
+    "(use an empty array if none)."
+)
+
+
+def _build_learned_lines(signals: dict, account_name: str = None):
+    """Return (lines, injected_ids, attribution_on) for the learned-signal block.
+
+    ``attribution_on`` is True exactly when >=1 in-scope, active ai_refinement
+    exists. ONLY then is a stable rule ID prefixed onto each injected line and
+    collected into ``injected_ids`` (F5). When it is False the lines are
+    byte-identical to the pre-F5 render and ``injected_ids`` is empty — this is
+    what keeps the shipped-defaults / eval prompt (zero ai_refinements)
+    unchanged, preserving the deterministic baseline with no API spend.
+
+    ``injected_ids`` is the authoritative set of IDs the model was shown; the
+    classify path whitelists the model's echoed ``matched_rules`` against it so
+    a crafted email cannot forge attribution to an ID that was never injected.
+    """
+    sig = signals.get("signals", {})
+
+    # Only status=="active", in-scope refinements, newest first, capped at 25
+    # (token bound). Same filter as the pre-F5 code.
+    refinements = signals.get("ai_refinements", []) or []
+    active = [r for r in refinements
+              if r.get("status", "active") == "active"
+              and _refinement_in_scope(r, account_name)]
+    active = active[::-1][:25]
+    attribution_on = bool(active)
+
+    injected_ids = set()
+    lines = []
+
+    def emit(rid, body):
+        # OFF-state render is byte-identical to pre-F5 ("- <body>"); ON-state
+        # prefixes the stable ID and records it for attribution whitelisting.
+        if attribution_on:
+            injected_ids.add(rid)
+            lines.append(f"- [{rid}] {body}")
+        else:
+            lines.append(f"- {body}")
+
+    for s in sig.get("hard_signals", []):
+        emit(_derive_signal_id("hard_signal", s), f"LEARNED HARD SIGNAL: {s}")
+    for s in sig.get("soft_signals", []):
+        emit(_derive_signal_id("soft_signal", s), f"LEARNED SOFT SIGNAL: {s}")
+
+    infra = sig.get("known_sending_infrastructure", [])
+    if infra:
+        joined = ", ".join(infra)
+        emit(_derive_signal_id("known_sending_infrastructure", joined),
+             f"Known spam infrastructure: {joined}")
+
+    # The user's OWN mail infrastructure — every configured account's IMAP/SMTP
+    # servers (auto-seeded by autoseed_trusted_infra). Tell the classifier these
+    # hosts are EXPECTED in the Received chain so they are not mistaken for a
+    # suspicious relay, WITHOUT trusting senders (shared providers also carry
+    # spam sent to the user).
+    trusted = sig.get("trusted_infrastructure", [])
+    if trusted:
+        joined = ", ".join(trusted)
+        emit(_derive_signal_id("trusted_infrastructure", joined),
+             "The user's OWN mail infrastructure — their account mail servers "
+             "and providers: " + joined + ". These hosts appear in "
+             "the Received chain of the user's normal incoming mail, so their "
+             "presence is EXPECTED and must NOT be treated as a suspicious relay "
+             "hop or RELAY_INFRASTRUCTURE_MISMATCH — they are the user's own "
+             "receiving/sending servers, not spam relays. IMPORTANT: this removes "
+             "ONLY relay/infrastructure suspicion about these specific hops; it "
+             "does NOT vouch for the sender or the content. These are often "
+             "shared providers (e.g. AOL, Gmail, Bluehost) that ALSO carry spam "
+             "sent to the user, so judge the sender's domain, brand match, "
+             "authentication, and message content exactly as you normally would.")
+
+    # Inject APPROVED ai_refinements so they actually influence classification.
+    # Each active refinement contributes its plain-English headline (what the
+    # pattern catches) and a short rationale (why it's suspicious). Refinements
+    # only exist in the ON-state, so their lines are always ID-prefixed. The ID
+    # is the refinement's own stable R- id (item-(b) actionable), with a derived
+    # S- fallback for any legacy record missing one.
+    for r in active:
+        headline = (r.get("headline") or "").strip()
+        if not headline:
+            continue
+        rid = r.get("id") or _derive_signal_id("refinement", headline)
+        rationale = (r.get("rationale") or "").strip()
+        verdict = (r.get("verdict") or "spam").strip().lower()
+        rule_class = (r.get("rule_class") or "").strip().lower()
+        if verdict == "legitimate":
+            # A user-taught legitimacy rule. Render it as guidance toward
+            # NOT_SPAM, but keep it CONDITIONAL ("unless ... impersonation") so a
+            # later phishing look-alike that matches the pattern is not rescued —
+            # the authentication-vs-brand RULES in BASE_SYSTEM_PROMPT still win.
+            body = (f"LEARNED LEGITIMATE PATTERN: {headline} — the user "
+                    f"confirmed mail matching this is legitimate; treat it as "
+                    f"NOT_SPAM unless the SERVER-VERIFIED AUTHENTICATION block "
+                    f"indicates impersonation/spoofing.")
+            if rationale:
+                body += f" {rationale[:700]}"
+        elif rule_class == "curate":
+            # A user PREFERENCE about LEGITIMATE mail the owner no longer wants
+            # (e.g. fundraising they are sick of). Apply NARROWLY: junk only mail
+            # that unmistakably matches this preference; never extend it to
+            # adjacent legitimate mail, and never junk an authenticated sender
+            # over a single keyword. This is NOT a bad-actor threat.
+            body = (f"USER PREFERENCE (curate): {headline} — the user has "
+                    f"chosen NOT to receive this kind of LEGITIMATE mail; for "
+                    f"this account, treat mail that clearly matches as unwanted "
+                    f"(junk it) EVEN THOUGH it is not bad-actor spam. Apply ONLY "
+                    f"to mail that unmistakably matches this narrow preference; "
+                    f"NEVER extend it to adjacent legitimate mail, and never junk "
+                    f"an authenticated sender over a single keyword.")
+            if rationale:
+                body += f" {rationale[:700]}"
+        else:
+            # protect (bad-actor threat) or any legacy spam rule without a
+            # rule_class — the subtle tells of phishing/scam/fraud/impersonation.
+            body = f"LEARNED THREAT PATTERN: {headline}"
+            if rationale:
+                body += f" — {rationale[:700]}"
+        emit(rid, body)
+
+    return lines, injected_ids, attribution_on
+
+
+def injected_rule_ids(signals: dict, account_name: str = None) -> set:
+    """F5: the set of stable rule IDs actually injected into the classifier
+    prompt for this signals set + account. Empty unless attribution is active.
+    Used to whitelist the model's echoed ``matched_rules`` before logging."""
+    return _build_learned_lines(signals, account_name)[1]
+
+
 def build_classifier_prompt(signals: dict, account_name: str = None,
                             approvals_active: bool = False) -> str:
     """Build the full system prompt by injecting learned signals.
@@ -3159,97 +3313,18 @@ def build_classifier_prompt(signals: dict, account_name: str = None,
     returned prompt (after learned-signal injection) is byte-identical to the
     pre-feature prompt — RULE 0 is dead text with no approved senders and only
     perturbs the model, so it is omitted entirely.
+
+    F5: when >=1 learned rule is in scope, each injected learned line is tagged
+    with its stable rule ID and an attribution instruction is appended so the
+    model can report which rule(s) drove its verdict. With no learned rules (the
+    shipped-defaults / eval configuration) the learned block is byte-identical to
+    the pre-F5 render.
     """
-    learned_parts = []
-    sig = signals.get("signals", {})
-
-    for s in sig.get("hard_signals", []):
-        learned_parts.append(f"- LEARNED HARD SIGNAL: {s}")
-    for s in sig.get("soft_signals", []):
-        learned_parts.append(f"- LEARNED SOFT SIGNAL: {s}")
-
-    infra = sig.get("known_sending_infrastructure", [])
-    if infra:
-        learned_parts.append(
-            f"- Known spam infrastructure: {', '.join(infra)}"
-        )
-
-    # The user's OWN mail infrastructure — every configured account's IMAP/SMTP
-    # servers (auto-seeded by autoseed_trusted_infra). Tell the classifier these
-    # hosts are EXPECTED in the Received chain so they are not mistaken for a
-    # suspicious relay, WITHOUT trusting senders (shared providers also carry
-    # spam sent to the user).
-    trusted = sig.get("trusted_infrastructure", [])
-    if trusted:
-        learned_parts.append(
-            "- The user's OWN mail infrastructure — their account mail servers "
-            "and providers: " + ", ".join(trusted) + ". These hosts appear in "
-            "the Received chain of the user's normal incoming mail, so their "
-            "presence is EXPECTED and must NOT be treated as a suspicious relay "
-            "hop or RELAY_INFRASTRUCTURE_MISMATCH — they are the user's own "
-            "receiving/sending servers, not spam relays. IMPORTANT: this removes "
-            "ONLY relay/infrastructure suspicion about these specific hops; it "
-            "does NOT vouch for the sender or the content. These are often "
-            "shared providers (e.g. AOL, Gmail, Bluehost) that ALSO carry spam "
-            "sent to the user, so judge the sender's domain, brand match, "
-            "authentication, and message content exactly as you normally would."
-        )
-
-    # Inject APPROVED ai_refinements so they actually influence classification.
-    # Previously this function read only signals["signals"] and silently
-    # ignored ai_refinements, so an approved refinement never changed a single
-    # decision. Each active refinement contributes its plain-English headline
-    # (what the pattern catches) and a short rationale (why it's suspicious).
-    # Bounded for token cost: only status=="active" refinements, newest first,
-    # capped at 25, rationale trimmed — this keeps the prompt growth small even
-    # after many approvals while preserving the most recent learned rules.
-    refinements = signals.get("ai_refinements", []) or []
-    active = [r for r in refinements
-              if r.get("status", "active") == "active"
-              and _refinement_in_scope(r, account_name)]
-    active = active[::-1][:25]  # newest-approved first, bounded
-    for r in active:
-        headline = (r.get("headline") or "").strip()
-        if not headline:
-            continue
-        rationale = (r.get("rationale") or "").strip()
-        verdict = (r.get("verdict") or "spam").strip().lower()
-        rule_class = (r.get("rule_class") or "").strip().lower()
-        if verdict == "legitimate":
-            # A user-taught legitimacy rule. Render it as guidance toward
-            # NOT_SPAM, but keep it CONDITIONAL ("unless ... impersonation") so a
-            # later phishing look-alike that matches the pattern is not rescued —
-            # the authentication-vs-brand RULES in BASE_SYSTEM_PROMPT still win.
-            line = (f"- LEARNED LEGITIMATE PATTERN: {headline} — the user "
-                    f"confirmed mail matching this is legitimate; treat it as "
-                    f"NOT_SPAM unless the SERVER-VERIFIED AUTHENTICATION block "
-                    f"indicates impersonation/spoofing.")
-            if rationale:
-                line += f" {rationale[:700]}"
-        elif rule_class == "curate":
-            # A user PREFERENCE about LEGITIMATE mail the owner no longer wants
-            # (e.g. fundraising they are sick of). Apply NARROWLY: junk only mail
-            # that unmistakably matches this preference; never extend it to
-            # adjacent legitimate mail, and never junk an authenticated sender
-            # over a single keyword. This is NOT a bad-actor threat.
-            line = (f"- USER PREFERENCE (curate): {headline} — the user has "
-                    f"chosen NOT to receive this kind of LEGITIMATE mail; for "
-                    f"this account, treat mail that clearly matches as unwanted "
-                    f"(junk it) EVEN THOUGH it is not bad-actor spam. Apply ONLY "
-                    f"to mail that unmistakably matches this narrow preference; "
-                    f"NEVER extend it to adjacent legitimate mail, and never junk "
-                    f"an authenticated sender over a single keyword.")
-            if rationale:
-                line += f" {rationale[:700]}"
-        else:
-            # protect (bad-actor threat) or any legacy spam rule without a
-            # rule_class — the subtle tells of phishing/scam/fraud/impersonation.
-            line = f"- LEARNED THREAT PATTERN: {headline}"
-            if rationale:
-                line += f" — {rationale[:700]}"
-        learned_parts.append(line)
-
-    learned_text = "\n".join(learned_parts) if learned_parts else "No additional learned signals yet."
+    lines, _injected_ids, attribution_on = _build_learned_lines(
+        signals, account_name)
+    learned_text = "\n".join(lines) if lines else "No additional learned signals yet."
+    if attribution_on:
+        learned_text += _ATTRIBUTION_INSTRUCTION
     prompt = BASE_SYSTEM_PROMPT
     if approvals_active:
         prompt = prompt.replace(
@@ -4152,6 +4227,12 @@ def _validate_classification(result) -> dict | None:
     out["signals_hit"] = sig if isinstance(sig, list) else []
     reasoning = result.get("reasoning")
     out["reasoning"] = reasoning if isinstance(reasoning, str) else ""
+    # F5: optional, additive. Absent/malformed -> [] (never a validation
+    # failure). Kept as raw strings here; the classify path whitelists these
+    # against the IDs actually injected before anything is logged.
+    mr = result.get("matched_rules")
+    out["matched_rules"] = [x for x in mr if isinstance(x, str)] \
+        if isinstance(mr, list) else []
     return out
 
 
@@ -4363,6 +4444,8 @@ def _synthesize_rescue_result(screen_result: dict, confirm_result: dict | None,
         "decision": "NOT_SPAM",
         "confidence": confidence,
         "signals_hit": screen_result.get("signals_hit", []),
+        # F5: carry the screen stage's rule attribution, parallel to signals_hit.
+        "matched_rules": screen_result.get("matched_rules", []),
         "reasoning": (f"Rescued by cascade confirm stage ({confirm_model}): "
                       f"screen model junked but {detail}."),
     }
@@ -5165,10 +5248,20 @@ def execute_spam_action(conn: imaplib.IMAP4_SSL, uid: bytes, account: dict,
 # ---------------------------------------------------------------------------
 
 def log_decision(account_name: str, msg_data: dict, result: dict,
-                 action: str):
-    """Write a decision entry to decisions.log."""
+                 action: str, rule_ids=None):
+    """Write a decision entry to decisions.log.
+
+    ``rule_ids`` (F5, optional) is the list of stable rule IDs that influenced
+    this decision — already whitelisted by the caller against the IDs actually
+    injected into the prompt. When non-empty a ``RULE IDS:`` line is added; the
+    IDs are sanitized here (like every other field) so a value can never forge a
+    second record. When empty/None the record is byte-identical to the pre-F5
+    format, so existing consumers are unaffected."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     signals = ", ".join(result.get("signals_hit", []))
+    safe_rule_ids = [_sanitize_decision_log_field(r) for r in (rule_ids or [])]
+    rule_ids_line = (
+        f"  RULE IDS: {', '.join(safe_rule_ids)}\n" if safe_rule_ids else "")
 
     # Sanitize every attacker-controlled value (account name + the four
     # sender/message fields) before formatting them into the line-oriented
@@ -5187,7 +5280,8 @@ def log_decision(account_name: str, msg_data: dict, result: dict,
         f"  SUBJECT: {s_subject}\n"
         f"  DECISION: {result['decision']} (confidence: {result['confidence']:.2f})\n"
         f"  SIGNALS HIT: {signals}\n"
-        f"  ACTION: {action}\n"
+        + rule_ids_line
+        + f"  ACTION: {action}\n"
         f"  ---\n"
     )
     append_decision(entry)
@@ -5565,6 +5659,11 @@ def run_filter(force: bool = False):
         system_prompt = build_classifier_prompt(
             signals, account.get("username", ""),
             approvals_active=bool(approved_domains))
+        # F5: the stable rule IDs this account's prompt exposes to the model.
+        # Computed once per account (same signals + scope as the prompt above)
+        # and used to whitelist the model's echoed attribution at log time.
+        account_injected_ids = injected_rule_ids(
+            signals, account.get("username", ""))
 
         # One-time migration: rename display-name bucket to username key
         old_name = account.get("name", "Unknown")
@@ -7531,8 +7630,14 @@ USER'S FOLLOW-UP:
                     # log_decision does not sanitize `action`).
                     action += _cascade_action_suffix(cascade_meta)
 
-                    # Log the decision
-                    log_decision(account_name, msg_data, result, action)
+                    # Log the decision. F5: whitelist the model's echoed rule
+                    # attribution against the IDs actually injected into THIS
+                    # account's prompt, so a crafted email cannot forge an
+                    # attribution to an ID it was never shown.
+                    matched_rules = [rid for rid in result.get("matched_rules", [])
+                                     if rid in account_injected_ids]
+                    log_decision(account_name, msg_data, result, action,
+                                 rule_ids=matched_rules)
 
                     # Add to processed_ids — but be careful in dry-run mode.
                     # In dry_run, a message classified as SPAM is not moved.
