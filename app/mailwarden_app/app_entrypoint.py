@@ -11,6 +11,8 @@ This module also discovers the bundled defaults directory inside the .app,
 so other modules can copy skip_names.txt, signals.json, EULAs, etc. without
 hardcoding macOS bundle paths.
 """
+from __future__ import annotations
+
 import os
 import sys
 from pathlib import Path

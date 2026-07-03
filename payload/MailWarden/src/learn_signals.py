@@ -21,6 +21,7 @@ The Claude prompt enforces a ≤ 12-word plain-English headline, no
 rhetorical flourishes, and a "what this doesn't cover" line so users
 can second-guess the generalization before approving.
 """
+from __future__ import annotations
 
 import email
 import email.header

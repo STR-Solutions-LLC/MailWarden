@@ -4,6 +4,7 @@
 Spam Filter — Main filter script.
 Runs every 15 minutes via launchd. Also supports --review mode.
 """
+from __future__ import annotations
 
 import argparse
 import email

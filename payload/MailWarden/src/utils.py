@@ -3,6 +3,7 @@
 """
 Shared utility functions for the spam filter system.
 """
+from __future__ import annotations
 
 import email
 import email.header

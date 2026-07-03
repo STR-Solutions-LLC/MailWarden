@@ -119,7 +119,9 @@ esac
 "$BUILD_PY" -m venv "$BUILD_VENV"
 # shellcheck disable=SC1091
 source "$BUILD_VENV/bin/activate"
-pip install --quiet --upgrade pip setuptools wheel
+# setuptools pinned <81: py2app's build imports pkg_resources, which
+# setuptools removed in 81+ (hit 2026-07-03 when unpinned upgrade pulled it).
+pip install --quiet --upgrade pip "setuptools<81" wheel
 # dnspython + dkimpy are runtime deps of the filter (local DKIM verification,
 # audit a-2). Both pure-Python (no native wheels → no universal2 fusion). They
 # are NOT transitive deps of anything above, so name them explicitly or the
@@ -128,9 +130,14 @@ pip install --quiet py2app rumps anthropic openpyxl dnspython dkimpy
 # pyobjc-framework-ServiceManagement is REQUIRED at runtime by
 # smappservice_install.py (v1.6.0 SMAppService migration). It is NOT a
 # transitive dep of rumps or any other package above, so it must be named
-# explicitly. Pin to the same major as pyobjc-core (12.x ships with rumps)
-# so the framework wrapper matches the installed pyobjc-core ABI.
-pip install --quiet "pyobjc-framework-ServiceManagement>=12.0,<13"
+# explicitly. The framework wrapper must match the installed pyobjc-core
+# ABI, so derive the pin from whatever major rumps actually resolved —
+# a hardcoded major breaks when PyPI moves (2026-07-03: pyobjc 12.0 was
+# yanked and 12.1+ requires Python >=3.10, while this build's universal2
+# /usr/bin/python3 is 3.9 and resolves pyobjc-core 11.x).
+PYOBJC_CORE_MAJOR=$(pip show pyobjc-core | awk '/^Version:/{split($2,v,"."); print v[1]}')
+[ -n "$PYOBJC_CORE_MAJOR" ] || die "pyobjc-core not installed — rumps install failed?"
+pip install --quiet "pyobjc-framework-ServiceManagement>=${PYOBJC_CORE_MAJOR}.0,<$((PYOBJC_CORE_MAJOR+1))"
 
 log "Building MailWarden.app with py2app..."
 cd "$APP_DIR"
