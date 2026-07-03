@@ -3251,6 +3251,27 @@ def build_classifier_prompt(signals: dict, account_name: str = None,
 # non-joiner, U+200D zero-width joiner, U+FEFF BOM/zero-width no-break space).
 _ZERO_WIDTH_CHARS = "​‌‍﻿"
 
+# Plain/HTML divergence advisory (evasion tell). Deterministic, stdlib-only.
+_DIVERGENCE_MIN_CHARS = 50           # reuse the existing "substantial part" bar
+_DIVERGENCE_MIN_PLAIN_TOKENS = 12    # below this the plain part carries no "story"
+_DIVERGENCE_CONTAINMENT_FIRE = 0.5   # fire when <50% of plain words appear in HTML
+_DIVERGENCE_TOKEN_RE = re.compile(r"[a-z0-9]{3,}")
+
+# Belt-and-suspenders cap on the raw HTML handed to html_to_text in
+# build_user_message. html_to_text itself is hardened to linear time, but an
+# attacker-controlled part should still have a bounded cost no matter what.
+# 500,000 chars gives >2.5x headroom over the largest real HTML part in the
+# 119-email corpus (191,513 chars), so no legitimate email is truncated,
+# while post-hardening conversion at the cap — adversarial or well-formed —
+# measures in the tens of milliseconds (200 KB adversarial: ~7-16 ms;
+# pre-hardening the same input took 13+ seconds).
+# Trade-off: the prompt body only needs 1,500 visible chars, but the
+# divergence comparison wants the fuller story; at 500 KB the comparison
+# sees the entire visible text of any real email, and a con pushed beyond
+# 500 KB of filler is also far beyond anything a human reader (or the
+# 1500-char body window) would ever reach.
+_HTML_CONVERSION_INPUT_CAP = 500_000
+
 
 def _normalize_leading_padding(text: str) -> str:
     """Strip leading zero-width characters and collapse a long leading
@@ -3367,6 +3388,41 @@ def _extract_link_domains(html_body: str) -> list:
     return domains[:10]
 
 
+def _visible_texts_diverge(plain_text: str, html_visible_text: str) -> bool:
+    """True when a message's plain-text part and its HTML visible text tell
+    materially different stories — the decoy-in-plain / con-in-HTML
+    filter-evasion pattern.
+
+    Compares the PRE-truncation, PRE-sanitization texts (the full plain part
+    vs the html_to_text output) — the comparison must see the whole story,
+    not the 1500-char prompt window. (The caller bounds the raw HTML at
+    _HTML_CONVERSION_INPUT_CAP before conversion — an availability cap far
+    above any real email's visible text.)
+
+    Deterministic, stdlib-only. Uses a DIRECTIONAL containment metric: the
+    fraction of the plain part's distinctive words (>=3 chars, lowercased)
+    that also appear anywhere in the HTML visible text. An honest text/plain
+    alternative is a near-subset of the rendered HTML (containment high); a
+    decoy hiding a different HTML message shares almost no words (containment
+    low). Directionality is deliberate — the HTML legitimately carries EXTRA
+    text (nav, footers, unsubscribe) that must not be counted as divergence.
+    Guards below suppress firing on stubs/boilerplate that carry no story.
+    """
+    if len(plain_text.strip()) < _DIVERGENCE_MIN_CHARS:
+        return False
+    if len(html_visible_text.strip()) < _DIVERGENCE_MIN_CHARS:
+        return False
+    plain_tokens = set(_DIVERGENCE_TOKEN_RE.findall(plain_text.lower()))
+    if len(plain_tokens) < _DIVERGENCE_MIN_PLAIN_TOKENS:
+        return False
+    html_tokens = set(_DIVERGENCE_TOKEN_RE.findall(html_visible_text.lower()))
+    # No fifth guard for empty html_tokens: wholly non-Latin-script (or
+    # emoji-only) scam HTML behind an English decoy yields containment 0,
+    # which IS divergence — the advisory must fire.
+    containment = len(plain_tokens & html_tokens) / len(plain_tokens)
+    return containment < _DIVERGENCE_CONTAINMENT_FIRE
+
+
 def _locally_verified_dkim(msg_data: dict) -> list:
     """Audit a-2 trigger gate for local DKIM verification.
 
@@ -3406,7 +3462,9 @@ def build_user_message(msg_data: dict, approved_domains: set = None) -> str:
     authentication summary (F3) is placed OUTSIDE the tags as trustworthy data.
 
     Session-7 additions (advisory only — no change to the decision pipeline):
-      - HTML->text fallback when plain text is absent/sparse (B1)
+      - HTML->text fallback when plain text is absent/sparse (B1); since the
+        HTML-body fix, the HTML visible text is PREFERRED whenever it exists
+        (classify what the human sees), with plain-text fallback
       - Body window expanded from 500 to 1500 characters
       - Extracted link domains from HTML body
       - Reply-To vs From domain mismatch note
@@ -3431,15 +3489,25 @@ def build_user_message(msg_data: dict, approved_domains: set = None) -> str:
         )
 
     # --- Body ---------------------------------------------------------------
+    # Classify what the human actually sees. When the email carries an HTML
+    # part with extractable visible text, feed the model that HTML-derived
+    # text so an innocuous plain-text decoy can no longer hide the real
+    # message in the HTML the recipient reads. Fall back to the plain part
+    # when there is no HTML, or the HTML yields no visible text at all
+    # (image-only HTML). Whitespace-only parts are treated as empty.
     plain_body = msg_data.get("plain_text_body", "") or ""
     html_body_raw = msg_data.get("html_body", "") or ""
 
-    if len(plain_body.strip()) < 50 and html_body_raw:
-        body_text = html_to_text(html_body_raw)
+    html_visible = (html_to_text(html_body_raw[:_HTML_CONVERSION_INPUT_CAP])
+                    if html_body_raw else "")
+    if html_visible.strip():
+        body_text = html_visible
         body_label = "BODY (HTML-converted, first 1500 characters)"
+        used_html_body = True
     else:
         body_text = plain_body
         body_label = "PLAIN TEXT BODY (first 1500 characters)"
+        used_html_body = False
 
     body = _sanitize_for_delimiter(
         _normalize_leading_padding(body_text)[:1500])
@@ -3494,6 +3562,27 @@ def build_user_message(msg_data: dict, approved_domains: set = None) -> str:
             + _sanitize_for_delimiter(", ".join(link_domains))
         )
 
+    # --- Plain/HTML divergence advisory (evasion tell) ----------------------
+    # Fires ONLY when the model is being shown the HTML body AND a substantial
+    # plain-text part tells a materially different story (decoy-in-plain,
+    # con-in-HTML). Lives inside <untrusted_email> exactly like LINK DOMAINS;
+    # the fixed prose is a literal we control, and the interpolated decoy
+    # excerpt is neutralized with _sanitize_for_delimiter so untrusted text
+    # cannot forge or escape the block.
+    divergence_line = ""
+    if used_html_body and _visible_texts_diverge(plain_body, html_visible):
+        decoy_excerpt = _sanitize_for_delimiter(
+            _normalize_leading_padding(plain_body).strip()[:200])
+        divergence_line = (
+            "\nADVISORY — PLAIN/HTML DIVERGENCE: This message's plain-text "
+            "part and its HTML part show materially different visible text. "
+            "Honest senders keep the two in sync; a large mismatch is "
+            "characteristic of filter evasion — an innocuous plain-text decoy "
+            "concealing a different message in the HTML the recipient actually "
+            "sees (shown as BODY above). The plain-text decoy reads: \""
+            + decoy_excerpt + "\"."
+        )
+
     # --- Reply-To vs From domain mismatch (advisory) ------------------------
     raw_reply_to = msg_data.get('reply_to', '') or ''
     # Parse the first address only (Reply-To may be a comma-separated list or
@@ -3544,6 +3633,7 @@ def build_user_message(msg_data: dict, approved_domains: set = None) -> str:
         f"{body_label}:\n"
         f"{body}"
         f"{link_domain_line}"
+        f"{divergence_line}"
         f"{mismatch_line}"
         f"{punycode_line}\n"
         f"</untrusted_email>\n\n"
@@ -3625,25 +3715,131 @@ def get_html_body(msg: email.message.Message) -> str:
     return ""
 
 
+# --- html_to_text hardening (availability) ----------------------------------
+# These replace the previous inline regexes, which were quadratic on
+# adversarial input (a run of unmatched '<' made the old tag-strip r'<[^>]+>'
+# rescan to end-of-input from every '<'; the ambiguous r'\s*/?\s*' in the old
+# br pattern backtracked O(m^2) over an unclosed whitespace run; the old
+# script/style pattern's lazy '.*?' rescanned to end-of-input for every
+# unclosed opener). Since the HTML body is attacker-controlled and
+# html_to_text now runs on the hot path of every classification, conversion
+# must be linear-time. Every replacement below is EXACTLY semantics-
+# preserving (verified byte-identical old-vs-new over the full 119-email
+# corpus + all fixtures):
+#   - Possessive quantifiers (\s*+; Python 3.11+, the app bundles and builds
+#     with 3.12) eliminate backtracking. Safe here because each possessive
+#     class is disjoint from what follows it (whitespace vs 'b'/'/'/'>'),
+#     so greedy matching never needed to give characters back to succeed.
+#   - The generic tag-strip and the script/style block-strip become manual
+#     str.find scans (below) that replicate the old patterns' semantics
+#     exactly — including '<' characters INSIDE a tag span (real mail does
+#     this: MSO conditional comments like '<!--[if !mso]><!-->'), which is
+#     why a narrowed [^<>] character class was NOT usable.
+_HTML_BR_RE = re.compile(r'<\s*+br\s*+/?\s*+>', re.IGNORECASE)
+_HTML_BLOCK_CLOSE_RE = re.compile(
+    r'<\s*+/\s*+(p|div|tr|li|h[1-6]|blockquote)\s*+>', re.IGNORECASE)
+_SCRIPT_STYLE_OPEN_HEAD_RE = re.compile(r'<\s*+(script|style)', re.IGNORECASE)
+_SCRIPT_STYLE_CLOSE_RES = {
+    "script": re.compile(r'<\s*+/\s*+script\s*+>', re.IGNORECASE),
+    "style":  re.compile(r'<\s*+/\s*+style\s*+>', re.IGNORECASE),
+}
+
+
+def _strip_tags(text: str) -> str:
+    """Remove every '<'...'>' span with a non-empty interior — the exact
+    semantics of the old r'<[^>]+>' sub (greedy [^>]+ always runs to the
+    first following '>', and may span interior '<' characters), but linear:
+    each str.find consumes the region it scanned, so an adversarial run of
+    unmatched '<' costs O(n) instead of the old O(n^2) rescans."""
+    out = []
+    pos = 0
+    while True:
+        i = text.find('<', pos)
+        if i == -1:
+            out.append(text[pos:])
+            return "".join(out)
+        j = text.find('>', i + 1)
+        if j == -1:
+            # No '>' anywhere ahead: nothing later can match either.
+            out.append(text[pos:])
+            return "".join(out)
+        if j == i + 1:
+            # '<>' — empty interior never matched [^>]+; keep the '<' and
+            # continue scanning after it.
+            out.append(text[pos:i + 1])
+            pos = i + 1
+            continue
+        out.append(text[pos:i])
+        pos = j + 1
+
+
+def _strip_script_style_blocks(text: str) -> str:
+    """Remove <script>...</script> and <style>...</style> blocks wholesale.
+
+    Replaces the old single regex (r'<\\s*(script|style)[^>]*>.*?<\\s*/\\s*\\1\\s*>',
+    DOTALL) with an equivalent linear scan. Old semantics, replicated
+    exactly: the opening tag runs to the first '>' after the tag word
+    ([^>]* may span interior '<'); the earliest same-type closer ends the
+    block; an opener with no same-type closer ahead is left in place (the
+    generic tag-strip then removes the tag itself). Linear because: a
+    successful closer search consumes the span it scanned; a failed closer
+    search is remembered per tag type (no closer after position p means none
+    after any later position); and the first-'>' lookup is cached so
+    repeated unclosed openers never rescan the same region.
+    """
+    out = []
+    pos = 0
+    no_closer = {"script": False, "style": False}
+    gt = -1  # cached result: text.find('>', x) for the last x searched
+    while True:
+        m = _SCRIPT_STYLE_OPEN_HEAD_RE.search(text, pos)
+        if m is None:
+            out.append(text[pos:])
+            return "".join(out)
+        # The opening tag needs a '>' at/after the tag word ([^>]* in the old
+        # pattern). Successive heads start strictly later, so the cached '>'
+        # position stays valid until we pass it.
+        if gt < m.end():
+            gt = text.find('>', m.end())
+            if gt == -1:
+                # No '>' anywhere ahead: no opener (or closer) can complete.
+                out.append(text[pos:])
+                return "".join(out)
+        tag = m.group(1).lower()
+        c = (None if no_closer[tag]
+             else _SCRIPT_STYLE_CLOSE_RES[tag].search(text, gt + 1))
+        if c is None:
+            no_closer[tag] = True
+            # Unclosed block: keep the opener (old behavior) and resume the
+            # scan just past its '<'.
+            out.append(text[pos:m.start() + 1])
+            pos = m.start() + 1
+            continue
+        out.append(text[pos:m.start()])
+        pos = c.end()
+
+
 def html_to_text(html: str) -> str:
     """Best-effort HTML-to-text for forwarded-email parsing. Converts block
     tags to newlines, strips remaining tags, decodes entities. Good enough
     for finding 'From:'/'Subject:' lines in an HTML-only forward; not a
     faithful renderer.
+
+    Hardened to linear time on adversarial input (see the pattern constants
+    above): the HTML part is attacker-controlled and this now runs on the
+    classification hot path, so quadratic blowup was a DoS surface.
     """
     if not html:
         return ""
     import html as _html_module
     # Block-level tags become line breaks so quoted headers stay on their
     # own lines after tag-stripping.
-    text = re.sub(r'<\s*br\s*/?\s*>', '\n', html, flags=re.IGNORECASE)
-    text = re.sub(r'<\s*/\s*(p|div|tr|li|h[1-6]|blockquote)\s*>',
-                  '\n', text, flags=re.IGNORECASE)
+    text = _HTML_BR_RE.sub('\n', html)
+    text = _HTML_BLOCK_CLOSE_RE.sub('\n', text)
     # Strip style/script blocks wholesale so we don't parse their contents.
-    text = re.sub(r'<\s*(script|style)[^>]*>.*?<\s*/\s*\1\s*>',
-                  '', text, flags=re.IGNORECASE | re.DOTALL)
+    text = _strip_script_style_blocks(text)
     # Remove remaining tags.
-    text = re.sub(r'<[^>]+>', '', text)
+    text = _strip_tags(text)
     try:
         text = _html_module.unescape(text)
     except Exception:
