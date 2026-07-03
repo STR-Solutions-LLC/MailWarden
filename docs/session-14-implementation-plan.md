@@ -16,7 +16,7 @@
 - Do NOT write under `.superpowers/` or `docs/superpowers/` — breaks the build pre-flight.
 - Test-first: write a failing test, confirm it fails, implement minimal code, confirm it passes, commit.
 - Tests use `tmp_path` + inline Python bytes for synthetic `.eml` content — no real emails committed.
-- The `tests/_out/` directory is git-ignored (local-only). All nine `*.py` scripts in it still reference the old installer path `/Users/mattrosenberg/MailWarden-installer` — Task 3 fixes them.
+- The `tests/_out/` directory is git-ignored (local-only). All nine `*.py` scripts in it still reference the old installer path `~/MailWarden-installer` — Task 3 fixes them.
 
 ---
 
@@ -802,7 +802,7 @@ git commit -m "feat(S14): eval harness CLI — corpus runner with recall/precisi
 
 ### Task 3: Regenerate stale `tests/_out` baselines
 
-All nine `tests/_out/*.py` scripts contain a hardcoded `REPO` path pointing to the old installer directory (`/Users/mattrosenberg/MailWarden-installer`). They need updating to the current repo. Since `tests/_out/` is git-ignored, these edits are local-only — not committed. The resulting `.txt` files are also local-only.
+All nine `tests/_out/*.py` scripts contain a hardcoded `REPO` path pointing to the old installer directory (`~/MailWarden-installer`). They need updating to the current repo. Since `tests/_out/` is git-ignored, these edits are local-only — not committed. The resulting `.txt` files are also local-only.
 
 **Files to edit locally (not committed):**
 - `tests/_out/run_baseline.py`
@@ -830,7 +830,7 @@ Expected: lists all 9 files. If any file is missing or has a different pattern, 
 Run this command (single invocation, safe to re-run):
 
 ```bash
-sed -i '' 's|/Users/mattrosenberg/MailWarden-installer|/Users/mattrosenberg/Documents/Claude-Projects/MailWarden-app|g' tests/_out/*.py
+sed -i '' 's|~/MailWarden-installer|~/Documents/Claude-Projects/MailWarden-app|g' tests/_out/*.py
 ```
 
 - [ ] **Step 3.3: Verify the replacement took**
@@ -867,7 +867,7 @@ Expected: prints results for both Haiku and Sonnet, 8/8 all-green each, and writ
 grep "signals" tests/_out/baseline_haiku.txt | head -1
 ```
 
-Expected: shows `signals : /Users/mattrosenberg/Documents/Claude-Projects/MailWarden-app/resources/defaults/signals.json` (not the installer path).
+Expected: shows `signals : ~/Documents/Claude-Projects/MailWarden-app/resources/defaults/signals.json` (not the installer path).
 
 - [ ] **Step 3.7: Run the spam gate (online)**
 

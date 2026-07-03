@@ -5,7 +5,7 @@
 #
 # Pipeline:
 #   1. Run the §0 pre-build audit. Halt on any finding.
-#   2. Regenerate scrubbed signals.json from ~/MailWarden/memory/signals.json.
+#   2. (removed 2026-07-03 — resources/defaults/signals.json ships as tracked)
 #   3. Regenerate eula.html from EULA.md.
 #   4. Build MailWarden.app via py2app in a clean venv.
 #   5. Re-run the audit against the built .app.
@@ -22,7 +22,7 @@ DIST_DIR="$INSTALLER_ROOT/dist"
 COMPONENT_PKG="$INSTALLER_ROOT/build/MailWarden-component.pkg"
 FINAL_PKG="$DIST_DIR/MailWarden.pkg"
 APP_BUNDLE_ID="com.strsolutions.mailwarden"
-APP_VERSION="1.6.0-beta.16.2"
+APP_VERSION="1.6.0-beta.17"
 
 mkdir -p "$DIST_DIR" "$(dirname "$COMPONENT_PKG")"
 
@@ -30,14 +30,15 @@ log() { printf "\033[1;34m[build]\033[0m %s\n" "$*"; }
 die() { printf "\033[1;31m[build]\033[0m %s\n" "$*" >&2; exit 1; }
 
 # ----------------------------------------------------------------------------
-# Step 0 — refresh scrubbed signals.json from live install.
+# Step 0 — REMOVED 2026-07-03. It refreshed resources/defaults/signals.json
+# from the build machine's live ~/MailWarden install. The tracked file is now
+# the curated source of truth (the a-1 signal cleanup was made there and
+# measured against the eval corpus); the live-install sync silently
+# resurrected the very signals a-1 removed. Ship exactly what the repo
+# reviews. To import learned signals from a runtime again, do it as a
+# reviewed commit, not a build step. (scripts/scrub_signals.py kept for
+# manual use.)
 # ----------------------------------------------------------------------------
-log "Refreshing scrubbed signals.json..."
-if [ -f "$HOME/MailWarden/memory/signals.json" ]; then
-    python3 "$INSTALLER_ROOT/scripts/scrub_signals.py"
-else
-    log "  (no live signals.json found — keeping whatever is already in resources/defaults/)"
-fi
 
 # ----------------------------------------------------------------------------
 # Step 0.5 — clean dev-runtime junk from the source payload tree before audit.
@@ -62,7 +63,7 @@ if [ -d "$PAYLOAD_SRC/false_positives" ]; then
 fi
 
 # ----------------------------------------------------------------------------
-# Step 1 — pre-build audit. Hard gate. Runs after scrub so it sees the fresh signals.json.
+# Step 1 — pre-build audit. Hard gate. Audits the tracked signals.json as-is.
 # ----------------------------------------------------------------------------
 log "Running §1 pre-build audit..."
 if ! "$INSTALLER_ROOT/scripts/audit_payload.sh"; then

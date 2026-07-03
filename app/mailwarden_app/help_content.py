@@ -8,7 +8,7 @@ across surfaces and a single edit updates every spot.
 # ---------------------------------------------------------------------------
 # Version and repo
 # ---------------------------------------------------------------------------
-VERSION = "1.6.0-beta.16.2"
+VERSION = "1.6.0-beta.17"
 GITHUB_URL = "https://github.com/STR-Solutions-LLC/MailWarden"
 FEEDBACK_EMAIL = "info@rentalist.pro"
 ANTHROPIC_CONSOLE_URL = "https://console.anthropic.com"
