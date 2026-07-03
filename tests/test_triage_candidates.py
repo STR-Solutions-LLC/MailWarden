@@ -222,3 +222,266 @@ def test_limit_caps_candidates(tmp_path):
     res = mod.run_triage(h.parent, bench, limit=2, prompt=lambda *_: "skip",
                          out=lambda *_: None)
     assert res["processed"] == 2
+
+
+# ─── sandboxed browser preview ─────────────────────────────────────────────────
+
+_HTML_EMAIL = (
+    b"From: Promo Sender <promo@bigbrand.com>\r\n"
+    b"To: me@example.com\r\n"
+    b"Subject: Big <Sale> Today\r\n"
+    b"Date: Wed, 1 Jul 2026 10:00:00 -0400\r\n"
+    b"Message-ID: <m1@bigbrand.com>\r\n"
+    b"List-Unsubscribe: <mailto:u@bigbrand.com>\r\n"
+    b"Content-Type: text/html; charset=utf-8\r\n"
+    b"\r\n"
+    b"<html><head><meta http-equiv=\"refresh\" content=\"0;url=https://evil.example/\">"
+    b"<base href=\"https://evil.example/\"></head>"
+    b"<body><script>alert('pwn')</script>"
+    b"<p style=\"color:red\">HUGE deal</p>"
+    b"<img src=\"https://tracker.example/pixel.gif\">"
+    b"</body></html>\r\n"
+)
+
+_PLAIN_EMAIL = (
+    b"From: Plain Person <p@plainco.com>\r\n"
+    b"To: me@example.com\r\n"
+    b"Subject: hello\r\n"
+    b"Date: Wed, 1 Jul 2026 11:00:00 -0400\r\n"
+    b"Message-ID: <m2@plainco.com>\r\n"
+    b"List-Unsubscribe: <mailto:u@plainco.com>\r\n"
+    b"\r\n"
+    b"Just words here. 1 < 2 & so on.\r\n"
+)
+
+
+def _preview(mod, raw):
+    ev = mod.evaluate_candidate(raw)
+    return mod.build_preview_html(raw, ev)
+
+
+def test_preview_csp_wrapper_present():
+    """The strict CSP meta must be injected in <head>, before any email
+    content: remote img/script/css/fonts are blocked (default-src 'none' +
+    img-src data: only) while inline styles still render (style-src
+    'unsafe-inline'). Blank remote images are the intended behavior."""
+    mod = _load()
+    doc = _preview(mod, _HTML_EMAIL)
+    assert 'http-equiv="Content-Security-Policy"' in doc
+    assert "default-src 'none'" in doc
+    assert "img-src data:" in doc
+    assert "style-src 'unsafe-inline'" in doc
+    assert "form-action 'none'" in doc
+    # CSP is in OUR head, before the email's (neutralized) markup begins.
+    assert doc.index("Content-Security-Policy") < doc.index("HUGE deal")
+    # The inline style the email carries survives (renders under the CSP).
+    assert 'style="color:red"' in doc
+
+
+def test_preview_script_neutralized():
+    mod = _load()
+    doc = _preview(mod, _HTML_EMAIL)
+    assert "<script" not in doc.lower()
+    assert "alert('pwn')" not in doc
+
+
+def test_preview_script_unclosed_dropped():
+    """An unclosed <script> must not leak its contents into the preview."""
+    mod = _load()
+    out = mod._remove_script_blocks("safe<script>evil= tail with no close")
+    assert out == "safe"
+    # And closed blocks vanish while surrounding content stays.
+    assert mod._remove_script_blocks("a<SCRIPT src=x>b</sCrIpT>c") == "ac"
+
+
+def test_preview_script_splice_bypass_removed():
+    """A single linear pass over "<scr<script>DUMMY</script>ipt>alert(1)
+    </script>" deletes the inner <script>...</script> span and glues the
+    surrounding text into a brand-new, live "<script>alert(1)</script>" that
+    a one-shot scan never re-examines. _remove_script_blocks must run to a
+    fixed point so the reconstructed tag gets caught on a follow-up pass."""
+    mod = _load()
+    probe = "<scr<script>DUMMY</script>ipt>alert(1)</script>"
+    out = mod._remove_script_blocks(probe)
+    assert "<script" not in out.lower()
+
+    # Doubly-nested variant — two layers of splicing must both be defeated.
+    probe2 = ("<scr<scr<script>D1</script>D2</script>ipt>alert(2)</script>"
+              "ipt>alert(1)</script>")
+    out2 = mod._remove_script_blocks(probe2)
+    assert "<script" not in out2.lower()
+
+
+def test_preview_script_splice_bypass_removed_in_full_pipeline():
+    """The same splice payload, delivered as an email's HTML body, must not
+    surface a live <script> anywhere in the rendered preview.html output."""
+    mod = _load()
+    raw = (
+        b"From: Promo Sender <promo@bigbrand.com>\r\n"
+        b"To: me@example.com\r\n"
+        b"Subject: splice test\r\n"
+        b"Date: Wed, 1 Jul 2026 10:00:00 -0400\r\n"
+        b"Message-ID: <m3@bigbrand.com>\r\n"
+        b"List-Unsubscribe: <mailto:u@bigbrand.com>\r\n"
+        b"Content-Type: text/html; charset=utf-8\r\n"
+        b"\r\n"
+        b"<html><body><p>hi</p>"
+        b"<scr<script>DUMMY</script>ipt>alert(1)</script>"
+        b"</body></html>\r\n"
+    )
+    doc = _preview(mod, raw)
+    assert "<script" not in doc.lower()
+
+
+def test_preview_links_neutralized():
+    """href targets must never survive as a live navigable href, across
+    quoting styles (double/single/unquoted/whitespace) and dangerous
+    schemes (javascript:) — while the anchor's visible text is preserved."""
+    mod = _load()
+    cases = [
+        '<a href="http://evil.example/steal">click here</a>',
+        "<a href='javascript:alert(1)'>js here</a>",
+        "<a href=http://evil.example/bare>bare here</a>",
+        '<A   HrEf  =  "HTTP://Evil.Example/Mixed"  >mixed here</A>',
+    ]
+    for html_fragment in cases:
+        out = mod._neutralize_links(html_fragment)
+        assert "evil.example" not in out.lower()
+        assert "javascript:" not in out.lower()
+        # visible anchor text survives
+        assert "here</a" in out.lower() or "here</A" in out
+
+
+def test_preview_link_click_disabled_full_pipeline():
+    """A live http(s) link in an email body must not survive into the
+    rendered preview as a clickable href, and the header bar must warn Matt
+    that links are disabled."""
+    mod = _load()
+    raw = (
+        b"From: Promo Sender <promo@bigbrand.com>\r\n"
+        b"To: me@example.com\r\n"
+        b"Subject: link test\r\n"
+        b"Date: Wed, 1 Jul 2026 10:00:00 -0400\r\n"
+        b"Message-ID: <m4@bigbrand.com>\r\n"
+        b"List-Unsubscribe: <mailto:u@bigbrand.com>\r\n"
+        b"Content-Type: text/html; charset=utf-8\r\n"
+        b"\r\n"
+        b'<html><body><a href="http://evil.example/steal">click me</a>'
+        b"</body></html>\r\n"
+    )
+    doc = _preview(mod, raw)
+    assert "evil.example" not in doc.lower()
+    assert "click me" in doc  # anchor text preserved
+    assert "links are disabled" in doc  # header bar warns Matt
+
+
+def test_preview_meta_refresh_and_base_neutralized():
+    """meta-refresh and <base> are renamed to inert unknown elements; no
+    live <meta ...> or <base ...> from the EMAIL remains (our own wrapper
+    metas — charset + CSP — are the only real ones)."""
+    mod = _load()
+    doc = _preview(mod, _HTML_EMAIL)
+    assert "x-meta" in doc and "x-base" in doc
+    body_part = doc.split("</head>", 1)[1]
+    assert "<meta" not in body_part.lower()
+    assert "<base" not in body_part.lower()
+
+
+def test_preview_remote_img_stays_but_csp_blocks():
+    """The remote <img> tag remains in the markup (the CSP is what blocks
+    the load — a blank box is the tracking-pixel protection working)."""
+    mod = _load()
+    doc = _preview(mod, _HTML_EMAIL)
+    assert "tracker.example/pixel.gif" in doc
+    assert "img-src data:" in doc  # …and nothing but data: may load
+
+
+def test_preview_header_bar_fields_escaped():
+    mod = _load()
+    doc = _preview(mod, _HTML_EMAIL)
+    assert "MailWarden triage preview" in doc
+    assert "Promo Sender" in doc
+    # Subject's <Sale> must be HTML-escaped in the header bar, not raw markup.
+    assert "Big &lt;Sale&gt; Today" in doc
+    assert "Wed, 1 Jul 2026 10:00:00" in doc
+    assert "Auth:" in doc and "SPF=" in doc
+    assert "list_unsubscribe" in doc  # heuristics fired
+
+
+def test_preview_plain_fallback_pre():
+    mod = _load()
+    doc = _preview(mod, _PLAIN_EMAIL)
+    assert "<pre" in doc
+    assert "Just words here. 1 &lt; 2 &amp; so on." in doc
+    assert 'http-equiv="Content-Security-Policy"' in doc  # same wrapper
+
+
+def test_preview_loop_unique_file_per_candidate(tmp_path):
+    """Preview ON: each candidate gets its OWN fresh filename (never a single
+    reused name) inside one temp dir — never repo, never benchmark. A stale
+    cached browser tab for a reused URL is a labeling-correctness risk, so
+    every `open` call must target a distinct path Matt hasn't visited before."""
+    mod = _load()
+    h = tmp_path / "_harvest" / "acct"
+    h.mkdir(parents=True)
+    (h / "a.eml").write_bytes(_HTML_EMAIL)
+    (h / "b.eml").write_bytes(_PLAIN_EMAIL)
+    bench = _benchmark(tmp_path)
+    opened = []
+    res = mod.run_triage(h.parent, bench, prompt=lambda *_: "skip",
+                         out=lambda *_: None, preview=True,
+                         opener=lambda p: opened.append(Path(p)))
+    assert res["processed"] == 2
+    assert len(opened) == 2
+    assert opened[0] != opened[1], "each candidate must get a distinct preview file"
+    assert opened[0].exists()
+    assert opened[1].exists()
+    assert opened[0].parent == opened[1].parent, "same temp dir, different filenames"
+    assert not str(opened[0]).startswith(str(REPO))
+    assert not str(opened[0]).startswith(str(bench))
+    assert not str(opened[1]).startswith(str(REPO))
+    assert not str(opened[1]).startswith(str(bench))
+    # Each file holds its OWN candidate's preview (not overwritten by the next).
+    assert "HUGE deal" in opened[0].read_text()
+    assert "Just words here" in opened[1].read_text()
+
+
+def test_preview_open_failure_never_breaks_loop(tmp_path):
+    """`open` blowing up must not crash triage; the verdict still lands."""
+    mod = _load()
+    h = tmp_path / "_harvest" / "acct"
+    h.mkdir(parents=True)
+    (h / "a.eml").write_bytes(_HTML_EMAIL)
+    bench = _benchmark(tmp_path)
+    msgs = []
+
+    def boom(_):
+        raise OSError("no browser here")
+
+    res = mod.run_triage(h.parent, bench, prompt=lambda *_: "n",
+                         out=msgs.append, preview=True, opener=boom)
+    assert res["counts"]["n"] == 1
+    assert (bench / mod.FOLDER_SPAM / "a.eml").exists()
+    assert any("preview unavailable" in m for m in msgs)
+    # Terminal text view was still shown (fallback path).
+    assert any("Subject:" in m for m in msgs)
+
+
+def test_preview_off_never_opens(tmp_path):
+    mod = _load()
+    h = tmp_path / "_harvest" / "acct"
+    h.mkdir(parents=True)
+    (h / "a.eml").write_bytes(_HTML_EMAIL)
+    bench = _benchmark(tmp_path)
+    opened = []
+    mod.run_triage(h.parent, bench, prompt=lambda *_: "skip",
+                   out=lambda *_: None, preview=False,
+                   opener=lambda p: opened.append(p))
+    assert opened == []
+
+
+def test_cli_has_no_preview_flag():
+    """--no-preview exists and the CLI default is preview ON."""
+    src = (REPO / "tools" / "triage_candidates.py").read_text()
+    assert "--no-preview" in src
+    assert "preview=not args.no_preview" in src
