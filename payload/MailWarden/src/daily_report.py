@@ -39,6 +39,12 @@ REPORT_STATE_PATH = PROJECT_ROOT / "memory" / "report_state.json"
 REPORT_APPROVALS_PATH = PROJECT_ROOT / "memory" / "report_approvals.json"
 # Report-approval tokens expire after this many days (locked product decision).
 REPORT_APPROVAL_MAX_AGE_DAYS = 30
+# item (b): FP-driven learned-rule review queue (rule-id keyed). Written by the
+# filter (enqueue on an APPROVE rescue driven by a learned R- rule; KEEP/DROP
+# resolve). Read here to render the LEARNED-RULE REVIEW section; pending entries
+# auto-expire (silent "kept") after RULE_REVIEW_MAX_AGE_DAYS.
+RULE_REVIEWS_PATH = PROJECT_ROOT / "memory" / "rule_reviews.json"
+RULE_REVIEW_MAX_AGE_DAYS = 30
 REPORT_BOUNDARY_HOUR = 8  # local clock hour the report "day" rolls over
 PENDING_SIGNALS_PATH = PROJECT_ROOT / "memory" / "pending_signals.json"
 # Persistent lifetime counters that survive pruning of decisions.log and
@@ -430,12 +436,17 @@ def build_approval_entries(decisions: dict) -> dict:
             "from_domain": (extract_domain(addr) or "").lstrip("@"),
             "from": e.get("from", ""),
             "subject": e.get("subject", ""),
+            # item (b): the learned rules that drove this junk verdict, so an
+            # APPROVE rescue can queue them for review without re-scanning
+            # decisions.log.
+            "rule_ids": e.get("rule_ids", []),
         }
     return entries
 
 
 def record_report_approvals(token: str, account: str, window_end,
-                            entries: dict, logger: logging.Logger):
+                            entries: dict, logger: logging.Logger,
+                            rule_reviews: dict = None):
     """Write one report's number->sender map under its [MWR-<token>] key.
     Tokens older than REPORT_APPROVAL_MAX_AGE_DAYS are pruned opportunistically
     inside the same locked write. Best-effort: a failure here must never block
@@ -458,10 +469,137 @@ def record_report_approvals(token: str, account: str, window_end,
                 "account": account,
                 "window_end": window_end.isoformat(),
                 "entries": entries,
+                # item (b): number->rule-id map for KEEP/DROP replies under the
+                # SAME token (verb disambiguates from APPROVE's entries).
+                "rule_reviews": rule_reviews or {},
             }
             save_report_approvals(data)
     except Exception as e:
         logger.error(f"Failed to record report approvals for [MWR-{token}]: {e}")
+
+
+# ---------------------------------------------------------------------------
+# item (b): FP-driven learned-rule review — queue read + render
+# ---------------------------------------------------------------------------
+
+def load_rule_reviews() -> dict:
+    """Read rule_reviews.json (rule-id-keyed pending review queue). Caller holds
+    the lock (mirrors load_report_approvals)."""
+    try:
+        with open(RULE_REVIEWS_PATH, "r") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_rule_reviews(data: dict):
+    """Atomic write of rule_reviews.json. Caller holds the lock (mirrors
+    save_report_approvals)."""
+    fd, tmp_path = tempfile.mkstemp(dir=RULE_REVIEWS_PATH.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, RULE_REVIEWS_PATH)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+def prune_rule_reviews(logger: logging.Logger) -> dict:
+    """Locked load of the review queue, dropping entries older than
+    RULE_REVIEW_MAX_AGE_DAYS (by ``first_queued``) — an unanswered review
+    silently auto-resolves to "kept". Malformed entries are dropped. Returns the
+    current (pruned) queue dict. Best-effort: never blocks a report."""
+    try:
+        with file_lock.locked(RULE_REVIEWS_PATH):
+            data = load_rule_reviews()
+            cutoff = datetime.now() - timedelta(days=RULE_REVIEW_MAX_AGE_DAYS)
+            changed = False
+            for rid in list(data.keys()):
+                rec = data.get(rid)
+                try:
+                    fq = datetime.fromisoformat((rec or {}).get("first_queued", ""))
+                    if fq < cutoff:
+                        del data[rid]
+                        changed = True
+                except (ValueError, TypeError, AttributeError):
+                    del data[rid]
+                    changed = True
+            if changed:
+                save_rule_reviews(data)
+            return data
+    except Exception as e:
+        logger.error(f"Failed to prune rule_reviews.json: {e}")
+        return load_rule_reviews()
+
+
+def _active_refinement_by_id(signals_data: dict, rid: str) -> dict:
+    """Return the ACTIVE ai_refinement with id ``rid``, else None."""
+    for r in (signals_data or {}).get("ai_refinements", []) or []:
+        if r.get("id") == rid and r.get("status", "active") == "active":
+            return r
+    return None
+
+
+def ordered_rule_reviews(queue: dict, signals_data: dict) -> list:
+    """Deterministic, render-ready list of pending reviews whose rule is still
+    an ACTIVE learned refinement (auto-dropping any that were already retired /
+    removed — this is how the section stays honest without a write). Ordered by
+    ``first_queued`` then rule id. Live rule metadata (headline/confidence/blind
+    spot) is read fresh from signals_data; the queue snapshot is the fallback."""
+    out = []
+    for rid, rec in (queue or {}).items():
+        ref = _active_refinement_by_id(signals_data, rid)
+        if ref is None:
+            continue
+        rec = rec or {}
+        out.append({
+            "rule_id": rid,
+            "headline": (ref.get("headline") or rec.get("headline") or "").strip(),
+            "confidence": (ref.get("confidence") or rec.get("confidence")
+                           or "medium"),
+            "what_this_doesnt_cover": (
+                ref.get("what_this_doesnt_cover") or "").strip(),
+            "evidence": rec.get("evidence", []) or [],
+            "first_queued": rec.get("first_queued", ""),
+        })
+    out.sort(key=lambda d: (d["first_queued"], d["rule_id"]))
+    return out
+
+
+def build_rule_review_entries(ordered: list) -> dict:
+    """Number->rule-id map for one report's KEEP/DROP token, keyed by the SAME
+    numbers build_rule_review_section renders (1..m)."""
+    return {str(i): d["rule_id"] for i, d in enumerate(ordered, 1)}
+
+
+def build_rule_review_section(ordered: list) -> list:
+    """LEARNED-RULE REVIEW section lines (owner-approved copy). Empty when there
+    is nothing pending. Numbered independently (1..m); the KEEP/DROP verb
+    disambiguates from the APPROVE spam-list numbering."""
+    if not ordered:
+        return []
+    lines = ["", "LEARNED-RULE REVIEW",
+             "A sender you rescued had been junked by a rule MailWarden taught "
+             "itself.",
+             "Review the rule that caused it:", ""]
+    for i, d in enumerate(ordered, 1):
+        lines.append(f'{i}. [{d["rule_id"]}] "{d["headline"]}"')
+        lines.append(f'   Confidence when learned: {d["confidence"]}')
+        if d["what_this_doesnt_cover"]:
+            lines.append(f'   Known blind spot: {d["what_this_doesnt_cover"]}')
+        ev = d["evidence"][0] if d["evidence"] else None
+        if ev:
+            lines.append(f'   Triggered the rescue of: "{ev.get("subject", "")}"'
+                         f' from {ev.get("from", "")}')
+    lines.append("")
+    lines.append("To DROP a rule (stop using it), reply DROP and the item "
+                 "number (example: DROP 1).")
+    lines.append("To KEEP a rule, reply KEEP 1. No reply leaves your rules "
+                 "unchanged.")
+    return lines
 
 
 def _parse_state_ts(value):
@@ -853,6 +991,13 @@ def parse_decisions_24h(window_start, window_end) -> dict:
             subj_match = re.search(r'^\s*SUBJECT: (.+)', entry, re.MULTILINE)
             conf_match = re.search(r'confidence: ([\d.]+)', entry)
             sig_match = re.search(r'^\s*SIGNALS HIT: (.+)', entry, re.MULTILINE)
+            # item (b): capture the LEARNED rule ids (R-) that drove this verdict
+            # (F5 attribution). S- defaults are out of scope for owner review, so
+            # they are filtered out here; the list feeds the APPROVE token entry
+            # and, on a later rescue, the rule-review queue.
+            rule_match = re.search(r'^\s*RULE IDS: (.+)', entry, re.MULTILINE)
+            rule_ids = ([x.strip() for x in rule_match.group(1).split(",")
+                         if x.strip().startswith("R-")] if rule_match else [])
 
             spam_entry = {
                 "time": ts.strftime("%I:%M %p").lstrip("0"),
@@ -862,6 +1007,7 @@ def parse_decisions_24h(window_start, window_end) -> dict:
                 "signals": sig_match.group(1).strip() if sig_match else "",
                 "account": acct_name,
                 "dry_run": "would move to" in entry,
+                "rule_ids": rule_ids,
             }
             result["spam_entries"].append(spam_entry)
         elif "No action taken" in entry or "NOT SPAM" in entry:
@@ -884,8 +1030,14 @@ def build_report_body(config: dict, decisions: dict, last_run: datetime,
                       sig_status: dict = None,
                       bl_additions: list = None, bl_blocked: tuple = None,
                       bl_totals: tuple = None,
-                      window_start=None, window_end=None) -> str:
-    """Build the plain text email body."""
+                      window_start=None, window_end=None,
+                      rule_reviews_ordered: list = None) -> str:
+    """Build the plain text email body.
+
+    ``rule_reviews_ordered`` (item (b)): the ordered pending learned-rule
+    reviews to render (primary report only; None/[] renders nothing). The
+    numbering here must match build_rule_review_entries fed from the SAME list.
+    """
     now = datetime.now()
     date_str = now.strftime("%B %d, %Y")
     time_str = now.strftime("%I:%M %p").lstrip("0")
@@ -1114,6 +1266,12 @@ def build_report_body(config: dict, decisions: dict, last_run: datetime,
         if sig_lines:
             lines.extend(sig_lines)
 
+    # item (b): learned-rule review (primary report only — passed by the caller)
+    if rule_reviews_ordered:
+        rr_lines = build_rule_review_section(rule_reviews_ordered)
+        if rr_lines:
+            lines.extend(rr_lines)
+
     lines.append("")
     lines.append("=" * 40)
 
@@ -1210,6 +1368,13 @@ def main(now=None):
     logger.info("Checking pending signal proposals...")
     sig_status = expire_pending_signals(logger)
 
+    # --- item (b): learned-rule review queue (prune stale, then render on the
+    # PRIMARY report only — one owner, so a single prompt avoids duplicating the
+    # same rule across every account's report). ---
+    rule_reviews_queue = prune_rule_reviews(logger)
+    rule_reviews_ordered = ordered_rule_reviews(rule_reviews_queue, signals_data)
+    rule_review_entries = build_rule_review_entries(rule_reviews_ordered)
+
     # --- Current whitelist/blacklist snapshots (NOT windowed) ---
     wl_additions = []
     wl_domains = {"added": [], "removed": [], "total": 0}
@@ -1265,17 +1430,20 @@ def main(now=None):
                 bl_additions=bl_additions, bl_blocked=bl_blocked,
                 bl_totals=bl_totals,
                 window_start=window_start, window_end=window_end,
+                rule_reviews_ordered=rule_reviews_ordered,
             )
             subject = (f"MailWarden Report — {date_str} — "
                        f"{decisions['spam_moved']} moved to Junk")
-            # Safe sender-approval: reports that list junked entries get a
-            # short reply token; zero-entry reports write no token.
+            # Safe sender-approval + item (b): reports that list junked entries
+            # OR carry pending rule-reviews get a short reply token; otherwise
+            # no token is written.
             approval_entries = build_approval_entries(decisions)
-            if approval_entries:
+            if approval_entries or rule_review_entries:
                 approval_token = random_token()
                 subject += f" [MWR-{approval_token}]"
                 record_report_approvals(approval_token, name, window_end,
-                                        approval_entries, logger)
+                                        approval_entries, logger,
+                                        rule_reviews=rule_review_entries)
             try:
                 send_report(config, subject, body, logger)
                 advances[name] = {
@@ -1344,17 +1512,24 @@ def main(now=None):
                 bl_additions=bl_additions, bl_blocked=bl_blocked,
                 bl_totals=bl_totals,
                 window_start=window_start, window_end=window_end,
+                # item (b): learned-rule review renders on the PRIMARY report
+                # only (one owner; avoids duplicating a rule across accounts).
+                rule_reviews_ordered=(rule_reviews_ordered if is_primary
+                                      else None),
             )
             subject = (f"MailWarden Report — {acct_name} — {date_str} — "
                        f"{acct_decisions['spam_moved']} moved to Junk")
-            # Safe sender-approval: reports that list junked entries get a
-            # short reply token; zero-entry reports write no token.
+            # Safe sender-approval + item (b): junked entries OR (primary-only)
+            # pending rule-reviews get a short reply token; else no token.
+            acct_rule_review_entries = (rule_review_entries if is_primary
+                                        else {})
             approval_entries = build_approval_entries(acct_decisions)
-            if approval_entries:
+            if approval_entries or acct_rule_review_entries:
                 approval_token = random_token()
                 subject += f" [MWR-{approval_token}]"
                 record_report_approvals(approval_token, acct_name, window_end,
-                                        approval_entries, logger)
+                                        approval_entries, logger,
+                                        rule_reviews=acct_rule_review_entries)
             try:
                 send_report(config, subject, body, logger, to_addr=acct_user)
                 advances[acct_name] = {

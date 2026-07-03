@@ -55,6 +55,12 @@ APPROVED_SENDERS_PATH = PROJECT_ROOT / "memory" / "approved_senders.json"
 REPORT_APPROVALS_PATH = PROJECT_ROOT / "memory" / "report_approvals.json"
 # Report-approval tokens expire after this many days (locked product decision).
 REPORT_APPROVAL_MAX_AGE_DAYS = 30
+# item (b): FP-driven learned-rule review. The filter WRITES this queue (enqueue
+# on an APPROVE rescue whose junked message was driven by a learned R- rule) and
+# RESOLVES it (KEEP/DROP reply). daily_report.py reads it to render the review
+# section. Entries auto-expire (silent "kept") after RULE_REVIEW_MAX_AGE_DAYS.
+RULE_REVIEWS_PATH = PROJECT_ROOT / "memory" / "rule_reviews.json"
+RULE_REVIEW_MAX_AGE_DAYS = 30
 BLACKLIST_PATH = PROJECT_ROOT / "memory" / "blacklist.json"
 DECISIONS_LOG_PATH = PROJECT_ROOT / "memory" / "decisions.log"
 LOG_PATH = PROJECT_ROOT / "logs" / "spam_filter.log"
@@ -379,22 +385,21 @@ def load_report_approvals_store(logger: logging.Logger) -> dict:
         return {}
 
 
-def parse_approve_command(reply_text: str) -> list:
-    """Parse an owner's APPROVE reply to a daily report ([MWR-...] subject).
+def _parse_command_numbers(reply_text: str, verb: str) -> list:
+    """Shared numbered-command parser for owner replies to a daily report.
 
-    Accepts, case-insensitively: "APPROVE 3", "APPROVE 3,5", "APPROVE 3 5",
-    and "APPROVE 3-5". Tolerant of quoted-reply noise: the command must start
-    a line (quoted ">" lines are already stripped by extract_reply_text, and
-    the report's own instruction line — "...reply to this report with APPROVE
-    and the item number (example: APPROVE 3)." — never has APPROVE at a line
-    start, so an unquoted copy of the report can never self-trigger).
-
-    Returns a sorted list of ints; an EMPTY list means "not an approve reply"
-    (the caller falls through to normal classification).
+    ``verb`` is a fixed literal we control ("approve" / "keep" / "drop") — never
+    untrusted input — so interpolating it into the anchored regex is safe. The
+    command must START a line, case-insensitively; quoted ">" lines are already
+    stripped by extract_reply_text and every report instruction line places the
+    verb AFTER other words ("...reply APPROVE and the item number..."), so an
+    unquoted copy of the report can never self-trigger. Accepts "<verb> 3",
+    "<verb> 3,5", "<verb> 3 5", "<verb> 3-5". Returns a sorted list of ints; an
+    EMPTY list means "not this command".
     """
     if not reply_text:
         return []
-    m = re.search(r'^[ \t]*approve\b[:\s]*([0-9][0-9,\ \t\-]*)',
+    m = re.search(r'^[ \t]*' + verb + r'\b[:\s]*([0-9][0-9,\ \t\-]*)',
                   reply_text, re.IGNORECASE | re.MULTILINE)
     if not m:
         return []
@@ -412,6 +417,158 @@ def parse_approve_command(reply_text: str) -> list:
         if part.isdigit():
             nums.add(int(part))
     return sorted(nums)
+
+
+def parse_approve_command(reply_text: str) -> list:
+    """Parse an owner's APPROVE reply to a daily report ([MWR-...] subject).
+
+    Accepts, case-insensitively: "APPROVE 3", "APPROVE 3,5", "APPROVE 3 5",
+    and "APPROVE 3-5". Returns a sorted list of ints; an EMPTY list means "not
+    an approve reply" (the caller falls through to normal classification).
+    Behavior is byte-for-byte the historical parser — it now delegates to the
+    shared ``_parse_command_numbers`` helper (item (b) DRY).
+    """
+    return _parse_command_numbers(reply_text, "approve")
+
+
+def parse_rule_review_command(reply_text: str):
+    """Parse an owner's KEEP/DROP reply to a daily report's LEARNED-RULE REVIEW
+    section ([MWR-...] subject). Returns ``(verb, [ints])`` with verb "DROP" or
+    "KEEP", or ``None`` when the reply is neither. One verb per reply (v1): DROP
+    wins if both appear, mirroring the single-verb APPROVE model.
+    """
+    drop = _parse_command_numbers(reply_text, "drop")
+    if drop:
+        return ("DROP", drop)
+    keep = _parse_command_numbers(reply_text, "keep")
+    if keep:
+        return ("KEEP", keep)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# item (b): FP-driven learned-rule review — queue + retire machinery
+# ---------------------------------------------------------------------------
+
+def load_rule_reviews_store(logger: logging.Logger) -> dict:
+    """READ-ONLY view of memory/rule_reviews.json (the rule-id-keyed pending
+    review queue). Missing/malformed -> empty dict. Age expiry is enforced by
+    daily_report's prune pass; the filter only enqueues/dequeues here."""
+    try:
+        with open(RULE_REVIEWS_PATH, "r") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as e:
+        logger.error(f"rule_reviews.json is malformed: {e} — treating as empty")
+        return {}
+
+
+def _save_rule_reviews(data: dict) -> None:
+    """Atomic write of rule_reviews.json. Caller holds the lock."""
+    fd, tmp_path = tempfile.mkstemp(dir=RULE_REVIEWS_PATH.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, RULE_REVIEWS_PATH)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+def _active_refinement(signals: dict, rid: str) -> dict:
+    """Return the ACTIVE ai_refinement with id ``rid`` from a loaded signals
+    dict, or None. Mirrors the status filter used everywhere else."""
+    for r in (signals or {}).get("ai_refinements", []) or []:
+        if r.get("id") == rid and r.get("status", "active") == "active":
+            return r
+    return None
+
+
+def enqueue_rule_reviews(pairs, signals: dict,
+                         logger: logging.Logger) -> list:
+    """Queue LEARNED (R-) rules that drove now-rescued false positives.
+
+    ``pairs`` is a list of ``(rule_id, evidence)`` where evidence is
+    ``{"from","subject","account"}``. Only ``R-`` ids whose ai_refinement is
+    currently ACTIVE are queued (``S-`` defaults and already-retired rules are
+    skipped). Dedupe is by rule id (one review per rule, matching apply's id
+    semantics); evidence is prepended newest-first and capped at 5. Locked
+    read-modify-write. Returns the list of ids actually queued."""
+    r_pairs = [(rid, ev) for (rid, ev) in pairs if str(rid).startswith("R-")]
+    if not r_pairs:
+        return []
+    enqueued = []
+    with file_lock.locked(RULE_REVIEWS_PATH):
+        store = load_rule_reviews_store(logger)
+        for rid, ev in r_pairs:
+            ref = _active_refinement(signals, rid)
+            if ref is None:
+                continue
+            rec = store.get(rid)
+            if not isinstance(rec, dict):
+                rec = {
+                    "rule_id": rid,
+                    "headline": (ref.get("headline") or "").strip(),
+                    "confidence": (ref.get("confidence") or "medium"),
+                    "what_this_doesnt_cover": (
+                        ref.get("what_this_doesnt_cover") or "").strip(),
+                    "first_queued": datetime.now().isoformat(),
+                    "evidence": [],
+                    "status": "pending",
+                }
+                store[rid] = rec
+            evlist = rec.setdefault("evidence", [])
+            key = (ev.get("from", ""), ev.get("subject", ""))
+            evlist[:] = [e for e in evlist
+                         if (e.get("from", ""), e.get("subject", "")) != key]
+            evlist.insert(0, ev)
+            del evlist[5:]
+            enqueued.append(rid)
+        _save_rule_reviews(store)
+    return enqueued
+
+
+def dequeue_rule_review(rule_id: str, logger: logging.Logger) -> bool:
+    """Remove a rule from the pending review queue (KEEP or DROP resolves it).
+    Returns True if it was present, False otherwise (idempotent). Locked."""
+    with file_lock.locked(RULE_REVIEWS_PATH):
+        store = load_rule_reviews_store(logger)
+        if rule_id in store:
+            del store[rule_id]
+            _save_rule_reviews(store)
+            return True
+    return False
+
+
+def retire_ai_refinement(rule_id: str, logger: logging.Logger) -> bool:
+    """DROP a learned rule: flip its ai_refinement status to "retired" (never
+    delete — reversible, and the record stays for audit). Excludes it from
+    prompt injection on the NEXT sweep (signals.json is reloaded per run).
+    Mirrors apply_ai_refinement's id-keyed locked read-modify-write. Returns
+    True if a matching ACTIVE rule was retired; False if missing / already
+    inactive (idempotent — safe on replayed commands)."""
+    retired = False
+    with file_lock.locked(SIGNALS_PATH):
+        data = load_signals()
+        for r in data.get("ai_refinements", []) or []:
+            if (r.get("id") == rule_id
+                    and r.get("status", "active") == "active"):
+                r["status"] = "retired"
+                r["retired_at"] = datetime.now().isoformat()
+                retired = True
+                break
+        if retired:
+            save_signals(data)
+    if retired:
+        append_refinement_log({
+            "ts": datetime.now().isoformat(),
+            "event": "retired_by_owner",
+            "id": rule_id,
+        })
+    return retired
 
 
 def check_whitelist(from_header: str, whitelist: dict) -> str:
@@ -7391,6 +7548,31 @@ USER'S FOLLOW-UP:
                             approved_domains = approved_senders.get(
                                 "_domains_set", set())
 
+                            # item (b): each rescued FP whose junk verdict was
+                            # driven by a LEARNED (R-) rule queues that rule for
+                            # owner review on the next report. Evidence is the
+                            # rescued message itself. Best-effort — never blocks
+                            # the ack. (enqueue_rule_reviews filters to active
+                            # R- rules; S- defaults are out of scope.)
+                            review_pairs = []
+                            for n in approve_nums:
+                                entry = entries_map.get(str(n))
+                                if not isinstance(entry, dict):
+                                    continue
+                                for rid in (entry.get("rule_ids") or []):
+                                    review_pairs.append((rid, {
+                                        "from": entry.get("from", ""),
+                                        "subject": entry.get("subject", ""),
+                                        "account": account_name,
+                                    }))
+                            if review_pairs:
+                                try:
+                                    enqueue_rule_reviews(
+                                        review_pairs, signals, logger)
+                                except Exception as e:
+                                    logger.error(
+                                        f"  Rule-review enqueue failed: {e}")
+
                             send_email(config,
                                 f"Sender approval [MWR-{mwr_token}]",
                                 "\n\n".join(ack_lines),
@@ -7400,8 +7582,89 @@ USER'S FOLLOW-UP:
                                               account_processed, msg_id)
                             total_evaluated += 1
                             continue
-                        # Empty parse => not an approve reply: fall through to
-                        # normal classification below.
+                        # Not an APPROVE reply. Try a KEEP/DROP learned-rule
+                        # review command (item (b)) before falling through.
+                        review_cmd = parse_rule_review_command(reply_text)
+                        if review_cmd:
+                            verb, review_nums = review_cmd
+                            logger.info(
+                                f"  {verb} reply detected: MWR-{mwr_token} "
+                                f"items {review_nums}")
+                            # Mark \Seen so a re-tick does not re-process/re-ack.
+                            mark_uid_seen(conn, uid, logger)
+
+                            approvals_store = load_report_approvals_store(logger)
+                            token_rec = approvals_store.get(mwr_token)
+                            token_ok = isinstance(token_rec, dict)
+                            if token_ok:
+                                try:
+                                    created = datetime.fromisoformat(
+                                        token_rec.get("created", ""))
+                                    token_ok = (
+                                        datetime.now() - created
+                                        <= timedelta(
+                                            days=REPORT_APPROVAL_MAX_AGE_DAYS))
+                                except (ValueError, TypeError):
+                                    token_ok = False
+                            if not token_ok:
+                                send_email(config,
+                                    f"Rule review [MWR-{mwr_token}]",
+                                    "That report is too old for approvals. "
+                                    "Please reply to a more recent report.",
+                                    logger,
+                                    to_addr=account.get("username", ""))
+                                _record_processed(processed, account_key,
+                                                  account_processed, msg_id)
+                                total_evaluated += 1
+                                continue
+
+                            review_map = token_rec.get("rule_reviews", {}) or {}
+                            rr_store = load_rule_reviews_store(logger)
+                            ack_lines = []
+                            for n in review_nums:
+                                rid = review_map.get(str(n))
+                                if not rid:
+                                    ack_lines.append(
+                                        f"Couldn't find review item {n} in "
+                                        f"that report. No changes made.")
+                                    continue
+                                snap = rr_store.get(rid) or {}
+                                headline = snap.get("headline", "")
+                                if verb == "DROP":
+                                    if retire_ai_refinement(rid, logger):
+                                        dequeue_rule_review(rid, logger)
+                                        ack_lines.append(
+                                            f'Dropped rule {n} ("{headline}"). '
+                                            f"MailWarden will stop applying it "
+                                            f"starting with the next scan. This "
+                                            f"is reversible — reply and let us "
+                                            f"know if you want it back.")
+                                    else:
+                                        dequeue_rule_review(rid, logger)
+                                        ack_lines.append(
+                                            f"Rule {n} was already reviewed — "
+                                            f"no change.")
+                                else:  # KEEP
+                                    if dequeue_rule_review(rid, logger):
+                                        ack_lines.append(
+                                            f'Kept rule {n} ("{headline}"). '
+                                            f"No change.")
+                                    else:
+                                        ack_lines.append(
+                                            f"Rule {n} was already reviewed — "
+                                            f"no change.")
+
+                            send_email(config,
+                                f"Rule review [MWR-{mwr_token}]",
+                                "\n\n".join(ack_lines),
+                                logger,
+                                to_addr=account.get("username", ""))
+                            _record_processed(processed, account_key,
+                                              account_processed, msg_id)
+                            total_evaluated += 1
+                            continue
+                        # Empty parse => not a command: fall through to normal
+                        # classification below.
 
                     # --- Precedence check 1: Whitelist specific address ---
                     # Highest priority — nothing can override
