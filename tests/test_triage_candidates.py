@@ -485,3 +485,299 @@ def test_cli_has_no_preview_flag():
     src = (REPO / "tools" / "triage_candidates.py").read_text()
     assert "--no-preview" in src
     assert "preview=not args.no_preview" in src
+
+
+# ─── interleave / per-sender cap / graymail (defect fixes + delta) ──────────────
+
+def _cand(domain, name="X", subj="s"):
+    """A minimal candidate: List-Unsubscribe fires the heuristic regardless of
+    domain/name, so tests can freely vary From-domain and display-name."""
+    frm = f'"{name}" <x@{domain}>' if name else f"x@{domain}"
+    return (f"From: {frm}\r\nTo: me@e.com\r\nSubject: {subj}\r\n"
+            f"Message-ID: <1@{domain}>\r\n"
+            f"List-Unsubscribe: <mailto:u@{domain}>\r\n"
+            f"\r\nbody\r\n").encode()
+
+
+def test_interleave_round_robin_across_subdirs(tmp_path):
+    """Candidates are surfaced round-robin across account subdirs, not drained
+    one account at a time (the original single-sorted-rglob defect)."""
+    mod = _load()
+    h = tmp_path / "_harvest"
+    for acct in ("Commerce", "Dad", "Mom"):
+        (h / acct).mkdir(parents=True)
+        for i in range(2):
+            (h / acct / f"{acct}{i}.eml").write_bytes(_cand(f"{acct}{i}.com"))
+    order = [p.parent.name for p in mod._ordered_eml_paths(h)]
+    assert order == ["Commerce", "Dad", "Mom", "Commerce", "Dad", "Mom"]
+
+
+def test_interleave_is_deterministic(tmp_path):
+    mod = _load()
+    h = tmp_path / "_harvest"
+    for acct in ("A", "B"):
+        (h / acct).mkdir(parents=True)
+        for i in range(3):
+            (h / acct / f"f{i}.eml").write_bytes(_cand(f"{acct}{i}.com"))
+    assert mod._ordered_eml_paths(h) == mod._ordered_eml_paths(h)
+
+
+def test_stray_toplevel_eml_included_last(tmp_path):
+    """A stray .eml directly in _harvest (not in a subdir) is handled: included,
+    ordered after the subdir bucket, and still asked."""
+    mod = _load()
+    h = tmp_path / "_harvest"
+    (h / "acct").mkdir(parents=True)
+    (h / "acct" / "sub.eml").write_bytes(_cand("sub.com"))
+    (h / "stray.eml").write_bytes(_cand("stray.com"))
+    names = [p.name for p in mod._ordered_eml_paths(h)]
+    assert set(names) == {"sub.eml", "stray.eml"}
+    assert names[0] == "sub.eml"      # subdir bucket first
+    assert names[-1] == "stray.eml"   # stray bucket last
+    bench = _benchmark(tmp_path)
+    res = mod.run_triage(h, bench, prompt=lambda *_: "skip",
+                         out=lambda *_: None)
+    assert res["processed"] == 2
+
+
+def test_per_domain_cap_defers_and_never_labels(tmp_path):
+    """HARD-RULE guard: hitting the domain cap DEFERS the extras — never labels.
+    Exactly `cap` are asked/labeled; the rest stay in _harvest, unlogged."""
+    mod = _load()
+    h = tmp_path / "_harvest" / "acct"
+    h.mkdir(parents=True)
+    for i in range(5):
+        (h / f"c{i}.eml").write_bytes(_cand("blast.com", name=f"n{i}"))
+    bench = _benchmark(tmp_path)
+    res = mod.run_triage(h.parent, bench, per_domain_cap=2,
+                         prompt=lambda *_: "n", out=lambda *_: None)
+    assert res["processed"] == 2
+    assert res["deferred"] == 3
+    assert res["counts"]["n"] == 2
+    # exactly 2 labeled into spam; 3 deferred NOT labeled
+    assert len(list((bench / mod.FOLDER_SPAM).glob("*.eml"))) == 2
+    assert len(list(h.glob("*.eml"))) == 3          # 2 moved out, 3 remain
+    log_lines = (bench / mod.TRIAGE_LOG).read_text().splitlines()
+    assert len(log_lines) == 1 + 2                  # header + 2 verdicts only
+
+
+def test_no_cap_asks_all_same_domain(tmp_path):
+    """Library default (per_domain_cap=None) never caps — guards direct callers
+    (and every existing test) from a silent cap."""
+    mod = _load()
+    h = tmp_path / "_harvest" / "acct"
+    h.mkdir(parents=True)
+    for i in range(5):
+        (h / f"c{i}.eml").write_bytes(_cand("blast.com", name=f"n{i}"))
+    bench = _benchmark(tmp_path)
+    res = mod.run_triage(h.parent, bench, prompt=lambda *_: "skip",
+                         out=lambda *_: None)
+    assert res["processed"] == 5
+    assert res["deferred"] == 0
+
+
+def test_cap_composes_with_resume(tmp_path):
+    """resume-skip precedes cap counting: a prior-run label does not consume
+    this run's per-domain budget."""
+    mod = _load()
+    h = tmp_path / "_harvest" / "acct"
+    h.mkdir(parents=True)
+    for i in range(4):
+        (h / f"f{i}.eml").write_bytes(_cand("blast.com", name=f"n{i}"))
+    bench = _benchmark(tmp_path)
+    mod.append_triage_log(bench, "f0.eml", "spam", mod.FOLDER_SPAM)
+    res = mod.run_triage(h.parent, bench, resume=True, per_domain_cap=2,
+                         prompt=lambda *_: "skip", out=lambda *_: None)
+    # f0 resume-skipped; f1,f2 asked (cap=2); f3 deferred.
+    assert res["processed"] == 2
+    assert res["deferred"] == 1
+
+
+def test_cap_composes_with_limit(tmp_path):
+    """limit-break precedes cap-defer: once the sitting quota is asked we stop,
+    without inflating the deferred tally past the cutoff."""
+    mod = _load()
+    h = tmp_path / "_harvest" / "acct"
+    h.mkdir(parents=True)
+    for i in range(5):
+        (h / f"c{i}.eml").write_bytes(_cand("blast.com", name=f"n{i}"))
+    bench = _benchmark(tmp_path)
+    res = mod.run_triage(h.parent, bench, limit=1, per_domain_cap=2,
+                         prompt=lambda *_: "skip", out=lambda *_: None)
+    assert res["processed"] == 1
+    assert res["deferred"] == 0
+
+
+def test_display_name_cap_bunches_across_rotated_domains(tmp_path):
+    """DELTA: a blast that rotates the From-domain but keeps ONE display name is
+    capped by the display-name counter even though every domain is unique."""
+    mod = _load()
+    h = tmp_path / "_harvest" / "acct"
+    h.mkdir(parents=True)
+    for i in range(5):
+        (h / f"c{i}.eml").write_bytes(
+            _cand(f"rotate{i}.com", name="Jamie Raskin"))
+    bench = _benchmark(tmp_path)
+    res = mod.run_triage(h.parent, bench, per_domain_cap=2,
+                         prompt=lambda *_: "skip", out=lambda *_: None)
+    assert res["processed"] == 2      # capped by display-name, not domain
+    assert res["deferred"] == 3
+
+
+def test_empty_display_names_never_bunch(tmp_path):
+    """DELTA: bare-address senders (no display name) are never grouped — distinct
+    empty-name emails across the cap are all asked."""
+    mod = _load()
+    h = tmp_path / "_harvest" / "acct"
+    h.mkdir(parents=True)
+    for i in range(4):
+        (h / f"c{i}.eml").write_bytes(_cand(f"noname{i}.com", name=""))
+    bench = _benchmark(tmp_path)
+    res = mod.run_triage(h.parent, bench, per_domain_cap=2,
+                         prompt=lambda *_: "skip", out=lambda *_: None)
+    assert res["processed"] == 4      # distinct domains + empty names => no cap
+    assert res["deferred"] == 0
+
+
+def test_from_display_name_normalization():
+    mod = _load()
+    import email as _e
+
+    def nm(frm):
+        m = _e.message_from_bytes(f"From: {frm}\r\n\r\n".encode())
+        return mod._from_display_name(m)
+
+    assert nm('"Jamie Raskin" <a@b.com>') == "jamie raskin"
+    assert nm('Jamie   Raskin <a@b.com>') == "jamie raskin"
+    assert nm('"Jamie Raskin," <a@b.com>') == "jamie raskin"
+    assert nm('a@b.com') == ""        # bare address -> empty, never grouped
+
+
+def test_rfc2047_encodings_normalize_alike_and_bunch(tmp_path):
+    """A blast that RFC 2047-encodes the same display name differently (base64
+    vs quoted-printable vs plain ASCII) must normalize to one name and bunch
+    together under the per-name cap."""
+    mod = _load()
+    import base64
+    name = "Jamie Raskin"
+    b64 = "=?UTF-8?B?" + base64.b64encode(name.encode()).decode() + "?="
+    qp = "=?UTF-8?Q?Jamie_Raskin?="            # '_' is a QP-encoded space
+    froms = [f'{b64} <x@d0.com>', f'{qp} <x@d1.com>', f'{name} <x@d2.com>']
+    # all three decode to the same normalized name
+    import email as _e
+    names = {mod._from_display_name(_e.message_from_bytes(f"From: {f}\r\n\r\n"
+             .encode())) for f in froms}
+    assert names == {"jamie raskin"}
+    # and they bunch: 3 distinct domains, one shared name, cap 2 => 1 deferred
+    h = tmp_path / "_harvest" / "acct"
+    h.mkdir(parents=True)
+    for i, f in enumerate(froms):
+        (h / f"c{i}.eml").write_bytes(
+            (f"From: {f}\r\nTo: me@e.com\r\nSubject: s\r\n"
+             f"Message-ID: <1@d{i}.com>\r\n"
+             f"List-Unsubscribe: <mailto:u@d{i}.com>\r\n\r\nbody\r\n").encode())
+    bench = _benchmark(tmp_path)
+    res = mod.run_triage(h.parent, bench, per_domain_cap=2,
+                         prompt=lambda *_: "skip", out=lambda *_: None)
+    assert res["processed"] == 2
+    assert res["deferred"] == 1
+
+
+def test_malformed_encoded_word_does_not_crash():
+    """A malformed encoded-word must never crash the loop — it falls back to the
+    raw string path and still yields a usable normalized name."""
+    mod = _load()
+    import email as _e
+
+    def nm(frm):
+        m = _e.message_from_bytes(f"From: {frm}\r\n\r\n".encode())
+        return mod._from_display_name(m)
+
+    # truncated / bad-charset encoded-words: no exception, graceful fallback
+    assert nm('=?UTF-8?B?not-valid-base64!!!?= <a@b.com>') != None  # no crash
+    assert nm('=?bogus-charset?Q?Jamie?= <a@b.com>')  # non-empty, no crash
+    assert nm('=?UTF-8?B?QW1p <a@b.com>') != None                  # truncated
+
+
+def test_verdict_g_moves_to_graymail(tmp_path):
+    mod = _load()
+    files = _synth(tmp_path)
+    harvest = _harvest_with(tmp_path, "cand.eml",
+                            files["15-legit-authenticated-newsletter.eml"])
+    bench = _benchmark(tmp_path)
+    res = mod.run_triage(harvest, bench, prompt=lambda *_: "g",
+                         out=lambda *_: None)
+    assert res["counts"]["g"] == 1
+    assert mod.FOLDER_GRAYMAIL == "4-Graymail"
+    assert (bench / mod.FOLDER_GRAYMAIL / "cand.eml").exists()
+    assert not (harvest / "acct" / "cand.eml").exists()   # moved out
+
+
+def test_graymail_logged(tmp_path):
+    mod = _load()
+    files = _synth(tmp_path)
+    harvest = _harvest_with(tmp_path, "cand.eml",
+                            files["15-legit-authenticated-newsletter.eml"])
+    bench = _benchmark(tmp_path)
+    mod.run_triage(harvest, bench, prompt=lambda *_: "g", out=lambda *_: None)
+    rows = (bench / mod.TRIAGE_LOG).read_text().splitlines()
+    assert rows[0].startswith("filename\t")
+    data = rows[1].split("\t")
+    assert data[0] == "cand.eml"
+    assert data[1] == "graymail"
+    assert data[2] == "4-Graymail"
+
+
+def test_graymail_folder_matches_corpus_reader():
+    """The triage folder constant must equal the eval reader's graymail folder,
+    or labeled graymail would be invisible to the eval."""
+    mod = _load()
+    spec = importlib.util.spec_from_file_location(
+        "eval_corpus", REPO / "tools" / "eval_corpus.py")
+    ec = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ec)
+    assert mod.FOLDER_GRAYMAIL == ec._GRAYMAIL_FOLDER
+
+
+def test_summary_shape_has_deferred_and_graymail(tmp_path):
+    mod = _load()
+    h = tmp_path / "_harvest" / "acct"
+    h.mkdir(parents=True)
+    (h / "c0.eml").write_bytes(_cand("blast.com", name="Jamie Raskin"))
+    (h / "c1.eml").write_bytes(_cand("blast.com", name="Jamie Raskin"))
+    bench = _benchmark(tmp_path)
+    res = mod.run_triage(h.parent, bench, per_domain_cap=1,
+                         prompt=lambda *_: "g", out=lambda *_: None)
+    assert "processed" in res and "deferred" in res
+    assert "g" in res["counts"]
+    assert res["deferred"] == 1       # c1 capped (same domain AND same name)
+    assert res["counts"]["g"] == 1
+
+
+def test_guidance_and_g_hint_shown_with_prompt(tmp_path):
+    """QUESTION stays exact; the identity prompt carries the g hint and the
+    approved guidance line is shown alongside it."""
+    mod = _load()
+    files = _synth(tmp_path)
+    harvest = _harvest_with(tmp_path, "cand.eml",
+                            files["15-legit-authenticated-newsletter.eml"])
+    bench = _benchmark(tmp_path)
+    seen_prompts, seen_out = [], []
+
+    def rec(msg):
+        seen_prompts.append(msg)
+        return "skip"
+
+    mod.run_triage(harvest, bench, prompt=rec, out=seen_out.append)
+    assert mod.QUESTION == ("Is this a real company that legitimately has "
+                            "this address?")
+    id_prompt = [p for p in seen_prompts if mod.QUESTION in p][0]
+    assert "g=graymail" in id_prompt
+    assert any("relentless pitch mail" in m for m in seen_out)
+
+
+def test_cli_has_per_domain_cap_flag():
+    """--per-domain-cap exists and is wired into run_triage."""
+    src = (REPO / "tools" / "triage_candidates.py").read_text()
+    assert "--per-domain-cap" in src
+    assert "per_domain_cap=" in src

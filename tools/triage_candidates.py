@@ -26,9 +26,27 @@ The question wording is EXACTLY:
 NOT "do you want this?" — legit marketing Matt dislikes still counts as
 legitimate (the Nordstrom trap).
 
-  y  -> legit  (then n=newsletter/marketing [2-...] or p=personal [3-...])
-  n  -> spam   (1-Spam)
+  y  -> legit    (then n=newsletter/marketing [2-...] or p=personal [3-...])
+  n  -> spam     (1-Spam)
+  g  -> graymail (4-Graymail) — a real sender whose mail is unwanted/relentless
+                 pitch mail; scored SEPARATELY by the eval (junking it is never
+                 a false positive, missing it is never a recall miss)
   skip -> leave in _harvest, record nothing
+
+Candidates are surfaced INTERLEAVED across the account subdirectories (a
+deterministic round-robin over sorted subdirs, each subdir's files sorted;
+stray top-level .eml files form one extra bucket taken last), so every sitting
+mixes all accounts instead of draining one.
+
+Per-sender cap (--per-domain-cap, default 3; 0 disables): at most N candidates
+per From-domain AND per normalized From display-name are ASKED per run. Hitting
+either cap only DEFERS the extra emails — they are NOT asked, NOTHING is written
+to the log, and they are LEFT in _harvest (they reappear in a later run). A cap
+NEVER auto-applies a label; the HARD RULE (one email = one human verdict) is
+absolute. The display-name counter catches political blasts that rotate the
+From-domain to evade blocking while keeping one display name; at worst it
+over-groups a generic name like "Customer Service", which only defers those to
+a later sitting — acceptable. An empty/missing display name is never grouped.
 
 Browser preview (default ON, disable with --no-preview): each candidate is
 ALSO rendered to its own fresh temp HTML file (unique filename per candidate,
@@ -69,9 +87,24 @@ DEFAULT_BENCHMARK = Path.home() / "Desktop" / "MailWarden-Benchmark"
 FOLDER_SPAM = "1-Spam"
 FOLDER_NEWSLETTER = "2-Legitimate-Newsletters-and-Marketing"
 FOLDER_PERSONAL = "3-Legitimate-Personal"
+# Must match eval_corpus._GRAYMAIL_FOLDER exactly so the eval reader recognizes
+# this folder as the (separately-scored) graymail class.
+FOLDER_GRAYMAIL = "4-Graymail"
 TRIAGE_LOG = "_triage_log.tsv"
 
+# Max candidates ASKED per From-domain AND per normalized From display-name per
+# run; excess is DEFERRED (never labeled). 0 disables (CLI). The library/test
+# default stays None so direct run_triage callers are unaffected.
+DEFAULT_PER_DOMAIN_CAP = 3
+
 QUESTION = "Is this a real company that legitimately has this address?"
+
+# The main QUESTION is unchanged; this hint is shown alongside it. Keep it 1-2
+# lines — this is dev-only tooling — capturing Matt's approved decision rule.
+GUIDANCE = (
+    "  (y = real company, filter junking it would be an error  |  "
+    "n = deception/con, delivering it would be a failure  |  "
+    "g = real but relentless pitch mail, either verdict acceptable)")
 
 # A short English word list is enough for the "dictionary-word domain"
 # heuristic — it only needs to separate 'harborviewdental' from 'bkzvqx'. We
@@ -91,6 +124,39 @@ def _from_domain(msg):
     frm = msg.get("From", "") or ""
     m = re.search(r"[@]([A-Za-z0-9.\-]+)", frm)
     return m.group(1).lower().rstrip(".") if m else ""
+
+
+def _decode_encoded_word(s: str) -> str:
+    """Decode any RFC 2047 encoded-words (=?charset?B/Q?...?=) to plain text so
+    two differently-encoded copies of the same display name normalize alike.
+    Exception-safe: ANY decode failure (malformed encoded-word, unknown charset)
+    falls back to the raw string — a bad header must never crash the loop."""
+    try:
+        from email.header import decode_header
+        parts = []
+        for chunk, charset in decode_header(s):
+            if isinstance(chunk, bytes):
+                parts.append(chunk.decode(charset or "utf-8", "replace"))
+            else:
+                parts.append(chunk)
+        return "".join(parts)
+    except Exception:
+        return s
+
+
+def _from_display_name(msg) -> str:
+    """Normalized From display name for the per-name blast cap: RFC 2047
+    decoded, lowercased, whitespace collapsed, surrounding quotes/punctuation
+    stripped. Returns "" when there is no display name (bare address) — an empty
+    name is NEVER grouped, so distinct empty-name senders can't bunch together."""
+    from email.utils import parseaddr
+    name, _addr = parseaddr(msg.get("From", "") or "")
+    name = _decode_encoded_word(name)
+    name = re.sub(r"\s+", " ", name).strip()
+    # strip surrounding quotes/punctuation (parseaddr usually removes the outer
+    # quotes already; this also handles leading/trailing . , ; : ! ? - _ ' ").
+    name = name.strip("\"'.,;:!?-_ ").strip()
+    return name.lower()
 
 
 def _looks_dictionaryish(label: str) -> bool:
@@ -114,6 +180,7 @@ def evaluate_candidate(raw: bytes) -> dict:
 
     msg = _email_stdlib.message_from_bytes(raw)
     from_domain = _from_domain(msg)
+    from_name = _from_display_name(msg)
     reasons = []
 
     # Local DKIM: replicate _locally_verified_dkim's gate — verify locally ONLY
@@ -159,6 +226,7 @@ def evaluate_candidate(raw: bytes) -> dict:
         "is_candidate": bool(reasons),
         "reasons": reasons,
         "from_domain": from_domain,
+        "from_name": from_name,
         "subject": msg.get("Subject", "") or "",
         # For the browser-preview header bar (additive; nothing else keys on it).
         "auth": (f"SPF={auth.get('spf', 'none')}  "
@@ -391,21 +459,56 @@ def place(src: Path, benchmark_dir: Path, folder: str, copy: bool) -> Path:
     return dest
 
 
+def _ordered_eml_paths(harvest_dir: Path) -> list:
+    """Deterministic INTERLEAVED order of every .eml under ``harvest_dir``.
+
+    Round-robin across the immediate account subdirectories (taken in sorted
+    name order; each subdir's files sorted by path). Any stray .eml sitting
+    directly in ``harvest_dir`` (not in a subdir) forms one extra bucket taken
+    LAST. Same inputs -> same order, no randomness. This is what stops one
+    account (whose files happen to sort first) from draining a whole sitting."""
+    buckets = []
+    for d in sorted(p for p in harvest_dir.iterdir() if p.is_dir()):
+        files = sorted(f for f in d.rglob("*.eml") if f.is_file())
+        if files:
+            buckets.append(files)
+    stray = sorted(f for f in harvest_dir.glob("*.eml") if f.is_file())
+    if stray:
+        buckets.append(stray)
+
+    ordered = []
+    i = 0
+    while any(i < len(b) for b in buckets):
+        for b in buckets:
+            if i < len(b):
+                ordered.append(b[i])
+        i += 1
+    return ordered
+
+
 def iter_candidates(harvest_dir: Path):
-    """Yield (path, evaluation) for every harvested .eml that is a candidate."""
-    for f in sorted(harvest_dir.rglob("*.eml")):
-        if not f.is_file():
-            continue
-        raw = f.read_bytes()
-        ev = evaluate_candidate(raw)
+    """Yield (path, evaluation) for every harvested .eml that is a candidate,
+    in the deterministic interleaved order of ``_ordered_eml_paths``."""
+    for f in _ordered_eml_paths(harvest_dir):
+        ev = evaluate_candidate(f.read_bytes())
         if ev["is_candidate"]:
             yield f, ev
 
 
 def run_triage(harvest_dir: Path, benchmark_dir: Path, copy=False,
                limit=None, resume=False, prompt=input, out=print,
-               preview=False, opener=None) -> dict:
+               preview=False, opener=None, per_domain_cap=None) -> dict:
     """Interactive loop. ``prompt``, ``out`` and ``opener`` are test seams.
+
+    ``per_domain_cap`` caps how many candidates are ASKED per From-domain AND
+    per normalized From display-name in this run. Hitting EITHER cap DEFERS the
+    extra candidate — it is not asked, nothing is written to the log, and it is
+    left in _harvest to reappear next run. A cap NEVER auto-labels; deferring is
+    a non-ask, so it cannot violate the HARD RULE. The display-name counter
+    catches blasts that rotate the From-domain but keep one display name. The
+    library/test default is None (no cap) so direct callers are unaffected; the
+    CLI supplies DEFAULT_PER_DOMAIN_CAP (0 disables). The end-of-run summary
+    reports the deferred tally so deferred mail never looks like it vanished.
 
     ``preview`` additionally renders each candidate to its OWN sandboxed HTML
     file (a fresh filename per candidate, inside one temp dir — never the
@@ -423,18 +526,40 @@ def run_triage(harvest_dir: Path, benchmark_dir: Path, copy=False,
     Enforces the HARD RULE structurally: exactly one prompt per email, no path
     that applies a verdict to more than the single email in hand."""
     done = load_triage_log(benchmark_dir) if resume else set()
-    counts = {"y": 0, "n": 0, "skip": 0}
+    counts = {"y": 0, "n": 0, "g": 0, "skip": 0}
     n_processed = 0
+    deferred = 0
+    asked_per_domain = {}   # From-domain -> asks THIS run
+    asked_per_name = {}     # normalized From display-name -> asks THIS run
 
     preview_dir = None
     if preview:
         preview_dir = Path(tempfile.mkdtemp(prefix="mailwarden-triage-"))
 
     for src, ev in iter_candidates(harvest_dir):
-        if resume and src.name in done:
-            continue
+        # limit stops the sitting first — deferred items past the cutoff are
+        # "not reached", not "deferred", so we don't scan/inflate past it.
         if limit is not None and n_processed >= limit:
             break
+        # resume-skip a prior-run label BEFORE any cap counting: it is not an
+        # ask this run, so it must not consume this run's per-domain/name budget.
+        if resume and src.name in done:
+            continue
+        # Per-sender cap: defer (do NOT ask, do NOT log, LEAVE in _harvest) when
+        # either the domain or the display-name counter has reached the cap.
+        # Empty domain / empty name are never grouped.
+        dom = ev.get("from_domain") or ""
+        nm = ev.get("from_name") or ""
+        if per_domain_cap and (
+                (dom and asked_per_domain.get(dom, 0) >= per_domain_cap)
+                or (nm and asked_per_name.get(nm, 0) >= per_domain_cap)):
+            deferred += 1
+            continue
+        # ---- this candidate is being ASKED ----
+        if dom:
+            asked_per_domain[dom] = asked_per_domain.get(dom, 0) + 1
+        if nm:
+            asked_per_name[nm] = asked_per_name.get(nm, 0) + 1
         n_processed += 1
 
         raw = src.read_bytes()
@@ -450,7 +575,9 @@ def run_triage(harvest_dir: Path, benchmark_dir: Path, copy=False,
             except Exception as e:  # never let the browser break the loop
                 out(f"[browser preview unavailable ({e}); "
                     f"using the terminal view above]")
-        ans = prompt(f"{QUESTION} [y/n/skip] ").strip().lower()
+        out(GUIDANCE)
+        ans = prompt(f"{QUESTION} [y=legit / n=spam / g=graymail (real but "
+                     f"unwanted) / skip] ").strip().lower()
 
         if ans in ("y", "yes"):
             sub = prompt("Newsletter/marketing [n] or personal [p]? ").strip().lower()
@@ -464,11 +591,16 @@ def run_triage(harvest_dir: Path, benchmark_dir: Path, copy=False,
             append_triage_log(benchmark_dir, src.name, "spam", FOLDER_SPAM)
             counts["n"] += 1
             out(f"-> labeled SPAM into {FOLDER_SPAM}: {dest.name}")
+        elif ans in ("g", "gray", "graymail"):
+            dest = place(src, benchmark_dir, FOLDER_GRAYMAIL, copy)
+            append_triage_log(benchmark_dir, src.name, "graymail", FOLDER_GRAYMAIL)
+            counts["g"] += 1
+            out(f"-> labeled GRAYMAIL into {FOLDER_GRAYMAIL}: {dest.name}")
         else:
             counts["skip"] += 1
             out("-> skipped (left in _harvest)")
 
-    return {"processed": n_processed, "counts": counts}
+    return {"processed": n_processed, "counts": counts, "deferred": deferred}
 
 
 def main():
@@ -487,6 +619,12 @@ def main():
     ap.add_argument("--no-preview", action="store_true",
                     help="disable the sandboxed browser preview "
                          "(terminal text only)")
+    ap.add_argument("--per-domain-cap", type=int,
+                    default=DEFAULT_PER_DOMAIN_CAP,
+                    help=f"max candidates asked per sender domain AND per From "
+                         f"display-name per run; excess is deferred (left in "
+                         f"_harvest, not labeled). 0 disables. "
+                         f"(default: {DEFAULT_PER_DOMAIN_CAP})")
     args = ap.parse_args()
 
     harvest = Path(args.harvest)
@@ -497,10 +635,15 @@ def main():
 
     result = run_triage(harvest, Path(args.benchmark), copy=args.copy,
                         limit=args.limit, resume=args.resume,
-                        preview=not args.no_preview)
+                        preview=not args.no_preview,
+                        per_domain_cap=(args.per_domain_cap or None))
     c = result["counts"]
     print(f"\nDone. {result['processed']} candidates shown — "
-          f"legit={c['y']} spam={c['n']} skipped={c['skip']}.")
+          f"legit={c['y']} spam={c['n']} graymail={c['g']} "
+          f"skipped={c['skip']}.")
+    if result["deferred"]:
+        print(f"{result['deferred']} more were held back by the per-sender cap "
+              f"(still in _harvest — rerun to label them).")
     print("Only your labeled items entered the corpus.")
     return 0
 
