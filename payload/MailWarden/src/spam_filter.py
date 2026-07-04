@@ -6133,6 +6133,15 @@ def run_filter(force: bool = False):
                     # right before its `continue`. If a handler raises mid-way,
                     # the message is left UNSEEN and unrecorded, so the next tick
                     # retries it instead of silently dropping the command.
+                    # Also shared (finding #4, audit 2026-07-03) by every genuine
+                    # success exit in the SFID reply branch (`if sfid_match:`
+                    # below) and the MWR reply branch (`if mwr_match:`, APPROVE
+                    # and KEEP/DROP sub-cases) — those branches used to mark
+                    # \\Seen up front, before the reply was actually processed,
+                    # so a mid-handler exception left the owner's YES/NO/APPROVE/
+                    # KEEP/DROP reply \\Seen but never recorded, and the UNSEEN-
+                    # only IMAP search would never refetch it. They now call
+                    # this same closure only at their success exits.
                     def _finalize_command():
                         mark_uid_seen(conn, uid, logger)
                         _record_processed(processed, account_key,
@@ -7235,10 +7244,6 @@ Conversation ID: {sfid}
                             continue
 
                         logger.info(f"  SFID reply detected: {sfid}")
-                        # Mark the reply \\Seen so repeated filter ticks don't
-                        # reprocess the same YES/NO reply and resend the
-                        # "Refinement Applied / Rejected" confirmation email.
-                        mark_uid_seen(conn, uid, logger)
 
                         # Find conversation
                         conv = None
@@ -7255,8 +7260,7 @@ Conversation ID: {sfid}
                                 resolved_body,
                                 logger,
                                 to_addr=account.get("username", ""))
-                            _record_processed(processed, account_key,
-                                              account_processed, msg_id)
+                            _finalize_command()
                             total_evaluated += 1
                             continue
 
@@ -7270,8 +7274,7 @@ Conversation ID: {sfid}
                                 f"To revisit, forward the original email again with 'Fwd: False Positive' subject.",
                                 logger,
                                 to_addr=account.get("username", ""))
-                            _record_processed(processed, account_key,
-                                              account_processed, msg_id)
+                            _finalize_command()
                             total_evaluated += 1
                             continue
 
@@ -7320,8 +7323,7 @@ Conversation ID: {sfid}
                                 f"[{sfid}] Revised refinement — {ref.get('headline', '')[:60]}",
                                 revised_body, logger,
                                 to_addr=account.get("username", ""))
-                            _record_processed(processed, account_key,
-                                              account_processed, msg_id)
+                            _finalize_command()
                             total_evaluated += 1
                             continue
                         if conv_kind == "spam_example_proposal" and lowered.startswith("narrow:"):
@@ -7353,8 +7355,7 @@ Conversation ID: {sfid}
                                 f"[{sfid}] Revised refinement — {ref.get('headline', '')[:60]}",
                                 revised_body, logger,
                                 to_addr=account.get("username", ""))
-                            _record_processed(processed, account_key,
-                                              account_processed, msg_id)
+                            _finalize_command()
                             total_evaluated += 1
                             continue
 
@@ -7609,8 +7610,7 @@ USER'S FOLLOW-UP:
                             except Exception as e:
                                 logger.error(f"  Follow-up API call failed: {e}")
 
-                        _record_processed(processed, account_key,
-                                          account_processed, msg_id)
+                        _finalize_command()
                         total_evaluated += 1
                         continue
 
@@ -7683,9 +7683,6 @@ USER'S FOLLOW-UP:
                             logger.info(
                                 f"  APPROVE reply detected: MWR-{mwr_token} "
                                 f"items {approve_nums}")
-                            # Mark \Seen so repeated filter ticks don't
-                            # reprocess the same reply and resend the ack.
-                            mark_uid_seen(conn, uid, logger)
 
                             approvals_store = load_report_approvals_store(logger)
                             token_rec = approvals_store.get(mwr_token)
@@ -7708,8 +7705,7 @@ USER'S FOLLOW-UP:
                                     "Please reply to a more recent report.",
                                     logger,
                                     to_addr=account.get("username", ""))
-                                _record_processed(processed, account_key,
-                                                  account_processed, msg_id)
+                                _finalize_command()
                                 total_evaluated += 1
                                 continue
 
@@ -7786,8 +7782,7 @@ USER'S FOLLOW-UP:
                                 "\n\n".join(ack_lines),
                                 logger,
                                 to_addr=account.get("username", ""))
-                            _record_processed(processed, account_key,
-                                              account_processed, msg_id)
+                            _finalize_command()
                             total_evaluated += 1
                             continue
                         # Not an APPROVE reply. Try a KEEP/DROP learned-rule
@@ -7798,8 +7793,6 @@ USER'S FOLLOW-UP:
                             logger.info(
                                 f"  {verb} reply detected: MWR-{mwr_token} "
                                 f"items {review_nums}")
-                            # Mark \Seen so a re-tick does not re-process/re-ack.
-                            mark_uid_seen(conn, uid, logger)
 
                             approvals_store = load_report_approvals_store(logger)
                             token_rec = approvals_store.get(mwr_token)
@@ -7821,8 +7814,7 @@ USER'S FOLLOW-UP:
                                     "Please reply to a more recent report.",
                                     logger,
                                     to_addr=account.get("username", ""))
-                                _record_processed(processed, account_key,
-                                                  account_processed, msg_id)
+                                _finalize_command()
                                 total_evaluated += 1
                                 continue
 
@@ -7867,8 +7859,7 @@ USER'S FOLLOW-UP:
                                 "\n\n".join(ack_lines),
                                 logger,
                                 to_addr=account.get("username", ""))
-                            _record_processed(processed, account_key,
-                                              account_processed, msg_id)
+                            _finalize_command()
                             total_evaluated += 1
                             continue
                         # Empty parse => not a command: fall through to normal
