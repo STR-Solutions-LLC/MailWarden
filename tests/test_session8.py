@@ -282,3 +282,49 @@ def test_qualified_yes_history_recorded_once():
         f"{conv['conversation_history']}"
     )
     assert conv["conversation_history"][0]["role"] == "user_reply"
+
+
+# ── Self-loop fix: learner proposal email must be recognizable as own mail ──
+
+def test_learner_proposal_prefix_in_own_prefixes():
+    """The learner's proposal email opening line must appear verbatim in
+    _own_prefixes so the filter does not misread its own proposal as a reply.
+    Pins the exact static text — fails loudly if the wording changes without
+    _own_prefixes being updated to match."""
+    src = inspect.getsource(spam_filter.run_filter)
+    assert (
+        "MailWarden analyzed the spam example you submitted and proposes a "
+        "new refinement to add to the filter."
+    ) in src, (
+        "Learner proposal-email opening line not in _own_prefixes — self-loop risk"
+    )
+
+
+def test_learner_send_stamps_system_header():
+    """learn_signals._send must stamp X-MailWarden-System: 1 on the message it
+    sends, so the main loop's generic self-loop guard skips MailWarden's own
+    proposal email before any command parsing runs."""
+    import learn_signals
+
+    captured = {}
+
+    class _FakeServer:
+        def sendmail(self, from_addr, to_addrs, msg_string):
+            captured["msg_string"] = msg_string
+
+        def quit(self):
+            pass
+
+    with patch("utils.smtp_login", return_value=_FakeServer()):
+        ok = learn_signals._send(
+            {"smtp": {"host": "smtp.example.com", "from_address": "bot@example.com"}},
+            "owner@example.com",
+            "[SFID-x] Proposed refinement — test",
+            "body text",
+            MagicMock(),
+        )
+
+    assert ok is True
+    import email as _email
+    sent = _email.message_from_string(captured["msg_string"])
+    assert sent["X-MailWarden-System"] == "1"

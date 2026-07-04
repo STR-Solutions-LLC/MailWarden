@@ -1204,6 +1204,7 @@ def _send(config: dict, to_addr: str, subject: str, body: str,
         m["From"] = smtp_config.get("from_address",
                                      smtp_config.get("username", ""))
         m["To"] = to_addr
+        m["X-MailWarden-System"] = "1"
         if to_addr:
             # Ensure the owner's reply returns to the same mailbox this email
             # was sent to (which is polled), not back to the SMTP From address.

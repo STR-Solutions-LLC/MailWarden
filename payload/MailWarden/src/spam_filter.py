@@ -7181,7 +7181,7 @@ Conversation ID: {sfid}
                             "Your false positive has been analyzed",
                             "The proposed signal change has been applied",
                             "Understood. Signals remain unchanged",
-                            "MailWarden analyzed your forwarded spam example",
+                            "MailWarden analyzed the spam example you submitted and proposes a new refinement to add to the filter.",
                             "The refinement has been applied",
                             "The refinement proposal has been rejected",
                             "Your reply looks like it may include a condition:",
