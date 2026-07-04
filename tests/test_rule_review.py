@@ -48,11 +48,18 @@ def test_parse_approve_parity_after_refactor(text, expected):
     assert spam_filter.parse_approve_command(text) == expected
 
 
-@pytest.mark.parametrize("verb", ["approve", "keep", "drop"])
+@pytest.mark.parametrize("verb", ["approve", "keep", "drop", "restore"])
 def test_shared_number_parser_forms(verb):
     assert spam_filter._parse_command_numbers(f"{verb} 2,4", verb) == [2, 4]
     assert spam_filter._parse_command_numbers(f"{verb} 2-4", verb) == [2, 3, 4]
     assert spam_filter._parse_command_numbers("something else", verb) == []
+
+
+def test_restore_does_not_collide_with_drop():
+    # "RESTORE 1" must NOT parse as a DROP (the anchored "drop" verb only
+    # matches a line that STARTS with "drop").
+    assert spam_filter._parse_command_numbers("RESTORE 1", "drop") == []
+    assert spam_filter._parse_command_numbers("RESTORE 1", "restore") == [1]
 
 
 @pytest.mark.parametrize("text,expected", [
@@ -61,6 +68,10 @@ def test_shared_number_parser_forms(verb):
     ("KEEP 1", ("KEEP", [1])),
     ("keep 4-6", ("KEEP", [4, 5, 6])),
     ("DROP 2\nKEEP 3", ("DROP", [2])),        # drop wins when both present
+    ("RESTORE 1", ("RESTORE", [1])),
+    ("restore 2,3", ("RESTORE", [2, 3])),
+    ("restore 4-6", ("RESTORE", [4, 5, 6])),
+    ("RESTORE 1\nDROP 2", ("RESTORE", [1])),  # restore checked first
     ("thanks!", None),
     ("", None),
 ])
@@ -137,6 +148,51 @@ def test_retire_idempotent_on_already_retired(signals_path):
 def test_retire_missing_rule_returns_false(signals_path):
     _write_signals(signals_path, _signals_with_rule())
     assert spam_filter.retire_ai_refinement("R-nope", _LOGGER) is False
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 2b. unretire_ai_refinement (finding #10) — reverse the DROP (status flip back)
+# ═════════════════════════════════════════════════════════════════════════
+
+def test_unretire_flips_retired_back_to_active(signals_path):
+    # Full round-trip: drop (retire) then restore (unretire). The record was
+    # never deleted, so restore is a pure status flip on intact data.
+    _write_signals(signals_path, _signals_with_rule())
+    spam_filter.retire_ai_refinement("R-20260703-aaaa", _LOGGER)  # sets retired_at
+    restored = spam_filter.unretire_ai_refinement("R-20260703-aaaa", _LOGGER)
+    assert restored is not None
+    assert restored["headline"] == "Urgent fundraising"      # data intact
+    data = json.loads(signals_path.read_text())
+    ref = data["ai_refinements"][0]
+    assert ref["status"] == "active"
+    assert "retired_at" not in ref                            # cleared on restore
+    assert "last_reinforced" in ref
+    assert ref["headline"] == "Urgent fundraising"            # nothing reconstructed
+
+
+def test_unretire_reactivates_rule_for_prompt_injection(signals_path):
+    _write_signals(signals_path, _signals_with_rule())
+    spam_filter.retire_ai_refinement("R-20260703-aaaa", _LOGGER)
+    # Gone from the prompt after DROP...
+    assert "R-20260703-aaaa" not in spam_filter.injected_rule_ids(
+        spam_filter.load_signals())
+    spam_filter.unretire_ai_refinement("R-20260703-aaaa", _LOGGER)
+    # ...back in the prompt after RESTORE (fires again next sweep).
+    assert "R-20260703-aaaa" in spam_filter.injected_rule_ids(
+        spam_filter.load_signals())
+
+
+def test_unretire_idempotent_on_active_rule(signals_path):
+    # RESTORE on a rule that was never dropped => honest no-op (returns None).
+    _write_signals(signals_path, _signals_with_rule())          # status active
+    assert spam_filter.unretire_ai_refinement("R-20260703-aaaa", _LOGGER) is None
+    assert (json.loads(signals_path.read_text())
+            ["ai_refinements"][0]["status"] == "active")        # unchanged
+
+
+def test_unretire_missing_rule_returns_none(signals_path):
+    _write_signals(signals_path, _signals_with_rule())
+    assert spam_filter.unretire_ai_refinement("R-nope", _LOGGER) is None
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -310,9 +366,9 @@ def _token_store(token="abc123", rule_reviews=None, entries=None):
 
 def _rr_harness(monkeypatch, *, msg_data, dry_run=False, sender_is_owner=True,
                 auth_ok=True, approvals_store=None, retire_returns=True,
-                dequeue_returns=True):
+                dequeue_returns=True, unretire_returns=None):
     calls = {"send_email": [], "mark_uid_seen": 0, "classify_email": 0,
-             "retire": [], "dequeue": [], "enqueue": []}
+             "retire": [], "dequeue": [], "enqueue": [], "unretire": []}
     cfg = {
         "filter": {"dry_run": dry_run, "confidence_threshold": 0.85,
                    "max_emails_per_run": 50, "log_level": "INFO"},
@@ -385,6 +441,11 @@ def _rr_harness(monkeypatch, *, msg_data, dry_run=False, sender_is_owner=True,
         calls["dequeue"].append(rid)
         return dequeue_returns
     monkeypatch.setattr(spam_filter, "dequeue_rule_review", _dequeue)
+
+    def _unretire(rid, logger):
+        calls["unretire"].append(rid)
+        return unretire_returns
+    monkeypatch.setattr(spam_filter, "unretire_ai_refinement", _unretire)
 
     def _enqueue(pairs, signals, logger):
         calls["enqueue"].append(list(pairs))
@@ -507,6 +568,84 @@ def test_approve_rescue_no_rule_ids_no_enqueue(monkeypatch):
 
 
 # ═════════════════════════════════════════════════════════════════════════
+# 5b. run_filter RESTORE reply branch (finding #10) — reverse a DROP by email
+# ═════════════════════════════════════════════════════════════════════════
+
+def test_restore_reactivates_dropped_rule(monkeypatch):
+    # Owner replies RESTORE 1 to the DROP ack (same [MWR-] token). The rule is
+    # un-retired and acked; mark-seen only on success; no classification.
+    calls = _rr_harness(
+        monkeypatch, msg_data=_mwr_msg(body="RESTORE 1"),
+        approvals_store=_token_store(),
+        unretire_returns={"headline": "Urgent fundraising"})
+    assert calls["unretire"] == ["R-20260703-aaaa"]
+    assert calls["retire"] == []
+    assert calls["mark_uid_seen"] == 1
+    assert calls["classify_email"] == 0
+    subject, body, to_addr = calls["send_email"][0]
+    assert body == ('Restored rule 1 ("Urgent fundraising"). MailWarden will '
+                    "use it again starting with the next scan.")
+
+
+def test_restore_on_not_dropped_rule_is_honest_noop(monkeypatch):
+    # unretire returns None (rule active / already restored) => no-op ack.
+    calls = _rr_harness(
+        monkeypatch, msg_data=_mwr_msg(body="RESTORE 1"),
+        approvals_store=_token_store(),
+        unretire_returns=None)
+    assert calls["unretire"] == ["R-20260703-aaaa"]
+    subject, body, to_addr = calls["send_email"][0]
+    assert body == "Rule 1 isn't currently dropped — no change."
+
+
+def test_restore_invalid_number_ack(monkeypatch):
+    calls = _rr_harness(monkeypatch, msg_data=_mwr_msg(body="RESTORE 9"),
+                        approvals_store=_token_store())
+    assert calls["unretire"] == []          # never reached for an unknown number
+    subject, body, to_addr = calls["send_email"][0]
+    assert body == ("Couldn't find review item 9 in that report. "
+                    "No changes made.")
+
+
+def test_restore_rejected_from_non_owner(monkeypatch):
+    # A RESTORE from a non-owner is treated as ordinary mail (same gate as
+    # APPROVE/DROP): no un-retire, no rule-review ack.
+    calls = _rr_harness(monkeypatch, msg_data=_mwr_msg(body="RESTORE 1"),
+                        approvals_store=_token_store(),
+                        sender_is_owner=False,
+                        unretire_returns={"headline": "Urgent fundraising"})
+    assert calls["unretire"] == []
+    assert calls["send_email"] == []
+    assert calls["classify_email"] == 1     # fell through to classification
+
+
+def test_dry_run_defers_restore(monkeypatch):
+    # RESTORE writes signals.json (a real side effect); Dry Run defers it just
+    # like DROP — left UNSEEN, honored on the first real run.
+    calls = _rr_harness(monkeypatch, msg_data=_mwr_msg(body="RESTORE 1"),
+                        dry_run=True, approvals_store=_token_store(),
+                        unretire_returns={"headline": "Urgent fundraising"})
+    assert calls["unretire"] == []
+    assert calls["send_email"] == []
+    assert calls["mark_uid_seen"] == 0
+
+
+def test_drop_ack_copy_no_longer_promises_reversibility(monkeypatch):
+    # Finding #10 regression: the DROP ack must NOT claim an unbounded reversal
+    # ("reversible" / "want it back") and MUST name the real RESTORE command.
+    calls = _rr_harness(monkeypatch, msg_data=_mwr_msg(body="DROP 1"),
+                        approvals_store=_token_store())
+    subject, body, to_addr = calls["send_email"][0]
+    assert "reversible" not in body
+    assert "want it back" not in body
+    assert "RESTORE 1" in body
+    assert body == ('Dropped rule 1 ("Urgent fundraising"). MailWarden will '
+                    "stop applying it starting with the next scan. Changed "
+                    "your mind? Reply RESTORE 1 to this email to turn it "
+                    "back on.")
+
+
+# ═════════════════════════════════════════════════════════════════════════
 # 6. HERMETICITY — classify prompt is byte-identical regardless of this feature
 # ═════════════════════════════════════════════════════════════════════════
 
@@ -534,3 +673,24 @@ def test_classify_prompt_unaffected_by_retire_of_unrelated_rule(signals_path):
     spam_filter.retire_ai_refinement("R-drop-me", _LOGGER)
     got = spam_filter.build_classifier_prompt(spam_filter.load_signals())
     assert got == expected
+
+
+def test_classify_prompt_byte_identical_after_retire_then_unretire(signals_path):
+    # RESTORE is a pure status flip: dropping then restoring a rule must return
+    # the classifier prompt to byte-for-byte its pre-drop form (unretire adds
+    # last_reinforced / clears retired_at, neither of which the prompt renders).
+    data = {"signals": {}, "ai_refinements": [
+        {"id": "R-keep-me", "headline": "Keep", "rationale": "r1",
+         "confidence": "high", "what_this_doesnt_cover": "",
+         "verdict": "spam", "status": "active"},
+        {"id": "R-round-trip", "headline": "Round", "rationale": "r2",
+         "confidence": "low", "what_this_doesnt_cover": "",
+         "verdict": "spam", "status": "active"},
+    ]}
+    _write_signals(signals_path, data)
+    baseline = spam_filter.build_classifier_prompt(spam_filter.load_signals())
+
+    spam_filter.retire_ai_refinement("R-round-trip", _LOGGER)
+    spam_filter.unretire_ai_refinement("R-round-trip", _LOGGER)
+    got = spam_filter.build_classifier_prompt(spam_filter.load_signals())
+    assert got == baseline

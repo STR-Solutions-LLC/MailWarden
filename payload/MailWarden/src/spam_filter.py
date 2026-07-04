@@ -512,11 +512,17 @@ def parse_approve_command(reply_text: str) -> list:
 
 
 def parse_rule_review_command(reply_text: str):
-    """Parse an owner's KEEP/DROP reply to a daily report's LEARNED-RULE REVIEW
-    section ([MWR-...] subject). Returns ``(verb, [ints])`` with verb "DROP" or
-    "KEEP", or ``None`` when the reply is neither. One verb per reply (v1): DROP
-    wins if both appear, mirroring the single-verb APPROVE model.
+    """Parse an owner's RESTORE/KEEP/DROP reply to a daily report's LEARNED-RULE
+    REVIEW section ([MWR-...] subject), or a RESTORE reply to a DROP ack (same
+    [MWR-...] token). Returns ``(verb, [ints])`` with verb "RESTORE", "DROP", or
+    "KEEP", or ``None`` when the reply is none of them. One verb per reply (v1):
+    RESTORE is checked first, then DROP wins over KEEP if both appear, mirroring
+    the single-verb APPROVE model. The verbs share distinct line-start anchors
+    (``restore`` cannot collide with ``drop``/``keep``), so the order is safe.
     """
+    restore = _parse_command_numbers(reply_text, "restore")
+    if restore:
+        return ("RESTORE", restore)
     drop = _parse_command_numbers(reply_text, "drop")
     if drop:
         return ("DROP", drop)
@@ -649,6 +655,34 @@ def retire_ai_refinement(rule_id: str, logger: logging.Logger) -> bool:
             "id": rule_id,
         })
     return retired
+
+
+def unretire_ai_refinement(rule_id: str, logger: logging.Logger) -> dict:
+    """RESTORE a dropped rule: flip its ai_refinement status from "retired"
+    back to "active" (the reverse of retire_ai_refinement). The retired record
+    was never deleted, so this is a pure status flip — the rule fires again on
+    the NEXT sweep (signals.json is reloaded per run). Returns the reactivated
+    refinement dict on success, or None if no matching RETIRED rule was found
+    (missing OR already active — idempotent, safe on replayed commands)."""
+    restored = None
+    with file_lock.locked(SIGNALS_PATH):
+        data = load_signals()
+        for r in data.get("ai_refinements", []) or []:
+            if r.get("id") == rule_id and r.get("status") == "retired":
+                r["status"] = "active"
+                r.pop("retired_at", None)
+                r["last_reinforced"] = datetime.now().isoformat()
+                restored = r
+                break
+        if restored is not None:
+            save_signals(data)
+    if restored is not None:
+        append_refinement_log({
+            "ts": datetime.now().isoformat(),
+            "event": "restored_by_owner",
+            "id": rule_id,
+        })
+    return restored
 
 
 def check_whitelist(from_header: str, whitelist: dict) -> str:
@@ -8095,14 +8129,29 @@ USER'S FOLLOW-UP:
                                         ack_lines.append(
                                             f'Dropped rule {n} ("{headline}"). '
                                             f"MailWarden will stop applying it "
-                                            f"starting with the next scan. This "
-                                            f"is reversible — reply and let us "
-                                            f"know if you want it back.")
+                                            f"starting with the next scan. "
+                                            f"Changed your mind? Reply "
+                                            f"RESTORE {n} to this email to "
+                                            f"turn it back on.")
                                     else:
                                         dequeue_rule_review(rid, logger)
                                         ack_lines.append(
                                             f"Rule {n} was already reviewed — "
                                             f"no change.")
+                                elif verb == "RESTORE":
+                                    restored = unretire_ai_refinement(
+                                        rid, logger)
+                                    if restored is not None:
+                                        rhead = (restored.get("headline", "")
+                                                 or headline)
+                                        ack_lines.append(
+                                            f'Restored rule {n} ("{rhead}"). '
+                                            f"MailWarden will use it again "
+                                            f"starting with the next scan.")
+                                    else:
+                                        ack_lines.append(
+                                            f"Rule {n} isn't currently "
+                                            f"dropped — no change.")
                                 else:  # KEEP
                                     if dequeue_rule_review(rid, logger):
                                         ack_lines.append(
