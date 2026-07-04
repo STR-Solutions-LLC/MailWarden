@@ -589,3 +589,82 @@ def test_e_keepers_retained():
     for name in ("load_blacklist", "save_blacklist",
                  "count_blacklisted_blocked_24h"):
         assert hasattr(daily_report, name), f"{name} must remain"
+
+
+# ===========================================================================
+# F) Finding #12 — legacy duplicate suppression in parse_decisions_24h.
+#    The pre-fix dry-run filter re-logged the same UNSEEN spam every tick;
+#    exact repeats (same MESSAGE-ID, same dry/real kind) must collapse to ONE
+#    numbered entry / ONE counter contribution, while a dry-run preview and a
+#    later real MOVED record for the same message (the normal Dry Run -> real
+#    transition) must BOTH remain visible. Records without exactly one
+#    MESSAGE-ID line are non-dedupable (counted exactly as before).
+# ===========================================================================
+
+def _ai_spam_entry(ts, msg_id, acct="A", addr="s@bad.com", subject="buy",
+                   dry=True):
+    action = ("[DRY RUN - would move to Junk]" if dry else "MOVED to Junk")
+    return (f"[{ts}] ACCOUNT: {acct}\n"
+            f"  MESSAGE-ID: {msg_id}\n"
+            f"  FROM: Seller <{addr}>\n"
+            f"  SUBJECT: {subject}\n"
+            f"  DECISION: SPAM (confidence: 0.95)\n"
+            f"  SIGNALS HIT: s1\n"
+            f"  ACTION: {action}")
+
+
+def test_f_duplicate_dry_run_records_collapse_to_one(monkeypatch, tmp_path,
+                                                     window):
+    start, end = window
+    ts = (start + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    _put_decisions(monkeypatch, tmp_path, _decisions_log(
+        *[_ai_spam_entry(ts, "<loop@x>", dry=True) for _ in range(5)]))
+
+    result = daily_report.parse_decisions_24h(start, end)
+    assert len(result["spam_entries"]) == 1, (
+        "5 exact repeats -> ONE numbered entry (one APPROVE token)")
+    assert result["spam_dry_run"] == 1, "counter must match the list"
+    assert result["evaluated"] == 1
+    assert result["per_account"]["A"]["spam_dry_run"] == 1
+    assert result["per_account"]["A"]["evaluated"] == 1
+
+
+def test_f_distinct_messages_not_collapsed(monkeypatch, tmp_path, window):
+    start, end = window
+    ts = (start + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    _put_decisions(monkeypatch, tmp_path, _decisions_log(
+        _ai_spam_entry(ts, "<m1@x>", subject="one", dry=True),
+        _ai_spam_entry(ts, "<m2@x>", subject="two", dry=True)))
+
+    result = daily_report.parse_decisions_24h(start, end)
+    assert len(result["spam_entries"]) == 2
+    assert result["spam_dry_run"] == 2
+
+
+def test_f_dry_then_real_transition_keeps_both(monkeypatch, tmp_path, window):
+    # Dry Run preview record + the later real MOVED record for the SAME
+    # message: kind is part of the dedup key, so both stay visible.
+    start, end = window
+    t1 = (start + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    t2 = (start + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
+    _put_decisions(monkeypatch, tmp_path, _decisions_log(
+        _ai_spam_entry(t1, "<trans@x>", dry=True),
+        _ai_spam_entry(t2, "<trans@x>", dry=False)))
+
+    result = daily_report.parse_decisions_24h(start, end)
+    assert result["spam_dry_run"] == 1
+    assert result["spam_moved"] == 1
+    assert len(result["spam_entries"]) == 2
+
+
+def test_f_no_message_id_is_non_dedupable(monkeypatch, tmp_path, window):
+    # Exactly-one discipline: the legacy fixture records (no MESSAGE-ID line)
+    # keep counting individually, exactly as before the fix.
+    start, end = window
+    ts = (start + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    _put_decisions(monkeypatch, tmp_path, _decisions_log(
+        _spam_entry(ts), _spam_entry(ts), _spam_entry(ts)))
+
+    result = daily_report.parse_decisions_24h(start, end)
+    assert result["spam_moved"] == 3
+    assert len(result["spam_entries"]) == 3

@@ -170,17 +170,23 @@ def test_index_garbage_log_is_empty(monkeypatch, tmp_path):
 # --------------------------------------------------------------------------
 
 def test_index_unparseable_timestamp_counts_but_no_date(monkeypatch, tmp_path):
-    bad = (
-        "[NOT-A-TIMESTAMP] ACCOUNT: A\n"
-        "  MESSAGE-ID: <x@x>\n"
-        "  FROM: S <n@good.com>\n"
-        "  SUBJECT: hi\n"
-        "  DECISION: NOT_SPAM (confidence: 0.10)\n"
-        "  SIGNALS HIT: \n"
-        "  ACTION: No action taken\n"
-        "  ---\n"
-    )
-    records = [bad] * 3
+    # Finding #12 fixture note: these must be three DISTINCT messages (the
+    # original `[bad] * 3` byte-identical repeats are now — correctly —
+    # deduplicated to one). The intent under test is unchanged: an
+    # unparseable timestamp still counts toward delivered, but never
+    # contributes a first/last date.
+    def _bad(i):
+        return (
+            "[NOT-A-TIMESTAMP] ACCOUNT: A\n"
+            f"  MESSAGE-ID: <x{i}@x>\n"
+            "  FROM: S <n@good.com>\n"
+            f"  SUBJECT: hi{i}\n"
+            "  DECISION: NOT_SPAM (confidence: 0.10)\n"
+            "  SIGNALS HIT: \n"
+            "  ACTION: No action taken\n"
+            "  ---\n"
+        )
+    records = [_bad(i) for i in range(3)]
     _write_log(monkeypatch, tmp_path, records)
 
     idx = spam_filter.build_sender_history_index()
@@ -413,3 +419,62 @@ def test_offline_path_never_reads_decisions_log(monkeypatch, tmp_path):
     # even though a rich decisions.log sits on disk.
     assert "msg" in captured
     assert "SENDER HISTORY" not in captured["msg"]
+
+
+# --------------------------------------------------------------------------
+# Test 12 — Finding #12 legacy dedup: identical (domain, message-id, verdict)
+#           records count ONCE. The pre-fix dry-run filter re-logged the same
+#           UNSEEN spam every tick; those exact repeats must not inflate the
+#           junked tally (which can permanently suppress a domain's SENDER
+#           HISTORY line via the delivered >= junked gate).
+# --------------------------------------------------------------------------
+
+def test_duplicate_spam_records_count_once(monkeypatch, tmp_path):
+    # 5 identical repeats of ONE dry-run-looped spam (same subject => same
+    # MESSAGE-ID in the _record helper) + 1 genuinely distinct spam from the
+    # same domain.
+    records = [
+        _record(_ts(5), "A", "Pharma", "x@spam.example", "same-msg", "SPAM",
+                conf=0.95, action="[DRY RUN - would move to Junk]")
+        for _ in range(5)
+    ] + [
+        _record(_ts(4), "A", "Pharma", "x@spam.example", "other-msg", "SPAM",
+                conf=0.95, action="[DRY RUN - would move to Junk]"),
+    ]
+    _write_log(monkeypatch, tmp_path, records)
+
+    idx = spam_filter.build_sender_history_index()
+    assert idx["spam.example"]["junked"] == 2, (
+        "5 exact repeats + 1 distinct message = 2 junked, not 6")
+
+
+def test_distinct_messages_still_count_individually(monkeypatch, tmp_path):
+    # Two DIFFERENT delivered messages from one domain: no over-collapse.
+    records = [
+        _record(_ts(6), "A", "Acme", "a@acme.example", "note-1", "NOT_SPAM"),
+        _record(_ts(5), "A", "Acme", "a@acme.example", "note-2", "NOT_SPAM"),
+    ]
+    _write_log(monkeypatch, tmp_path, records)
+
+    idx = spam_filter.build_sender_history_index()
+    assert idx["acme.example"]["delivered"] == 2
+
+
+def test_ambiguous_message_id_is_non_dedupable(monkeypatch, tmp_path):
+    # Exactly-one discipline (mirrors the DECISION/FROM ambiguity guard):
+    # records with ZERO MESSAGE-ID lines are non-dedupable and count exactly
+    # as before, even when otherwise identical.
+    no_mid = (
+        f"[{_ts(3)}] ACCOUNT: A\n"
+        f"  FROM: Pharma <x@spam.example>\n"
+        f"  SUBJECT: same-msg\n"
+        f"  DECISION: SPAM (confidence: 0.95)\n"
+        f"  SIGNALS HIT: \n"
+        f"  ACTION: [DRY RUN - would move to Junk]\n"
+        f"  ---\n"
+    )
+    _write_log(monkeypatch, tmp_path, [no_mid, no_mid, no_mid])
+
+    idx = spam_filter.build_sender_history_index()
+    assert idx["spam.example"]["junked"] == 3, (
+        "no MESSAGE-ID line -> never dedup -> counted as before")

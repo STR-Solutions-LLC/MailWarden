@@ -43,6 +43,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 EULA_PATH = PROJECT_ROOT / "EULA.md"
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
 PROCESSED_IDS_PATH = PROJECT_ROOT / "memory" / "processed_ids.json"
+# Finding #12: dry-run sidecar ledger of messages already classified while Dry
+# Run is on (SPAM / below-threshold-spam verdicts, which are deliberately NOT
+# recorded in processed_ids). Consulted ONLY when dry_run is True, so the first
+# real run still classifies and actions each message once.
+DRY_RUN_VERDICTS_PATH = PROJECT_ROOT / "memory" / "dry_run_verdicts.json"
 LAST_FILTER_RUN_PATH = PROJECT_ROOT / "memory" / "last_filter_run.json"
 SIGNALS_PATH = PROJECT_ROOT / "memory" / "signals.json"
 WHITELIST_PATH = PROJECT_ROOT / "memory" / "whitelist.json"
@@ -173,6 +178,56 @@ def save_processed_ids(data: dict):
         with os.fdopen(fd, "w") as f:
             json.dump(data, f, indent=2)
         os.replace(tmp_path, PROCESSED_IDS_PATH)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+def load_dry_run_verdicts() -> dict:
+    """Finding #12: load the dry-run classified-message sidecar
+    (memory/dry_run_verdicts.json). Structure and behavior mirror
+    load_processed_ids exactly: same {"version","last_updated","ids"} shape,
+    same safe default on a missing/malformed file, same legacy
+    list-of-strings migration, same 30-day prune-on-load. Entries are
+    [msg_id, iso_timestamp] pairs per account — msg_ids only, never verdicts:
+    the first real run after Dry Run turns off deliberately re-classifies
+    each message fresh (once) so current rules are honored."""
+    try:
+        with open(DRY_RUN_VERDICTS_PATH, "r") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {"version": "1.0", "last_updated": "", "ids": {}}
+
+    cutoff = datetime.now().isoformat()
+    thirty_days_ago = (datetime.now() - timedelta(days=30)).isoformat()
+
+    for account_name in list(data.get("ids", {}).keys()):
+        entries = data["ids"][account_name]
+        if not entries:
+            continue
+        # Old format: list of plain string IDs — convert to [id, timestamp]
+        if isinstance(entries[0], str):
+            data["ids"][account_name] = [[mid, cutoff] for mid in entries]
+        else:
+            # Prune entries older than 30 days
+            data["ids"][account_name] = [
+                e for e in entries if e[1] >= thirty_days_ago
+            ]
+
+    return data
+
+
+def save_dry_run_verdicts(data: dict):
+    """Atomic write (mkstemp + os.replace), mirrors save_processed_ids."""
+    data["last_updated"] = datetime.now().isoformat()
+    fd, tmp_path = tempfile.mkstemp(
+        dir=DRY_RUN_VERDICTS_PATH.parent, suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, DRY_RUN_VERDICTS_PATH)
     except Exception:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -1192,6 +1247,17 @@ def persist_progress(processed: dict, token_usage: dict, token_delta: dict):
     with file_lock.locked(PROCESSED_IDS_PATH):
         save_processed_ids(processed)
     persist_token_delta(token_usage, token_delta)
+
+
+def persist_dry_run_verdicts(dry_verdicts: dict):
+    """Flush the finding-#12 dry-run sidecar. A BLIND save under lock is
+    correct for the same reasons persist_progress documents for
+    processed_ids: spam_filter is the ONLY writer of dry_run_verdicts.json in
+    the whole codebase, the run-flock guarantees a single filter instance, and
+    the in-memory dict only grows within a run. Called only when dry_run is
+    True — a real run never loads or writes the sidecar."""
+    with file_lock.locked(DRY_RUN_VERDICTS_PATH):
+        save_dry_run_verdicts(dry_verdicts)
 
 
 def _record_processed(processed: dict, account_name: str,
@@ -3945,6 +4011,18 @@ def build_sender_history_index() -> dict:
     ts_re = re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]')
     from_re = re.compile(r'^\s*FROM: (.+)', re.MULTILINE)
     decision_re = re.compile(r'^\s*DECISION: (\w+)', re.MULTILINE)
+    msg_id_re = re.compile(r'^\s*MESSAGE-ID: (.+)', re.MULTILINE)
+
+    # Finding #12: exact-duplicate suppression. The pre-fix dry-run code
+    # re-classified (and re-logged) the same UNSEEN spam every tick, so legacy
+    # decisions.log files on existing installs carry many identical records
+    # that inflate the junked tally and can permanently suppress a domain's
+    # SENDER HISTORY line (delivered < junked gate). Count each
+    # (domain, message-id, verdict) triple ONCE. Same exactly-one discipline
+    # as the DECISION/FROM ambiguity guard below: a record with zero or more
+    # than one MESSAGE-ID line is NON-DEDUPABLE and counts exactly as before —
+    # never dedup on an ambiguous record.
+    counted: set = set()
 
     for record in content.split("  ---\n"):
         if not record.strip():
@@ -3974,6 +4052,14 @@ def build_sender_history_index() -> dict:
         domain = _domain_from_log_from(froms[0].strip())
         if not domain:
             continue
+
+        # Finding #12 dedup (see `counted` above). Exactly-one or no dedup.
+        msg_ids = msg_id_re.findall(record)
+        if len(msg_ids) == 1:
+            key = (domain, msg_ids[0].strip(), verdict)
+            if key in counted:
+                continue
+            counted.add(key)
 
         rec = index.get(domain)
         if rec is None:
@@ -5936,6 +6022,11 @@ def run_filter(force: bool = False):
     deliver_eula_if_needed(config, logger)
 
     processed = load_processed_ids()
+    # Finding #12: the dry-run sidecar of already-classified messages. Loaded
+    # (and later consulted/flushed) ONLY in Dry Run — a real run ignores it
+    # entirely, so every sidecar'd message gets one fresh classification and
+    # a real action on the first run after Dry Run turns off.
+    dry_verdicts = load_dry_run_verdicts() if dry_run else None
     # Keep the user's own account mail servers (every configured account's IMAP
     # host + the SMTP host) marked as trusted infrastructure, so they are not
     # mistaken for a suspicious relay in the Received chain. Re-checks config
@@ -6059,6 +6150,11 @@ def run_filter(force: bool = False):
             processed["ids"][account_key] = []
 
         account_processed = {e[0] for e in processed["ids"][account_key]}
+        # Finding #12: msg_ids already classified during THIS dry-run period
+        # (empty set in real mode — the sidecar is never consulted there).
+        account_dry_seen = (
+            {e[0] for e in dry_verdicts.get("ids", {}).get(account_key, [])}
+            if dry_run else set())
 
         try:
             conn = connect_imap(account, logger)
@@ -8182,6 +8278,17 @@ USER'S FOLLOW-UP:
                         total_evaluated += 1
                         continue
 
+                    # Finding #12: in Dry Run, a message already classified in
+                    # a prior tick is recorded in the dry-run sidecar. Skip it
+                    # BEFORE the paid classifier call so it is billed and
+                    # logged exactly once for the life of the dry-run. It is
+                    # NOT in processed_ids, so the first real run after Dry
+                    # Run turns off still classifies and actions it once.
+                    if dry_run and msg_id in account_dry_seen:
+                        logger.debug(
+                            f"  Skipping dry-run already-classified: {msg_id}")
+                        continue
+
                     # No soft pre-classifier context exists anymore: non-hard,
                     # non-listed mail is judged by the AI from the SERVER-VERIFIED
                     # authentication block and content.
@@ -8264,14 +8371,19 @@ USER'S FOLLOW-UP:
                     log_decision(account_name, msg_data, result, action,
                                  rule_ids=matched_rules)
 
-                    # Add to processed_ids — but be careful in dry-run mode.
-                    # In dry_run, a message classified as SPAM is not moved.
-                    # If we ALSO cache it here, the next run (dry or live)
-                    # will skip it forever, and when the user eventually
-                    # turns dry-run off the spam is still sitting in the
-                    # inbox. Cache dry-run NOT-SPAM decisions only; dry-run
-                    # SPAM stays uncached so it gets acted on the first run
-                    # after the user flips dry-run off.
+                    # Record where this message was handled (finding #12):
+                    #   - Real run, or dry-run NOT-SPAM -> processed_ids
+                    #     (skipped permanently, as before).
+                    #   - Dry-run "spam" DECISION (whether moved-in-preview or
+                    #     below-threshold/delivered) -> the dry_run_verdicts
+                    #     SIDECAR instead. Recording it in processed_ids would
+                    #     make the filter ignore known spam forever once Dry
+                    #     Run turns off; recording it NOWHERE (the old
+                    #     behavior) re-billed the classifier and re-logged the
+                    #     decision every tick. The sidecar is consulted only
+                    #     while dry_run is True, so the first real run gives
+                    #     the message one fresh classification and a real
+                    #     action.
                     verdict = (result or {}).get("decision", "").lower()
                     cache_this = (not dry_run) or (verdict != "spam")
                     # Guard against a double-append: an auth-rejected command
@@ -8282,6 +8394,11 @@ USER'S FOLLOW-UP:
                     if cache_this:
                         _record_processed(processed, account_key,
                                           account_processed, msg_id)
+                    elif dry_run:
+                        # dry-run SPAM / below-threshold-spam: exactly the
+                        # messages deliberately left out of processed_ids.
+                        _record_processed(dry_verdicts, account_key,
+                                          account_dry_seen, msg_id)
 
                 # Break out of folder loop if max reached
                 if total_evaluated >= max_per_run:
@@ -8301,6 +8418,8 @@ USER'S FOLLOW-UP:
         # account that errored (persisting whatever it processed before the
         # error) and for the account that triggers the max_per_run break below.
         persist_progress(processed, token_usage, token_delta)
+        if dry_run:
+            persist_dry_run_verdicts(dry_verdicts)
 
         if total_evaluated >= max_per_run:
             break
@@ -8318,6 +8437,8 @@ USER'S FOLLOW-UP:
     # Final flush of any residual progress (and a clean end-of-run save even when
     # no account reached the per-account flush, e.g. all disabled / unreachable).
     persist_progress(processed, token_usage, token_delta)
+    if dry_run:
+        persist_dry_run_verdicts(dry_verdicts)
 
     logger.info(
         f"Filter complete: {accounts_checked} accounts, "

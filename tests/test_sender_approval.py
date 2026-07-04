@@ -843,9 +843,15 @@ def test_setup_assistant_seeds_approved_senders():
 def _log_rec(ts, decision, action, acct="Acct",
              from_line="Bad <b@bad.test>", subject="pitch", signals="x"):
     """One decisions.log record in log_decision's exact line format
-    (without the trailing '  ---\\n' separator)."""
+    (without the trailing '  ---\\n' separator).
+
+    Finding #12 fixture note: the MESSAGE-ID is derived from (from_line,
+    subject) instead of a shared constant — parse_decisions_24h now
+    deduplicates exact (message-id, kind) repeats, so DISTINCT fixture
+    messages must carry distinct ids, exactly as real log_decision records
+    would."""
     return (f"[{ts}] ACCOUNT: {acct}\n"
-            f"  MESSAGE-ID: <m@x>\n"
+            f"  MESSAGE-ID: <m-{abs(hash((from_line, subject))):x}@x>\n"
             f"  FROM: {from_line}\n"
             f"  SUBJECT: {subject}\n"
             f"  DECISION: {decision}\n"

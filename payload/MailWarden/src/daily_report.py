@@ -953,6 +953,19 @@ def parse_decisions_24h(window_start, window_end) -> dict:
 
     entries = content.split("  ---\n")
 
+    # Finding #12: exact-duplicate suppression for spam records. The pre-fix
+    # dry-run filter re-classified (and re-logged) the same UNSEEN spam every
+    # tick, so a legacy decisions.log can carry the same message dozens of
+    # times inside one report window — each repeat used to become another
+    # numbered junk entry with its own APPROVE token AND inflate the
+    # spam/evaluated counters. Key is (message-id, dry-run-ness): exact
+    # repeats collapse to one, while a dry-run preview record and a later
+    # real MOVED record for the same message (the normal Dry Run -> real
+    # transition) both remain visible. Same exactly-one discipline as the F1
+    # history-index guard: a record with zero or more than one MESSAGE-ID
+    # line is NON-DEDUPABLE and is counted exactly as before.
+    seen_spam_keys = set()
+
     for entry in entries:
         entry = entry.strip()
         if not entry:
@@ -1007,6 +1020,21 @@ def parse_decisions_24h(window_start, window_end) -> dict:
             continue
 
         if "MOVED to" in entry or "would move to" in entry:
+            # Finding #12 dedup (see seen_spam_keys above). Runs BEFORE the
+            # counter increments so the counts and the numbered list stay
+            # consistent; the evaluated decrement mirrors the WHITELISTED
+            # idiom ("this record does not count").
+            mid_matches = re.findall(r'^\s*MESSAGE-ID: (.+)', entry,
+                                     re.MULTILINE)
+            if len(mid_matches) == 1:
+                dedup_key = (mid_matches[0].strip(),
+                             "would move to" in entry)
+                if dedup_key in seen_spam_keys:
+                    result["evaluated"] -= 1
+                    result["per_account"][acct_name]["evaluated"] -= 1
+                    continue
+                seen_spam_keys.add(dedup_key)
+
             if "MOVED to" in entry:
                 result["spam_moved"] += 1
                 result["per_account"][acct_name]["spam"] += 1
