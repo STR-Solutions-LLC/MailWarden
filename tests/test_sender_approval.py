@@ -334,6 +334,22 @@ def test_branch_owner_approve_writes_domain(monkeypatch):
                     "judged normally.")
 
 
+def test_branch_approve_plus_drop_runs_approve_and_tells_owner(monkeypatch):
+    """Finding #15: a reply stacking APPROVE 1 and DROP 2 still executes only
+    the APPROVE — no rule is dropped — and the ack names the ignored DROP so
+    the owner knows it was not done and how to run it on its own."""
+    calls = _approve_harness(
+        monkeypatch, msg_data=_mwr_msg(body="APPROVE 1\nDROP 2"),
+        approvals_store=_fresh_token_store())
+    # Execution unchanged: APPROVE ran (domain written); DROP did not execute.
+    assert calls["add_approved_domain"] == ["newsletter.test"]
+    subject, body, to_addr = calls["send_email"][0]
+    assert ("You also included DROP 2 in this reply. MailWarden handles one "
+            "type of command per reply, so DROP 2 was not done. Please reply "
+            "to this email with only DROP 2 and MailWarden will take care of "
+            "it.") in body
+
+
 def test_branch_auth_failure_writes_nothing_and_notifies(monkeypatch):
     calls = _approve_harness(monkeypatch, msg_data=_mwr_msg(),
                              auth_ok=False,

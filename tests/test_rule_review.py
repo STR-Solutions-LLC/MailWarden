@@ -79,6 +79,35 @@ def test_parse_rule_review_command(text, expected):
     assert spam_filter.parse_rule_review_command(text) == expected
 
 
+# Finding #15 — _ignored_command_notes (DETECT-AND-TELL). Pins the exact
+# owner-facing wording and proves it never fires for a single-verb reply.
+_EXPECT_DROP2_NOTE = (
+    "You also included DROP 2 in this reply. MailWarden handles one type of "
+    "command per reply, so DROP 2 was not done. Please reply to this email "
+    "with only DROP 2 and MailWarden will take care of it.")
+
+
+def test_ignored_command_notes_detects_the_other_verb():
+    notes = spam_filter._ignored_command_notes("KEEP 1\nDROP 2", "keep")
+    assert notes == [_EXPECT_DROP2_NOTE]
+
+
+def test_ignored_command_notes_empty_for_single_verb():
+    assert spam_filter._ignored_command_notes("DROP 2", "drop") == []
+    assert spam_filter._ignored_command_notes("APPROVE 1", "approve") == []
+
+
+def test_ignored_command_notes_names_command_as_written():
+    # {cmd} echoes exactly what the owner typed (verb + numbers).
+    notes = spam_filter._ignored_command_notes("APPROVE 1\nRESTORE 3,5",
+                                               "approve")
+    assert notes == [
+        "You also included RESTORE 3,5 in this reply. MailWarden handles one "
+        "type of command per reply, so RESTORE 3,5 was not done. Please reply "
+        "to this email with only RESTORE 3,5 and MailWarden will take care of "
+        "it."]
+
+
 def test_rule_review_section_never_self_triggers():
     # A quoted copy of the report's own instruction lines must NOT parse as a
     # command (the verbs only ever appear after "To " or mid-line).
@@ -501,6 +530,24 @@ def test_keep_dequeues_without_retire(monkeypatch):
     assert calls["dequeue"] == ["R-20260703-aaaa"]
     subject, body, to_addr = calls["send_email"][0]
     assert body == 'Kept rule 1 ("Urgent fundraising"). No change.'
+
+
+def test_multi_verb_reply_runs_one_and_tells_owner_the_other(monkeypatch):
+    """Finding #15: a reply stacking KEEP 1 and DROP 2 still executes exactly
+    one verb (DROP wins by precedence) — KEEP is NOT run — and the ack names
+    the ignored KEEP so the owner knows it was skipped and how to run it."""
+    calls = _rr_harness(
+        monkeypatch, msg_data=_mwr_msg(body="KEEP 1\nDROP 2"),
+        approvals_store=_token_store(
+            rule_reviews={"1": "R-20260703-aaaa", "2": "R-20260703-aaaa"}))
+    # Only DROP executed (retire fires on DROP, never on KEEP).
+    assert calls["retire"] == ["R-20260703-aaaa"]
+    subject, body, to_addr = calls["send_email"][0]
+    assert body.startswith('Dropped rule 2 ("Urgent fundraising").')
+    assert ("You also included KEEP 1 in this reply. MailWarden handles one "
+            "type of command per reply, so KEEP 1 was not done. Please reply "
+            "to this email with only KEEP 1 and MailWarden will take care of "
+            "it.") in body
 
 
 def test_drop_invalid_number_ack(monkeypatch):

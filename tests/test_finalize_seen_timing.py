@@ -334,3 +334,84 @@ def test_mwr_keepdrop_happy_path_finalizes_once(monkeypatch):
     assert calls["mark_uid_seen"] == 1
     assert _msg_ids_recorded(calls).count(msg["message_id"]) == 1
     assert len(calls["send_email"]) == 1
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Finding #7 — block_sender_proposal YES must verify BEFORE it acks. A saved
+# proposal with an empty value / bad kind makes add_blocklist_entry_local
+# return False WITHOUT writing anything; the owner must NOT be told "Sender
+# blocked" and the proposal must stay open.
+# ═════════════════════════════════════════════════════════════════════════
+
+def test_block_sender_apply_failure_keeps_pending_and_acks_honestly(monkeypatch):
+    """add_blocklist_entry_local returns False (empty value / bad kind):
+    the conversation stays PENDING, NO "applied" event is logged, and the
+    owner gets the honest could-not-block ack — not a false "Sender blocked".
+    The message is still finalized once (we DID answer the reply)."""
+    events = []
+    pending = _block_sender_conv()
+    msg = _base_msg("Re: [SFID-TEST1] Block sender?", "YES")
+    calls = _run_harness(
+        monkeypatch, msg_data=msg, pending=pending,
+        patches={
+            "add_blocklist_entry_local":
+                lambda value, kind, scope, logger: False,
+            "append_refinement_log": lambda event: events.append(event),
+        })
+
+    conv = pending["conversations"][0]
+    assert conv.get("status") != "approved", (
+        "a failed apply must NOT mark the proposal approved")
+    assert conv.get("resolution") != "approved"
+
+    kinds = [e.get("event") for e in events]
+    assert "applied" not in kinds, "must NOT log 'applied' on a failed apply"
+    assert "apply_failed" in kinds, "must log the failure"
+
+    assert len(calls["send_email"]) == 1
+    subject, body, _to = calls["send_email"][0]
+    assert subject == "Could not block that sender [SFID-TEST1]"
+    assert body == spam_filter._BLOCK_APPLY_FAILED_BODY.format(
+        expires=conv["expires"][:10])
+    assert "Sender blocked" not in body
+
+    # The reply WAS handled (honest ack sent), so it is finalized once —
+    # never re-processed every tick.
+    assert calls["mark_uid_seen"] == 1
+    assert _msg_ids_recorded(calls).count(msg["message_id"]) == 1
+
+
+def test_block_sender_apply_success_blocks_and_acks(monkeypatch):
+    """A valid entry (harness default add_blocklist_entry_local -> True) still
+    writes the block, marks the proposal approved, logs 'applied', and sends
+    the success ack — the fix does not regress the happy path."""
+    events = []
+    pending = _block_sender_conv()
+    msg = _base_msg("Re: [SFID-TEST1] Block sender?", "YES")
+    calls = _run_harness(
+        monkeypatch, msg_data=msg, pending=pending,
+        patches={"append_refinement_log": lambda event: events.append(event)})
+
+    conv = pending["conversations"][0]
+    assert conv.get("status") == "approved"
+    assert [e.get("event") for e in events] == ["applied"]
+
+    assert len(calls["send_email"]) == 1
+    subject, body, _to = calls["send_email"][0]
+    assert subject == "Sender blocked [SFID-TEST1]"
+    assert "block list" in body
+    assert calls["mark_uid_seen"] == 1
+
+
+def test_add_blocklist_entry_local_false_on_empty_value():
+    """Unit: add_blocklist_entry_local returns False (writing nothing) for an
+    empty value and for an unknown kind — the precondition finding #7 relies
+    on. These early-return before any file IO, so no store is touched."""
+    assert spam_filter.add_blocklist_entry_local(
+        "", "domain", "all", _LOGGER) is False
+    assert spam_filter.add_blocklist_entry_local(
+        "   ", "address", "all", _LOGGER) is False
+    assert spam_filter.add_blocklist_entry_local(
+        "@", "domain", "all", _LOGGER) is False
+    assert spam_filter.add_blocklist_entry_local(
+        "x@y.com", "bogus_kind", "all", _LOGGER) is False

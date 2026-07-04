@@ -532,6 +532,45 @@ def parse_rule_review_command(reply_text: str):
     return None
 
 
+_MWR_COMMAND_VERBS = ("approve", "restore", "drop", "keep")
+
+# Finding #15 (DETECT-AND-TELL): the daily-report reply corridor executes
+# exactly ONE command verb per reply (APPROVE, or RESTORE>DROP>KEEP by
+# precedence). When an owner stacks a second verb in the same reply we do NOT
+# run it — but we must not silently drop it either. This note names the extra
+# command so the owner learns exactly what was skipped and how to run it alone.
+_IGNORED_COMMAND_NOTE = (
+    "You also included {cmd} in this reply. MailWarden handles one type of "
+    "command per reply, so {cmd} was not done. Please reply to this email "
+    "with only {cmd} and MailWarden will take care of it."
+)
+
+
+def _ignored_command_notes(reply_text: str, handled_verb: str) -> list:
+    """Finding #15: build owner-facing note(s) for any command verb PRESENT in
+    ``reply_text`` other than ``handled_verb`` (the verb actually executed).
+
+    Detection reuses ``_parse_command_numbers`` verb-by-verb, so it inherits the
+    same line-start anchoring that stops a quoted report from self-triggering: a
+    verb only counts as present when it STARTS a line AND carries item numbers.
+    ``{cmd}`` in each note is the ignored command as the owner wrote it (verb +
+    numbers), captured from the reply. Returns [] when the reply carries only
+    the handled verb. This changes NOTHING about what executes — detect and
+    tell only."""
+    handled = (handled_verb or "").strip().lower()
+    notes = []
+    for verb in _MWR_COMMAND_VERBS:
+        if verb == handled:
+            continue
+        if not _parse_command_numbers(reply_text, verb):
+            continue
+        m = re.search(r'^[ \t]*(' + verb + r'\b[:\s]*[0-9][0-9,\ \t\-]*)',
+                      reply_text, re.IGNORECASE | re.MULTILINE)
+        cmd = m.group(1).strip() if m else verb.upper()
+        notes.append(_IGNORED_COMMAND_NOTE.format(cmd=cmd))
+    return notes
+
+
 # ---------------------------------------------------------------------------
 # item (b): FP-driven learned-rule review — queue + retire machinery
 # ---------------------------------------------------------------------------
@@ -3441,6 +3480,22 @@ _FP_APPLY_FAILED_BODY = (
     "To fix it: forward the original email again with the subject "
     "\"Fwd: False Positive\". MailWarden will run a fresh analysis and send you "
     "a new proposal to approve.\n\n"
+    "If you do nothing, this proposal expires on {expires} and is discarded.\n"
+)
+
+
+# Finding #7: honest ack sent when an owner approves a "Block this sender"
+# proposal ([SFID-...]) whose saved blocklist_entry has no usable value / a
+# bad kind. add_blocklist_entry_local returns False BEFORE writing anything in
+# that case, so the block never happened — never ack "Sender blocked" or close
+# the proposal. Same shape as _FP_APPLY_FAILED_BODY: keep the proposal open,
+# name the self-serve fix, keep the {expires} placeholder.
+_BLOCK_APPLY_FAILED_BODY = (
+    "MailWarden could not block that sender. The saved proposal did not "
+    "contain a usable email address or domain, so nothing was changed.\n\n"
+    "Your block list is unchanged and this proposal is still open.\n\n"
+    "To block the sender yourself: forward one of their emails to MailWarden "
+    "with the subject \"Fwd: Blacklist All\".\n\n"
     "If you do nothing, this proposal expires on {expires} and is discarded.\n"
 )
 
@@ -7736,39 +7791,77 @@ Conversation ID: {sfid}
                                 # PB2: approve a "Block this sender" proposal by
                                 # email — write the scoped block-list entry and
                                 # reload the in-memory blacklist for this run.
+                                # Finding #7 (verify-before-ack): a proposal with
+                                # an empty value / bad kind makes
+                                # add_blocklist_entry_local return False BEFORE
+                                # writing anything. Capture that bool and never
+                                # ack "Sender blocked" or close the proposal on a
+                                # failed apply — mirrors the spam_example_proposal
+                                # and legacy false_positive verify arms below.
                                 entry = conv.get("blocklist_entry") or {}
-                                add_blocklist_entry_local(
+                                applied = add_blocklist_entry_local(
                                     entry.get("value", ""),
                                     entry.get("kind", "domain"),
                                     entry.get("scope", "all"),
                                     logger)
-                                blacklist = load_blacklist(logger)
-                                conv["status"] = "approved"
-                                conv["resolution"] = "approved"
-                                persist_pending_merge(pending, {sfid})
-                                append_refinement_log({
-                                    "ts": datetime.now().isoformat(),
-                                    "event": "applied",
-                                    "id": conv.get("id", ""),
-                                    "sfid": sfid,
-                                    "headline": (f"Block sender {entry.get('kind','')}: "
-                                                 f"{entry.get('value','')}"),
-                                    "source": "email",
-                                })
-                                _bnoun = ("address"
-                                          if entry.get("kind") == "address"
-                                          else "domain")
-                                send_email(
-                                    config,
-                                    f"Sender blocked [{sfid}]",
-                                    f"Added {_bnoun} {entry.get('value','')} to your "
-                                    f"block list. Matching mail will be moved to "
-                                    f"Junk on the next check.\n\n"
-                                    f"To remove it later, forward any email from "
-                                    f"this sender with the subject "
-                                    f"\"Fwd: Remove from Blacklist\".\n",
-                                    logger,
-                                    to_addr=account.get("username", ""))
+                                if not applied:
+                                    # Nothing was written: keep the conversation
+                                    # PENDING, log the failure (never "applied"),
+                                    # ack honestly, and do NOT reload the
+                                    # blacklist.
+                                    conv["conversation_history"].append({
+                                        "role": "system_email",
+                                        "timestamp": datetime.now().isoformat(),
+                                        "content": ("Apply failed: block "
+                                                    "proposal carried no usable "
+                                                    "address or domain; kept "
+                                                    "pending"),
+                                    })
+                                    persist_pending_merge(pending, {sfid})
+                                    append_refinement_log({
+                                        "ts": datetime.now().isoformat(),
+                                        "event": "apply_failed",
+                                        "sfid": sfid,
+                                        "reason": ("block proposal carried no "
+                                                   "usable email address or "
+                                                   "domain"),
+                                        "source": "email",
+                                    })
+                                    send_email(
+                                        config,
+                                        f"Could not block that sender [{sfid}]",
+                                        _BLOCK_APPLY_FAILED_BODY.format(
+                                            expires=conv.get("expires", "")[:10]),
+                                        logger,
+                                        to_addr=account.get("username", ""))
+                                else:
+                                    blacklist = load_blacklist(logger)
+                                    conv["status"] = "approved"
+                                    conv["resolution"] = "approved"
+                                    persist_pending_merge(pending, {sfid})
+                                    append_refinement_log({
+                                        "ts": datetime.now().isoformat(),
+                                        "event": "applied",
+                                        "id": conv.get("id", ""),
+                                        "sfid": sfid,
+                                        "headline": (f"Block sender {entry.get('kind','')}: "
+                                                     f"{entry.get('value','')}"),
+                                        "source": "email",
+                                    })
+                                    _bnoun = ("address"
+                                              if entry.get("kind") == "address"
+                                              else "domain")
+                                    send_email(
+                                        config,
+                                        f"Sender blocked [{sfid}]",
+                                        f"Added {_bnoun} {entry.get('value','')} to your "
+                                        f"block list. Matching mail will be moved to "
+                                        f"Junk on the next check.\n\n"
+                                        f"To remove it later, forward any email from "
+                                        f"this sender with the subject "
+                                        f"\"Fwd: Remove from Blacklist\".\n",
+                                        logger,
+                                        to_addr=account.get("username", ""))
                             elif conv_kind == "spam_example_proposal":
                                 refinement = conv.get("proposed_refinement") or {}
                                 # P1 approval backstop: a proposal created before
@@ -8208,6 +8301,11 @@ USER'S FOLLOW-UP:
                                     logger.error(
                                         f"  Rule-review enqueue failed: {e}")
 
+                            # Finding #15: APPROVE ran; if the same reply also
+                            # carried a RESTORE/DROP/KEEP, tell the owner it was
+                            # not done (execution stays single-verb).
+                            ack_lines.extend(
+                                _ignored_command_notes(reply_text, "approve"))
                             send_email(config,
                                 f"Sender approval [MWR-{mwr_token}]",
                                 "\n\n".join(ack_lines),
@@ -8300,6 +8398,11 @@ USER'S FOLLOW-UP:
                                             f"Rule {n} was already reviewed — "
                                             f"no change.")
 
+                            # Finding #15: one verb executed (RESTORE>DROP>KEEP
+                            # precedence); if the same reply also carried another
+                            # command verb, tell the owner it was not done.
+                            ack_lines.extend(
+                                _ignored_command_notes(reply_text, verb.lower()))
                             send_email(config,
                                 f"Rule review [MWR-{mwr_token}]",
                                 "\n\n".join(ack_lines),
