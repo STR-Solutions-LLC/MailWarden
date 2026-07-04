@@ -3469,6 +3469,57 @@ def _fp_changes_appliable(proposed_changes: dict) -> bool:
     return any(str(v).strip() for v in narrowings.values())
 
 
+# Finding #14: our own [SFID-...] / [MWR-...] conversation tokens, as they
+# appear bracketed in a subject line. A FORWARD of one of MailWarden's own
+# analysis/report emails still carries this token and — after its Fwd:/Re:
+# prefixes are stripped — re-matches the "False Positive" command, so it used
+# to mint a brand-new bogus SFID. The FP-teach handler uses this to recognise
+# a forward of our own output and redirect instead of minting. A genuine REPLY
+# keeps its leading "Re:" (only a Fwd: enables Re:-stripping), so
+# detect_email_command returns None for it and it never reaches that handler —
+# the reply corridor is untouched.
+_OWN_ANALYSIS_TOKEN_RE = re.compile(r'\[(?:SFID|MWR)-[A-Za-z0-9-]+\]')
+
+
+# Finding #14: honest redirect sent when the owner forwards one of MailWarden's
+# own analysis emails back to it (subject still carries {token}). No new SFID is
+# minted and no API call is made. Sent through send_email (X-MailWarden-System
+# stamped), and its subject carries no token, so it cannot self-loop.
+_FP_FORWARDED_ANALYSIS_BODY = (
+    "You forwarded one of MailWarden's own analysis emails ({token}) back to it, "
+    "so there was nothing new to analyze and nothing was changed.\n\n"
+    "To continue that conversation, reply to the original analysis email instead of forwarding it.\n\n"
+    "To start a new review, forward the original email that was wrongly filtered, "
+    "not MailWarden's analysis of it.\n"
+)
+
+
+# Finding #5a: honest ack sent when the false-positive ANALYSIS API call (or its
+# send) fails. No conversation may exist yet, so it names no SFID. No retry —
+# the message is finalized (mirrors the SPAM-example convention, which always
+# acks and never re-bills). Subject carries no token; send_email stamps it.
+_FP_ANALYSIS_FAILED_BODY = (
+    "MailWarden couldn't finish analyzing that false positive right now. "
+    "The analysis service didn't respond, so nothing was changed and your filter is unchanged.\n\n"
+    "To try again, forward the original email again with the subject \"Fwd: False Positive\".\n"
+)
+
+
+# Finding #5b: honest ack sent when the FP FOLLOW-UP API call fails. A
+# conversation exists, so the proposal stays open and the ack names the SFID.
+# The ack subject carries [SFID-...] and the body names YES/NO, so — exactly
+# like _SFID_UNREADABLE_REPLY_BODY — its FIRST sentence MUST also be registered
+# in run_filter's _own_prefixes: X-MailWarden-System is the primary defense
+# (loop-top guard), and the prefix match is defense-in-depth if that stamp is
+# ever lost. This body MUST start with that exact sentence.
+_FP_FOLLOWUP_FAILED_BODY = (
+    "MailWarden couldn't answer your question right now. "
+    "The analysis service didn't respond, so nothing was changed and your proposal is still open.\n\n"
+    "Reply YES to apply the proposed change, NO to reject it, or send your question again.\n\n"
+    "Conversation ID: {sfid}\n"
+)
+
+
 # Honest ack body sent when a YES cannot be applied (no readable proposed
 # change). Its FIRST line MUST also appear in _own_prefixes so the filter does
 # not reprocess this outgoing email as an SFID reply.
@@ -6639,6 +6690,34 @@ def run_filter(force: bool = False):
                     # --- Command: False Positive ---
                     elif command == "False Positive":
                         logger.info(f"  FALSE POSITIVE forward detected: {msg_data['subject'][:60]}")
+                        # Finding #14: a FORWARD of one of our own analysis/report
+                        # emails still carries our [SFID-...]/[MWR-...] token and,
+                        # after Fwd:/Re: stripping, re-matches "False Positive" — so
+                        # it used to mint a brand-new bogus SFID and run a garbage
+                        # analysis on our own output. A genuine REPLY keeps its
+                        # leading "Re:" (only a Fwd: enables Re:-stripping), so
+                        # detect_email_command returns None for it and it never
+                        # reaches this handler — the reply corridor is untouched.
+                        # Redirect the forward honestly instead of minting; guard
+                        # here (before the billed API call), never at the reply
+                        # branch, so replies can't be suppressed.
+                        _own_tok = _OWN_ANALYSIS_TOKEN_RE.search(
+                            msg_data.get("subject", ""))
+                        if _own_tok:
+                            logger.info(
+                                f"  [FP TEACH] Forwarded MailWarden analysis "
+                                f"({_own_tok.group(0)}) — not minting a new SFID "
+                                f"(finding #14).")
+                            send_email(
+                                config,
+                                "MailWarden analysis email — no new analysis started",
+                                _FP_FORWARDED_ANALYSIS_BODY.format(
+                                    token=_own_tok.group(0)),
+                                logger,
+                                to_addr=account.get("username", ""))
+                            _finalize_command()
+                            total_evaluated += 1
+                            continue
                         fwd_data = parse_forwarded_email(
                             msg_data.get("plain_text_body", ""),
                             msg_data.get("html_body", ""),
@@ -6792,6 +6871,16 @@ Conversation ID: {sfid}
 
                         except Exception as e:
                             logger.error(f"  False positive analysis failed: {e}")
+                            # Finding #5: don't swallow the failure. Mirror the
+                            # SPAM-example convention — ack the owner honestly
+                            # (no retry; the message is finalized below, so the
+                            # analysis is not re-billed on every tick).
+                            send_email(
+                                config,
+                                "MailWarden couldn't run that false-positive analysis",
+                                _FP_ANALYSIS_FAILED_BODY,
+                                logger,
+                                to_addr=account.get("username", ""))
 
                         # Mark as processed regardless
                         _finalize_command()
@@ -7634,6 +7723,10 @@ Conversation ID: {sfid}
                             # NO, so it must stay recognizable as our own mail
                             # even if the X-MailWarden-System stamp were lost.
                             "MailWarden received your reply but couldn't read any instruction in it.",
+                            # Finding #5: the follow-up API-failure ack also names
+                            # YES and NO under an [SFID-...] subject; register its
+                            # opening sentence for the same defense-in-depth.
+                            "MailWarden couldn't answer your question right now.",
                         )
                         if any(body_text.strip().startswith(p)
                                for p in _own_prefixes):
@@ -8073,6 +8166,18 @@ USER'S FOLLOW-UP:
 
                             except Exception as e:
                                 logger.error(f"  Follow-up API call failed: {e}")
+                                # Finding #5: ack honestly instead of swallowing.
+                                # The proposal stays open; no retry (finalized
+                                # below, so the follow-up is not re-billed each
+                                # tick). Subject carries [SFID-...] and the body
+                                # names YES/NO, so the ack's opening sentence is
+                                # registered in _own_prefixes (defense-in-depth).
+                                send_email(
+                                    config,
+                                    f"Re: False Positive Analysis [{sfid}] — {conv.get('original_subject', '')[:40]}",
+                                    _FP_FOLLOWUP_FAILED_BODY.format(sfid=sfid),
+                                    logger,
+                                    to_addr=account.get("username", ""))
 
                         _finalize_command()
                         total_evaluated += 1

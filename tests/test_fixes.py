@@ -2695,7 +2695,8 @@ from datetime import datetime, timezone, timedelta  # noqa: E402
 
 
 def _dry_run_filter_harness(monkeypatch, *, uids=None, msg_data=None,
-                            dry_run=True, pending=None, analysis_text=None):
+                            dry_run=True, pending=None, analysis_text=None,
+                            api_raises=False):
     """Drive spam_filter.run_filter(force=True) with all IO/network mocked.
 
     Returns a dict of call-recording spies so a test can assert which
@@ -2802,6 +2803,12 @@ def _dry_run_filter_harness(monkeypatch, *, uids=None, msg_data=None,
 
     def _fake_create(**kwargs):
         calls["messages_create_kwargs"].append(kwargs)
+        if api_raises:
+            # Finding #5: simulate an Anthropic API failure so a test can prove
+            # the FP-teach / follow-up handlers ack the owner instead of
+            # swallowing the error. Recorded above first so the test can still
+            # assert the call was attempted.
+            raise RuntimeError("simulated API failure")
         content = types.SimpleNamespace(text=_analysis)
         return types.SimpleNamespace(content=[content])
 
