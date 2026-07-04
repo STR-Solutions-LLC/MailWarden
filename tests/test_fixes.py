@@ -651,6 +651,110 @@ def test_p1_backstop_no_forwarder_leaves_scope_absent(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Finding #8 — apply_ai_refinement (and its config_io twin) are no longer
+# ack-blind. Approving a proposal whose rule id is RETIRED must NOT be acked
+# "now active" (the rule stays retired); re-approving an already-active rule
+# must NOT double-log an "applied" event; a genuine apply still logs exactly
+# one "applied" and reports an "applied" status.
+# ---------------------------------------------------------------------------
+
+def _run_apply_ai_refinement(monkeypatch, refinement, existing):
+    """Drive spam_filter.apply_ai_refinement with signals IO stubbed. Returns
+    (result_tuple, save_called, logged_events)."""
+    state = {"saved": False}
+    events = []
+    monkeypatch.setattr(spam_filter, "load_signals",
+                        lambda: {"signals": {}, "ai_refinements": list(existing)})
+    monkeypatch.setattr(spam_filter, "save_signals",
+                        lambda _data: state.update(saved=True))
+    monkeypatch.setattr(spam_filter, "append_refinement_log",
+                        lambda ev: events.append(ev))
+    result = spam_filter.apply_ai_refinement(
+        refinement, _QUIET_LOGGER, source="email", sfid="SFID-8")
+    return result, state["saved"], events
+
+
+def test_f8_apply_retired_id_acks_honestly_not_active(monkeypatch):
+    result, saved, events = _run_apply_ai_refinement(
+        monkeypatch,
+        {"id": "R-ret", "headline": "h", "rationale": "r"},
+        [{"id": "R-ret", "status": "retired", "headline": "h"}])
+    assert result == ("retired", "")          # no description; caller acks honestly
+    assert saved is False                      # nothing written to signals
+    assert [e["event"] for e in events] == ["apply_failed"]  # never "applied"
+
+
+def test_f8_apply_already_active_no_double_log(monkeypatch):
+    result, saved, events = _run_apply_ai_refinement(
+        monkeypatch,
+        {"id": "R-act", "headline": "h", "rationale": "r"},
+        [{"id": "R-act", "status": "active", "headline": "h"}])
+    assert result[0] == "already_active"
+    assert result[1].strip() != ""            # still returns a truthful description
+    assert saved is False
+    assert [e["event"] for e in events] == []  # re-approval does NOT double-log
+
+
+def test_f8_apply_genuine_logs_applied_once(monkeypatch):
+    result, saved, events = _run_apply_ai_refinement(
+        monkeypatch,
+        {"id": "R-new", "headline": "h", "rationale": "r"},
+        [])
+    assert result[0] == "applied"
+    assert saved is True
+    assert [e["event"] for e in events] == ["applied"]
+
+
+def _run_apply_from_pending_state(monkeypatch, proposed, existing):
+    """Drive config_io.apply_refinement_from_pending with IO stubbed and a
+    signals store carrying ``existing`` refinements. Returns (result, conv,
+    save_called, logged_events)."""
+    conv = {
+        "id": "SFID-8b",
+        "kind": "spam_example_proposal",
+        "status": "awaiting_reply",
+        "forwarder": "owner@x.com",
+        "proposed_refinement": proposed,
+        "conversation_history": [],
+    }
+    state = {"saved": False}
+    events = []
+    monkeypatch.setattr(config_io, "load_pending_signals",
+                        lambda: {"version": "1.0", "conversations": [conv]})
+    monkeypatch.setattr(config_io, "save_pending_signals", lambda data: None)
+    monkeypatch.setattr(config_io, "load_signals",
+                        lambda: {"signals": {}, "ai_refinements": list(existing)})
+    monkeypatch.setattr(config_io, "save_signals",
+                        lambda _data: state.update(saved=True))
+    monkeypatch.setattr(config_io, "append_refinement_log",
+                        lambda ev: events.append(ev))
+    result = config_io.apply_refinement_from_pending(
+        conv["id"], source="dashboard")
+    return result, conv, state["saved"], events
+
+
+def test_f8_twin_retired_marker_keeps_conv_pending(monkeypatch):
+    result, conv, saved, events = _run_apply_from_pending_state(
+        monkeypatch,
+        {"id": "R-ret", "headline": "h"},
+        [{"id": "R-ret", "status": "retired", "headline": "h"}])
+    assert result is not None and result.get("status") == "retired"
+    assert conv["status"] == "awaiting_reply"   # NOT resolved — honest, still open
+    assert saved is False
+    assert "applied" not in [e["event"] for e in events]
+
+
+def test_f8_twin_already_active_no_double_log(monkeypatch):
+    result, conv, saved, events = _run_apply_from_pending_state(
+        monkeypatch,
+        {"id": "R-act", "headline": "h"},
+        [{"id": "R-act", "status": "active", "headline": "h"}])
+    assert conv["status"] == "approved"          # no-op apply still resolves conv
+    assert saved is False
+    assert [e["event"] for e in events] == []    # re-approval does NOT double-log
+
+
+# ---------------------------------------------------------------------------
 # P1 (continued) — pure DASHBOARD serialization helper. The per-account toggle
 # row computes the scope to persist:
 #   ALL configured accounts ON  -> "all"

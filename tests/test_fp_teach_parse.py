@@ -242,7 +242,7 @@ def test_e2e_yes_self_heals_from_api_analysis(monkeypatch):
     def _fake_apply(refinement, logger, source="email", sfid=""):
         applied["called"] = True
         applied["ref"] = refinement
-        return "narrowed the promo-keyword signal"
+        return ("applied", "narrowed the promo-keyword signal")
     monkeypatch.setattr(spam_filter, "apply_ai_refinement", _fake_apply)
     _apply_failed_events(monkeypatch)
 
@@ -281,7 +281,7 @@ def test_e2e_yes_bare_label_still_applies(monkeypatch):
     def _fake_apply(refinement, logger, source="email", sfid=""):
         applied["called"] = True
         applied["ref"] = refinement
-        return "narrowed X"
+        return ("applied", "narrowed X")
     monkeypatch.setattr(spam_filter, "apply_ai_refinement", _fake_apply)
     _apply_failed_events(monkeypatch)
 
@@ -344,6 +344,79 @@ def test_e2e_modern_branch_empty_refinement_keeps_pending(monkeypatch):
     assert "apply_failed" in ev_types
     subjects = [s for (s, _b) in calls["send_email_args"]]
     assert any(s.startswith("Could not apply the signal change [") for s in subjects)
+
+
+# ===========================================================================
+# Finding #8 — approving a proposal whose rule is RETIRED must not be acked
+# "now active". apply_ai_refinement reports status "retired"; both YES branches
+# (spam_example_proposal AND the #17 FP-narrowing path) keep the conversation
+# pending and send the honest "Couldn't reactivate that rule" ack instead.
+# ===========================================================================
+
+def test_e2e_yes_retired_rule_email_acks_honestly(monkeypatch):
+    """spam_example_proposal YES where the referenced rule is retired: the
+    caller must keep the conv pending, log no 'applied' event, and send the
+    honest ack — never 'The refinement has been applied'."""
+    monkeypatch.setattr(spam_filter, "apply_ai_refinement",
+                        lambda *a, **k: ("retired", ""))
+    events = _apply_failed_events(monkeypatch)
+
+    from datetime import datetime, timedelta
+    sfid = "SFID-RETIRED1"
+    conv = {
+        "id": sfid,
+        "kind": "spam_example_proposal",
+        "status": "awaiting_reply",
+        "expires": (datetime.now() + timedelta(days=7)).isoformat(),
+        "proposed_refinement": {"id": "R-ret", "headline": "h",
+                                "keywords": ["x"]},
+        "conversation_history": [],
+        "resolution": None,
+    }
+    pending = {"conversations": [conv]}
+
+    calls = _dry_run_filter_harness(
+        monkeypatch, uids=[b"1"], msg_data=_yes_reply_msg(sfid),
+        dry_run=False, pending=pending)
+
+    assert conv["status"] == "awaiting_reply"
+    assert "applied" not in [e.get("event") for e in events]
+    subjects = [s for (s, _b) in calls["send_email_args"]]
+    assert any(s.startswith("Couldn't reactivate that rule [") for s in subjects)
+    assert not any("The refinement has been applied" in s for s in subjects)
+
+
+def test_e2e_yes_retired_rule_fp_path_acks_honestly(monkeypatch):
+    """Finding #8 cross-effect of #17: the FP-narrowing YES branch also routes
+    through apply_ai_refinement. If it reports 'retired', the caller must send
+    the honest ack, not 'now active' (defensive/near-dead path — a freshly
+    minted FP id can't collide, but the branch must exist and be revert-proof)."""
+    monkeypatch.setattr(spam_filter, "apply_ai_refinement",
+                        lambda *a, **k: ("retired", ""))
+    events = _apply_failed_events(monkeypatch)
+
+    from datetime import datetime, timedelta
+    sfid = "SFID-RETIRED2"
+    conv = {
+        "id": sfid,
+        "status": "awaiting_reply",
+        "expires": (datetime.now() + timedelta(days=7)).isoformat(),
+        "api_analysis": BARE_LABEL_ANALYSIS,
+        "proposed_changes": {"signals_to_narrow": {"from_analysis": "narrow X"},
+                             "tradeoffs": "low"},
+        "conversation_history": [],
+        "resolution": None,
+    }
+    pending = {"conversations": [conv]}
+
+    calls = _dry_run_filter_harness(
+        monkeypatch, uids=[b"1"], msg_data=_yes_reply_msg(sfid),
+        dry_run=False, pending=pending)
+
+    assert conv["status"] == "awaiting_reply"
+    subjects = [s for (s, _b) in calls["send_email_args"]]
+    assert any(s.startswith("Couldn't reactivate that rule [") for s in subjects)
+    assert not any("The refinement has been applied" in s for s in subjects)
 
 
 # ===========================================================================

@@ -3191,20 +3191,38 @@ def append_refinement_log(event: dict) -> None:
 def apply_ai_refinement(refinement: dict,
                          logger: logging.Logger,
                          source: str = "email",
-                         sfid: str = "") -> str:
-    """Append an approved AI refinement to signals.json[ai_refinements] and
-    log the event. Returns a human-readable description for the email
-    confirmation body."""
+                         sfid: str = "") -> tuple[str, str]:
+    """Append an approved AI refinement to signals.json[ai_refinements] and log
+    the event. Returns ``(status, description)`` where status is one of:
+
+      "applied"        — a NEW record was appended and saved (logs "applied").
+      "already_active" — the id is already an ACTIVE rule: no write, and NO log
+                         (re-approving must not double-log an "applied" event).
+      "retired"        — the id exists but is RETIRED, so it was NOT reactivated:
+                         no write, logs "apply_failed". The caller MUST ack
+                         honestly and offer RESTORE — never "now active".
+
+    ``description`` is the human-readable confirmation body on the "applied" /
+    "already_active" paths, and "" on the "retired" path (the caller supplies
+    its own honest copy)."""
     # Locked read-modify-write of signals.json so a concurrent learner save is
     # not clobbered (C7). The re-read happens inside the lock.
+    rid = refinement.get("id", "")
     with file_lock.locked(SIGNALS_PATH):
         data = load_signals()
         refinements = data.setdefault("ai_refinements", [])
-        existing_ids = {r.get("id") for r in refinements}
-        rid = refinement.get("id", "")
-        if rid and rid in existing_ids:
+        existing = next((r for r in refinements if r.get("id") == rid),
+                        None) if rid else None
+        if existing is not None and existing.get("status", "active") != "active":
+            # Ack-blind bug (finding #8): the id belongs to a rule the owner
+            # DROPped. Approving does not un-drop it — do not write, do not
+            # claim it is active.
+            status = "retired"
+        elif existing is not None:
+            status = "already_active"
             logger.info(f"  [AI REFINEMENT] {rid} already active — skipping add")
         else:
+            status = "applied"
             record = dict(refinement)
             record["status"] = "active"
             record.setdefault("first_learned", datetime.now().isoformat())
@@ -3214,14 +3232,28 @@ def apply_ai_refinement(refinement: dict,
             save_signals(data)
             logger.info(f"  [AI REFINEMENT] Applied {rid}: "
                         f"{refinement.get('headline', '')[:60]}")
-    append_refinement_log({
-        "ts": datetime.now().isoformat(),
-        "event": "applied",
-        "id": rid,
-        "sfid": sfid,
-        "headline": refinement.get("headline", ""),
-        "source": source,
-    })
+    # Log ONLY a genuine append as "applied" (re-approving an already-active
+    # rule must NOT double-log). A retired-id approval is a no-op that leaves
+    # the conversation pending, recorded as "apply_failed".
+    if status == "applied":
+        append_refinement_log({
+            "ts": datetime.now().isoformat(),
+            "event": "applied",
+            "id": rid,
+            "sfid": sfid,
+            "headline": refinement.get("headline", ""),
+            "source": source,
+        })
+    elif status == "retired":
+        append_refinement_log({
+            "ts": datetime.now().isoformat(),
+            "event": "apply_failed",
+            "id": rid,
+            "sfid": sfid,
+            "reason": "referenced rule is retired",
+            "source": source,
+        })
+        return status, ""
     desc_parts = [
         f"Headline: {refinement.get('headline', '')}",
         f"Confidence: {refinement.get('confidence', 'medium')}",
@@ -3236,7 +3268,7 @@ def apply_ai_refinement(refinement: dict,
             "What this does NOT cover:",
             refinement["what_this_doesnt_cover"],
         ])
-    return "\n".join(desc_parts)
+    return status, "\n".join(desc_parts)
 
 
 def apply_signal_changes(proposed_changes: dict, logger: logging.Logger) -> str:
@@ -3531,6 +3563,25 @@ _FP_APPLY_FAILED_BODY = (
     "To fix it: forward the original email again with the subject "
     "\"Fwd: False Positive\". MailWarden will run a fresh analysis and send you "
     "a new proposal to approve.\n\n"
+    "If you do nothing, this proposal expires on {expires} and is discarded.\n"
+)
+
+
+# Finding #8: honest ack sent when an owner approves a refinement whose rule id
+# is RETIRED (dropped). Approving a proposal does not un-drop a rule, so
+# apply_ai_refinement reports status "retired" and never writes — the caller
+# keeps the proposal open and sends this instead of the "now active" ack. The
+# only working restore path is the daily-report RESTORE reply (finding #10),
+# which is keyed by the rule's report NUMBER, not this SFID; the copy points
+# there truthfully. Same shape as _FP_APPLY_FAILED_BODY: keep the proposal
+# open, keep the {expires} placeholder.
+_REFINEMENT_RETIRED_BODY = (
+    "MailWarden did not turn that rule back on. This proposal matches a learned "
+    "rule you dropped earlier, and approving a proposal does not un-drop a rule on its own.\n\n"
+    "Your filter is unchanged and this proposal is still open.\n\n"
+    "To turn the rule back on, reply RESTORE followed by its number (for example, "
+    "RESTORE 2) to the daily-report email or drop confirmation that lists it. Once "
+    "it is active again, you can approve this proposal to reinforce it.\n\n"
     "If you do nothing, this proposal expires on {expires} and is discarded.\n"
 )
 
@@ -7995,23 +8046,45 @@ Conversation ID: {sfid}
                                         logger,
                                         to_addr=account.get("username", ""))
                                 else:
-                                    change_desc = apply_ai_refinement(
+                                    ref_status, change_desc = apply_ai_refinement(
                                         refinement, logger,
                                         source="email", sfid=sfid)
-                                    conv["status"] = "approved"
-                                    conv["resolution"] = "approved"
-                                    persist_pending_merge(pending, {sfid})
-                                    send_email(
-                                        config,
-                                        f"The refinement has been applied [{sfid}]",
-                                        f"The refinement has been applied and is now active in "
-                                        f"the filter.\n\n"
-                                        f"{change_desc}\n\n"
-                                        f"Refinement ID: {refinement.get('id', '')}\n"
-                                        f"To remove it later, open Dashboard -> Signal History "
-                                        f"and click Delete on the refinement card.\n",
-                                        logger,
-                                        to_addr=account.get("username", ""))
+                                    if ref_status == "retired":
+                                        # Finding #8: the proposal names a rule
+                                        # the owner dropped; approving does not
+                                        # un-drop it. Keep it pending and ack
+                                        # honestly (the verify-before-ack
+                                        # pattern) — apply_ai_refinement already
+                                        # logged apply_failed.
+                                        conv["conversation_history"].append({
+                                            "role": "system_email",
+                                            "timestamp": datetime.now().isoformat(),
+                                            "content": ("Apply failed: rule is "
+                                                        "retired; kept pending"),
+                                        })
+                                        persist_pending_merge(pending, {sfid})
+                                        send_email(
+                                            config,
+                                            f"Couldn't reactivate that rule [{sfid}]",
+                                            _REFINEMENT_RETIRED_BODY.format(
+                                                expires=conv.get("expires", "")[:10]),
+                                            logger,
+                                            to_addr=account.get("username", ""))
+                                    else:
+                                        conv["status"] = "approved"
+                                        conv["resolution"] = "approved"
+                                        persist_pending_merge(pending, {sfid})
+                                        send_email(
+                                            config,
+                                            f"The refinement has been applied [{sfid}]",
+                                            f"The refinement has been applied and is now active in "
+                                            f"the filter.\n\n"
+                                            f"{change_desc}\n\n"
+                                            f"Refinement ID: {refinement.get('id', '')}\n"
+                                            f"To remove it later, open Dashboard -> Signal History "
+                                            f"and click Delete on the refinement card.\n",
+                                            logger,
+                                            to_addr=account.get("username", ""))
                             else:
                                 # Verify-before-ack (legacy false_positive). The
                                 # stored proposed_changes may be empty because an
@@ -8058,23 +8131,44 @@ Conversation ID: {sfid}
                                     # "applied" event, so no separate log here.
                                     refinement = _fp_narrowing_to_refinement(
                                         proposed, conv, signals, source="email")
-                                    change_desc = apply_ai_refinement(
+                                    ref_status, change_desc = apply_ai_refinement(
                                         refinement, logger,
                                         source="email", sfid=sfid)
-                                    conv["status"] = "approved"
-                                    conv["resolution"] = "approved"
-                                    persist_pending_merge(pending, {sfid})
-                                    send_email(
-                                        config,
-                                        f"The refinement has been applied [{sfid}]",
-                                        f"The refinement has been applied and is now active in "
-                                        f"the filter.\n\n"
-                                        f"{change_desc}\n\n"
-                                        f"Refinement ID: {refinement.get('id', '')}\n"
-                                        f"To remove it later, open Dashboard -> Signal History "
-                                        f"and click Delete on the refinement card.\n",
-                                        logger,
-                                        to_addr=account.get("username", ""))
+                                    if ref_status == "retired":
+                                        # Finding #8 (defensive): a freshly minted
+                                        # FP-narrowing id cannot collide with a
+                                        # retired rule, but keep the ack honest
+                                        # and consistent with the spam-example
+                                        # path if it ever does.
+                                        conv["conversation_history"].append({
+                                            "role": "system_email",
+                                            "timestamp": datetime.now().isoformat(),
+                                            "content": ("Apply failed: rule is "
+                                                        "retired; kept pending"),
+                                        })
+                                        persist_pending_merge(pending, {sfid})
+                                        send_email(
+                                            config,
+                                            f"Couldn't reactivate that rule [{sfid}]",
+                                            _REFINEMENT_RETIRED_BODY.format(
+                                                expires=conv.get("expires", "")[:10]),
+                                            logger,
+                                            to_addr=account.get("username", ""))
+                                    else:
+                                        conv["status"] = "approved"
+                                        conv["resolution"] = "approved"
+                                        persist_pending_merge(pending, {sfid})
+                                        send_email(
+                                            config,
+                                            f"The refinement has been applied [{sfid}]",
+                                            f"The refinement has been applied and is now active in "
+                                            f"the filter.\n\n"
+                                            f"{change_desc}\n\n"
+                                            f"Refinement ID: {refinement.get('id', '')}\n"
+                                            f"To remove it later, open Dashboard -> Signal History "
+                                            f"and click Delete on the refinement card.\n",
+                                            logger,
+                                            to_addr=account.get("username", ""))
 
                         elif classification == "qualified_yes":
                             _send_scope_clarification(

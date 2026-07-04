@@ -139,6 +139,22 @@ def pending_proposal_label(refinement):
     return _PENDING_LABEL_DEFAULT
 
 
+def pending_retired_message():
+    """Owner-facing ack when a Dashboard approval names a rule the owner dropped.
+
+    Finding #8: the Dashboard has no restore control, and approving a proposal
+    does not un-drop a rule, so this points the owner at the working email
+    RESTORE reply (finding #10) instead of falsely claiming it is now active.
+    Pure (no tk, no IO) so the copy is unit-tested headlessly.
+    """
+    return (
+        "This proposal matches a learned rule you dropped earlier, so it was not "
+        "turned back on. Approving here does not un-drop a rule.\n\n"
+        "To turn it back on, reply RESTORE with the rule's number to the daily-report "
+        "email or drop confirmation that lists it. The Dashboard can't restore a dropped rule."
+    )
+
+
 # =============================================================================
 # Main window
 # =============================================================================
@@ -2909,16 +2925,19 @@ class SignalsTab(ttk.Frame):
             return
 
         # Content ai_refinement (spam_example_proposal).
-        applied = config_io.apply_refinement_from_pending(sfid, source="dashboard")
-        if applied:
-            messagebox.showinfo(
-                "Applied",
-                f"Refinement {applied.get('id', '')} is now active.")
-        else:
+        result = config_io.apply_refinement_from_pending(sfid, source="dashboard")
+        if result is None:
             messagebox.showerror(
                 "Could not apply",
                 f"SFID {sfid} not found or not approvable from the Dashboard "
                 f"(false-positive narrowings must be approved by email reply).")
+        elif result.get("status") == "retired":
+            # Finding #8: the rule was dropped; approving here can't un-drop it.
+            messagebox.showwarning("Not reactivated", pending_retired_message())
+        else:
+            messagebox.showinfo(
+                "Applied",
+                f"Refinement {result.get('id', '')} is now active.")
         self.refresh()
 
     def _on_reject_pending(self, sfid: str):

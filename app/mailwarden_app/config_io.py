@@ -530,14 +530,22 @@ def apply_refinement_from_pending(sfid: str, source: str = "dashboard") -> dict 
         if not isinstance(refinement, dict):
             return None
 
-        # Add to active list
+        # Add to active list. Finding #8: the id may reference a rule the owner
+        # DROPped. Approving does not un-drop it, so distinguish a genuine new
+        # rule from an already-active one (no-op) from a RETIRED one that this
+        # apply cannot reactivate (honest fail — the owner must RESTORE it).
         data = load_signals()
         refinements = data.setdefault("ai_refinements", [])
-        existing_ids = {r.get("id") for r in refinements}
-        if refinement.get("id") in existing_ids:
-            # Already active — treat as no-op but still mark conv resolved
-            pass
+        rid = refinement.get("id")
+        existing = next((r for r in refinements if r.get("id") == rid),
+                        None) if rid else None
+        if existing is not None and existing.get("status", "active") != "active":
+            outcome = "retired"
+        elif existing is not None:
+            # Already active — treat as no-op but still mark conv resolved.
+            outcome = "already_active"
         else:
+            outcome = "applied"
             refinement = dict(refinement)
             # P1 approval backstop: proposals created before scope-capture
             # existed carry no scope. Bind them to the inbox that forwarded the
@@ -556,22 +564,42 @@ def apply_refinement_from_pending(sfid: str, source: str = "dashboard") -> dict 
             refinements.append(refinement)
             save_signals(data)
 
-        conv["status"] = "approved"
-        conv["resolution"] = "approved"
-        conv.setdefault("conversation_history", []).append({
-            "role": "system",
-            "timestamp": now_iso(),
-            "content": f"Approved via {source}",
+        if outcome != "retired":
+            # Retired: leave the proposal PENDING (do not resolve it) so the
+            # Dashboard can ack honestly and point the owner at the email
+            # RESTORE reply.
+            conv["status"] = "approved"
+            conv["resolution"] = "approved"
+            conv.setdefault("conversation_history", []).append({
+                "role": "system",
+                "timestamp": now_iso(),
+                "content": f"Approved via {source}",
+            })
+            save_pending_signals(pending)
+    # Log ONLY a genuine append as "applied" (re-approving an already-active
+    # rule must not double-log). A retired-id approval is a no-op → "apply_failed".
+    if outcome == "applied":
+        append_refinement_log({
+            "ts": now_iso(),
+            "event": "applied",
+            "id": refinement.get("id"),
+            "sfid": sfid,
+            "headline": refinement.get("headline", ""),
+            "source": source,
         })
-        save_pending_signals(pending)
-    append_refinement_log({
-        "ts": now_iso(),
-        "event": "applied",
-        "id": refinement.get("id"),
-        "sfid": sfid,
-        "headline": refinement.get("headline", ""),
-        "source": source,
-    })
+        return refinement
+    if outcome == "retired":
+        append_refinement_log({
+            "ts": now_iso(),
+            "event": "apply_failed",
+            "id": rid,
+            "sfid": sfid,
+            "reason": "referenced rule is retired",
+            "source": source,
+        })
+        return {"id": rid, "status": "retired",
+                "headline": refinement.get("headline", "")}
+    # already_active: truthful "it's active" for the caller; no re-log.
     return refinement
 
 
