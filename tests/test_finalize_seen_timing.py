@@ -238,10 +238,19 @@ def test_sfid_reply_happy_path_finalizes_once(monkeypatch):
 
 
 def test_sfid_own_email_still_record_only_not_seen(monkeypatch):
-    """Regression guard: MailWarden's own outgoing SFID email (empty reply
-    after stripping quotes) must remain record-only / left UNSEEN (finding
-    #13) — the fix must not route this exit through _finalize_command()."""
-    msg = _base_msg("Re: [SFID-TEST1] Block sender?", "> quoted only\n")
+    """Regression guard: MailWarden's own outgoing SFID email (recognized by
+    its _own_prefixes opening line) must remain record-only / left UNSEEN
+    (finding #13) — the fix must not route this exit through
+    _finalize_command().
+
+    Finding #11 note: this fixture used to be a quoted-only (empty-reply)
+    body, but an empty auth-gated owner reply now gets a could-not-read ack
+    and IS finalized (see tests/test_html_bottompost_replies.py). The
+    own-mail skip is driven by the prefix arm alone, so pin it with a real
+    own-prefix body."""
+    msg = _base_msg("Re: [SFID-TEST1] Block sender?",
+                    "Your false positive has been analyzed and a signal "
+                    "change is proposed below.\n")
     calls = _run_harness(monkeypatch, msg_data=msg,
                         pending=_block_sender_conv())
     assert calls["mark_uid_seen"] == 0, (

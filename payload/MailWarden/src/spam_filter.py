@@ -3009,6 +3009,32 @@ def extract_reply_text(plain_body: str) -> str:
     return "\n".join(reply_lines).strip()
 
 
+def extract_reply_text_with_html_fallback(msg_data: dict) -> str:
+    """Reply text from the plain part; if that is empty, fall back to the
+    visible text of the HTML part (finding #11 — HTML-only replies from
+    clients that send no text/plain alternative). Reuses the hardened
+    html_to_text converter already on the classification hot path and the
+    same quote-stripping rules, so an HTML-only top-posted reply parses
+    exactly like its plain-text twin.
+
+    Bottom-posted replies (owner's text BELOW the "On ... wrote:" line)
+    still parse empty BY DESIGN: extract_reply_text's break logic is
+    intentionally unchanged, because scanning below the quote would let the
+    proposal's own quoted "Reply YES to apply, NO to reject" instruction
+    line bleed into the reply, and classify_reply's negative-wins phrase
+    matching would then turn a bottom-posted YES into a silent rejection.
+    Unreadable replies get the could-not-read ack in the reply handlers
+    instead."""
+    plain = extract_reply_text(msg_data.get("plain_text_body", "") or "").strip()
+    if plain:
+        return plain
+    html_raw = msg_data.get("html_body", "") or ""
+    if html_raw:
+        visible = html_to_text(html_raw[:_HTML_CONVERSION_INPUT_CAP])
+        return extract_reply_text(visible).strip()
+    return ""
+
+
 def append_refinement_log(event: dict) -> None:
     """Append a JSONL event to ~/MailWarden/memory/signal_refinements.log.
 
@@ -3193,6 +3219,36 @@ _FP_APPLY_FAILED_BODY = (
     "\"Fwd: False Positive\". MailWarden will run a fresh analysis and send you "
     "a new proposal to approve.\n\n"
     "If you do nothing, this proposal expires on {expires} and is discarded.\n"
+)
+
+
+# Finding #11: honest ack sent when an auth-gated owner reply to an
+# [SFID-...] analysis email parses empty even after the HTML fallback
+# (HTML with no visible text, a bottom-posted reply below the quote, or a
+# genuinely empty reply). Its FIRST sentence MUST also appear verbatim in
+# _own_prefixes (pinned by test): the body deliberately names YES and NO,
+# so if the X-MailWarden-System stamp were ever lost, classify_reply's
+# negative-wins phrase matching would read this ack as a rejection — the
+# prefix guard is the defense-in-depth that keeps the filter from ever
+# acting on its own ack.
+_SFID_UNREADABLE_REPLY_BODY = (
+    "MailWarden received your reply but couldn't read any instruction in it. "
+    "Please reply again with your answer (for example YES or NO) on its own "
+    "line, ABOVE the quoted message.\n\n"
+    "Conversation ID: {sfid}\n"
+)
+
+# Finding #11, MWR twin. No _own_prefixes list exists for [MWR-...] mail, so
+# the self-trigger defense is structural instead: "APPROVE 3" stays strictly
+# MID-LINE (never at the start of a line), because _parse_command_numbers
+# only matches a verb that STARTS a line (pinned by test). If the
+# X-MailWarden-System stamp were ever lost, this body parses as neither
+# APPROVE nor KEEP/DROP and falls through to ordinary classification —
+# never back into a reply handler.
+_MWR_UNREADABLE_REPLY_BODY = (
+    "MailWarden received your reply to the daily report but couldn't read a "
+    "command in it. Please reply again with your command (for example "
+    "\"APPROVE 3\") on its own line, ABOVE the quoted report.\n"
 )
 
 
@@ -7246,7 +7302,8 @@ Conversation ID: {sfid}
 
                         # Check if this is our own outgoing analysis (not a user reply).
                         body_text = msg_data.get("plain_text_body", "")
-                        reply_text_check = extract_reply_text(body_text).strip()
+                        reply_text_check = extract_reply_text_with_html_fallback(
+                            msg_data)
                         _own_prefixes = (
                             "Your false positive has been analyzed",
                             "The proposed signal change has been applied",
@@ -7256,15 +7313,35 @@ Conversation ID: {sfid}
                             "The refinement proposal has been rejected",
                             "Your reply looks like it may include a condition:",
                             "MailWarden could not apply this signal change",
+                            # Finding #11: the could-not-read ack names YES and
+                            # NO, so it must stay recognizable as our own mail
+                            # even if the X-MailWarden-System stamp were lost.
+                            "MailWarden received your reply but couldn't read any instruction in it.",
                         )
-                        is_our_own_email = (
-                            any(body_text.strip().startswith(p) for p in _own_prefixes)
-                            or (not reply_text_check)  # No reply text after stripping quotes
-                        )
-                        if is_our_own_email:
+                        if any(body_text.strip().startswith(p)
+                               for p in _own_prefixes):
                             logger.debug(f"  Skipping own SFID email: {sfid}")
                             _record_processed(processed, account_key,
                                               account_processed, msg_id)
+                            continue
+                        if not reply_text_check:
+                            # Finding #11: an auth-gated OWNER reply we could
+                            # not read — HTML with no visible text, a bottom-
+                            # posted reply below the quote, or genuinely
+                            # empty. Previously swallowed silently as "our own
+                            # email"; ack honestly instead. send_email stamps
+                            # X-MailWarden-System, so the loop-top guard skips
+                            # the ack next tick (no ack-of-ack loop).
+                            logger.info(
+                                f"  Unreadable SFID reply {sfid} — sending "
+                                f"could-not-read ack")
+                            send_email(config,
+                                f"Re: [{sfid}] — couldn't read your reply",
+                                _SFID_UNREADABLE_REPLY_BODY.format(sfid=sfid),
+                                logger,
+                                to_addr=account.get("username", ""))
+                            _finalize_command()
+                            total_evaluated += 1
                             continue
 
                         logger.info(f"  SFID reply detected: {sfid}")
@@ -7302,8 +7379,10 @@ Conversation ID: {sfid}
                             total_evaluated += 1
                             continue
 
-                        # Parse user reply
-                        reply_text = extract_reply_text(msg_data.get("plain_text_body", ""))
+                        # Parse user reply (finding #11: the fallback-aware
+                        # value computed above, so an HTML-only reply's text
+                        # reaches classify_reply exactly like a plain one).
+                        reply_text = reply_text_check
 
                         conv["conversation_history"].append({
                             "role": "user_reply",
@@ -7689,17 +7768,38 @@ USER'S FOLLOW-UP:
                         # carries the [MWR-...] subject and an instruction line
                         # containing "APPROVE 3" (daily_report.send_report does
                         # not stamp X-MailWarden-System, so the loop-top guard
-                        # does not catch it). Mirror the SFID _own_prefixes
-                        # guard; also skip when the reply text is empty. Leave
-                        # UNSEEN so the owner still reads the report.
+                        # does not catch it). This prefix check is the PRIMARY
+                        # own-report guard and must run before the empty-reply
+                        # check; the report is plain-text-only (MIMEText
+                        # "plain"), so the HTML fallback below can never make
+                        # its body parse as a reply. Leave UNSEEN so the owner
+                        # still reads the report.
                         body_text = msg_data.get("plain_text_body", "")
-                        reply_text = extract_reply_text(body_text).strip()
-                        if (body_text.strip().startswith("SPAM FILTER DAILY REPORT")
-                                or not reply_text):
+                        reply_text = extract_reply_text_with_html_fallback(
+                            msg_data)
+                        if body_text.strip().startswith("SPAM FILTER DAILY REPORT"):
                             logger.debug(
-                                f"  Skipping own/empty MWR email: MWR-{mwr_token}")
+                                f"  Skipping own report: MWR-{mwr_token}")
                             _record_processed(processed, account_key,
                                               account_processed, msg_id)
+                            continue
+                        if not reply_text:
+                            # Finding #11: an auth-gated OWNER reply we could
+                            # not read (HTML with no visible text, bottom-
+                            # posted below the quoted report, or genuinely
+                            # empty). Previously swallowed silently; ack
+                            # honestly instead. send_email stamps
+                            # X-MailWarden-System, so the ack cannot loop.
+                            logger.info(
+                                f"  Unreadable MWR reply MWR-{mwr_token} — "
+                                f"sending could-not-read ack")
+                            send_email(config,
+                                f"Re: [MWR-{mwr_token}] — couldn't read your reply",
+                                _MWR_UNREADABLE_REPLY_BODY,
+                                logger,
+                                to_addr=account.get("username", ""))
+                            _finalize_command()
+                            total_evaluated += 1
                             continue
 
                         approve_nums = parse_approve_command(reply_text)
