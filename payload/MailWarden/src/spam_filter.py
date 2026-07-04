@@ -5686,6 +5686,36 @@ def fetch_raw_email(conn: imaplib.IMAP4_SSL, uid: bytes,
     return data[0][1]
 
 
+def fetch_message_id(conn: imaplib.IMAP4_SSL, uid: bytes,
+                     logger: logging.Logger) -> str:
+    """PEEK-fetch ONLY the Message-ID header for a UID, normalized exactly as
+    extract_email_data does, or "" if the header is absent/unreadable or the
+    fetch fails. Uses BODY.PEEK so it never sets \\Seen.
+
+    Finding #20: lets run_filter skip the full-body download for a message
+    whose Message-ID is already handled (in processed_ids or, in Dry Run, the
+    dry-run sidecar). It is exception-safe on purpose: any conn that does not
+    behave like a live IMAP connection yields "", which disables the
+    optimization (the caller falls through to a normal full fetch) rather than
+    dropping the message."""
+    try:
+        status, data = conn.uid(
+            "FETCH", uid, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+    except Exception as e:
+        logger.debug(f"  Header-only fetch failed for UID {uid!r}: {e}")
+        return ""
+    if status != "OK" or not data or not data[0]:
+        return ""
+    try:
+        header_bytes = data[0][1]
+    except (IndexError, TypeError):
+        return ""
+    if not header_bytes:
+        return ""
+    msg = email.message_from_bytes(header_bytes, policy=email.policy.compat32)
+    return str(msg.get("Message-ID", "") or "")
+
+
 def mark_uid_seen(conn: imaplib.IMAP4_SSL, uid: bytes,
                   logger: logging.Logger) -> None:
     """Flag a UID as \\Seen so the filter won't reprocess the same user-
@@ -6548,6 +6578,29 @@ def run_filter(force: bool = False):
                         logger.info(f"  Reached max_emails_per_run ({max_per_run}), stopping")
                         break
 
+                    # Finding #20: fetch ONLY the Message-ID header first and,
+                    # if we have already handled this exact message, skip the
+                    # full body download entirely. Pure bandwidth/cost saving —
+                    # it skips the same messages the account_processed check
+                    # (~6567) and, in Dry Run, the dry-run sidecar check
+                    # (~8836) already skip, just before the wasted download.
+                    # This includes our own proposal/analysis/ack mail that
+                    # finding #13 deliberately leaves UNSEEN, so it recurs every
+                    # tick. account_dry_seen is an empty set in real mode
+                    # (built ~6506 only when dry_run), so the second clause is a
+                    # no-op then. A missing/unreadable Message-ID returns "" and
+                    # falls through to the full fetch, which computes the
+                    # synthetic ID and re-checks both sets exactly as before, so
+                    # no new message is ever skipped and nothing is
+                    # double-processed. fetch_message_id PEEKs, never \\Seen.
+                    peek_msg_id = fetch_message_id(conn, uid, logger)
+                    if peek_msg_id and (peek_msg_id in account_processed
+                                        or peek_msg_id in account_dry_seen):
+                        logger.debug(
+                            f"  Skipping already-handled (header-only): "
+                            f"{peek_msg_id}")
+                        continue
+
                     # Fetch and parse the email
                     raw = fetch_raw_email(conn, uid, logger)
                     if raw is None:
@@ -6574,7 +6627,14 @@ def run_filter(force: bool = False):
                     # "Whitelist — Could Not Parse" reply whose subject starts with
                     # "Whitelist"), command detection would fire on it, produce
                     # another error reply, and loop indefinitely. Guard against this
-                    # by marking the message seen and skipping it entirely.
+                    # by recording it processed (so the already-processed skip at
+                    # the top of the loop cheaply drops it on every later tick, and
+                    # finding #20's header-first check skips the download) and
+                    # skipping it here — but do NOT mark it \\Seen (finding #13):
+                    # leave it UNSEEN so the owner still sees our proposals/
+                    # analyses/acks/notices in their unread badge. Mirrors the
+                    # daily-report (~8371) and SFID own-prefix (~7813) own-mail
+                    # skips, which also record-without-mark-seen.
                     _mw_system_hdr = str(
                         msg_data.get("_mime_msg", {}) and
                         msg_data["_mime_msg"].get("X-MailWarden-System", "") or ""
@@ -6588,7 +6648,6 @@ def run_filter(force: bool = False):
                             f"  Skipping own MailWarden system email "
                             f"(X-MailWarden-System: 1): {msg_data.get('subject','')[:60]}"
                         )
-                        mark_uid_seen(conn, uid, logger)
                         _record_processed(processed, account_key,
                                           account_processed, msg_id)
                         continue

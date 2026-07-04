@@ -26,6 +26,7 @@ Harness style mirrors tests/test_rule_review.py's `_rr_harness` /
 tests/test_cascade.py's `_run_filter_cascade_harness` — a full
 spam_filter.run_filter(force=True) drive with every IO/network call mocked.
 """
+import email as _email
 import logging as _logging
 import os
 import sys
@@ -258,6 +259,33 @@ def test_sfid_own_email_still_record_only_not_seen(monkeypatch):
     assert msg["message_id"] in _msg_ids_recorded(calls), (
         "own/empty SFID email must still be recorded processed"
         " (loop prevention)")
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Finding #13 — the loop-top self-loop guard. MailWarden's own outgoing mail
+# (X-MailWarden-System: 1 — learner proposals, FP analyses, acks, AND notices/
+# EULA/dry-run reminders, all sent via send_email) must be recorded processed
+# (loop prevention) but left UNSEEN, so the owner still sees it in their
+# unread badge. Mirrors the daily-report (~8371) and SFID own-prefix (~7813)
+# skips, which already record-without-mark-seen. Revert-proof: re-adding
+# mark_uid_seen(conn, uid, logger) to the guard flips the count 0 -> 1 here.
+# ═════════════════════════════════════════════════════════════════════════
+
+def test_own_system_mail_recorded_but_left_unseen(monkeypatch):
+    """Own outgoing mail carrying X-MailWarden-System: 1 hits the loop-top
+    guard: recorded processed, but NOT marked \\Seen (finding #13)."""
+    msg = _base_msg("MailWarden proposal [SFID-OWN1]",
+                    "MailWarden analyzed the spam example you submitted and "
+                    "proposes a new refinement to add to the filter.",
+                    msg_id="<own-proposal-1@example.com>")
+    msg["_mime_msg"] = _email.message_from_string(
+        "X-MailWarden-System: 1\n\n")
+    calls = _run_harness(monkeypatch, msg_data=msg)
+    assert calls["mark_uid_seen"] == 0, (
+        "own X-MailWarden-System mail must NOT be marked \\Seen (finding #13)")
+    assert msg["message_id"] in _msg_ids_recorded(calls), (
+        "own X-MailWarden-System mail must still be recorded processed "
+        "(loop prevention)")
 
 
 # ═════════════════════════════════════════════════════════════════════════
