@@ -699,8 +699,10 @@ def retire_ai_refinement(rule_id: str, logger: logging.Logger) -> bool:
 def unretire_ai_refinement(rule_id: str, logger: logging.Logger) -> dict:
     """RESTORE a dropped rule: flip its ai_refinement status from "retired"
     back to "active" (the reverse of retire_ai_refinement). The retired record
-    was never deleted, so this is a pure status flip — the rule fires again on
-    the NEXT sweep (signals.json is reloaded per run). Returns the reactivated
+    was never deleted, so this is a pure status flip — the rule fires again
+    immediately for the remainder of the current run (the run_filter reply
+    handler refreshes the in-memory snapshot after a RESTORE, finding #18) and
+    on every subsequent run. Returns the reactivated
     refinement dict on success, or None if no matching RETIRED rule was found
     (missing OR already active — idempotent, safe on replayed commands)."""
     restored = None
@@ -4042,6 +4044,32 @@ def injected_rule_ids(signals: dict, account_name: str = None) -> set:
     prompt for this signals set + account. Empty unless attribution is active.
     Used to whitelist the model's echoed ``matched_rules`` before logging."""
     return _build_learned_lines(signals, account_name)[1]
+
+
+def _normalize_rule_echo(rid: str) -> str:
+    """Normalize a model-echoed rule id for whitelist comparison (finding #3).
+
+    The classifier prompt shows each learned rule bracketed (``[R-...]``) and
+    _ATTRIBUTION_INSTRUCTION asks the model to echo the EXACT bracketed id, but
+    ``injected_rule_ids`` and every downstream reader (the decisions.log
+    ``RULE IDS`` line, the daily-report parse, the review queue) key off the
+    BARE id (``R-...`` / ``S-...``). Strip surrounding brackets and whitespace
+    so a bracketed echo matches the bare injected id. Whitelist semantics are
+    unchanged: the result must still be ``in`` the injected set, so this can
+    never forge an id that was never injected. Real ids are ``R-``/``S-`` +
+    hex/``-`` (random_token = token_hex; derived ids are hex), so they contain
+    no bracket or space — stripping is a no-op on a well-formed bare id."""
+    return rid.strip().strip("[]").strip() if isinstance(rid, str) else ""
+
+
+def _whitelist_echoed_rules(echoed, injected):
+    """Whitelist the model's echoed ``matched_rules`` against the ids actually
+    injected into this account's prompt (finding #3). Each echo is normalized
+    (brackets/whitespace stripped) then kept only if it was injected. Returns
+    BARE ids (what the log / report parse / review queue expect); order is
+    preserved and no un-injected id can pass."""
+    return [n for n in (_normalize_rule_echo(r) for r in (echoed or []))
+            if n in injected]
 
 
 def build_classifier_prompt(signals: dict, account_name: str = None,
@@ -8475,6 +8503,18 @@ USER'S FOLLOW-UP:
                             approved_domains = approved_senders.get(
                                 "_domains_set", set())
 
+                            # Finding #18 (APPROVE side): a first approval mid-run
+                            # flips approvals_active empty->non-empty, so rebuild
+                            # this account's prompt (RULE 0) and injected-id
+                            # whitelist from the refreshed approved set — RULE 0
+                            # then matches the OWNER-APPROVED block already
+                            # emitted for later mail in this same run.
+                            system_prompt = build_classifier_prompt(
+                                signals, account.get("username", ""),
+                                approvals_active=bool(approved_domains))
+                            account_injected_ids = injected_rule_ids(
+                                signals, account.get("username", ""))
+
                             # item (b): each rescued FP whose junk verdict was
                             # driven by a LEARNED (R-) rule queues that rule for
                             # owner review on the next report. Evidence is the
@@ -8549,6 +8589,10 @@ USER'S FOLLOW-UP:
                             review_map = token_rec.get("rule_reviews", {}) or {}
                             rr_store = load_rule_reviews_store(logger)
                             ack_lines = []
+                            # Finding #18: set when a DROP/RESTORE actually
+                            # changes which rules are active, so the classify
+                            # snapshot is refreshed once after the loop.
+                            rules_changed = False
                             for n in review_nums:
                                 rid = review_map.get(str(n))
                                 if not rid:
@@ -8560,6 +8604,7 @@ USER'S FOLLOW-UP:
                                 headline = snap.get("headline", "")
                                 if verb == "DROP":
                                     if retire_ai_refinement(rid, logger):
+                                        rules_changed = True
                                         dequeue_rule_review(rid, logger)
                                         ack_lines.append(
                                             f'Dropped rule {n} ("{headline}"). '
@@ -8577,6 +8622,7 @@ USER'S FOLLOW-UP:
                                     restored = unretire_ai_refinement(
                                         rid, logger)
                                     if restored is not None:
+                                        rules_changed = True
                                         rhead = (restored.get("headline", "")
                                                  or headline)
                                         ack_lines.append(
@@ -8596,6 +8642,20 @@ USER'S FOLLOW-UP:
                                         ack_lines.append(
                                             f"Rule {n} was already reviewed — "
                                             f"no change.")
+
+                            # Finding #18: a mid-run DROP/RESTORE changed which
+                            # learned rules are active on disk. Refresh the
+                            # in-memory snapshot so mail LATER in this same run
+                            # (and later accounts, which reuse this signals
+                            # object) classifies against the current rule set,
+                            # mirroring the per-account build above.
+                            if rules_changed:
+                                signals = load_signals()
+                                system_prompt = build_classifier_prompt(
+                                    signals, account.get("username", ""),
+                                    approvals_active=bool(approved_domains))
+                                account_injected_ids = injected_rule_ids(
+                                    signals, account.get("username", ""))
 
                             # Finding #15: one verb executed (RESTORE>DROP>KEEP
                             # precedence); if the same reply also carried another
@@ -8855,8 +8915,8 @@ USER'S FOLLOW-UP:
                     # attribution against the IDs actually injected into THIS
                     # account's prompt, so a crafted email cannot forge an
                     # attribution to an ID it was never shown.
-                    matched_rules = [rid for rid in result.get("matched_rules", [])
-                                     if rid in account_injected_ids]
+                    matched_rules = _whitelist_echoed_rules(
+                        result.get("matched_rules", []), account_injected_ids)
                     log_decision(account_name, msg_data, result, action,
                                  rule_ids=matched_rules)
 

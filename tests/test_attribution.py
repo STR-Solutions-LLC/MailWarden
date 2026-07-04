@@ -236,3 +236,62 @@ def test_run_review_tolerates_rule_ids_line(monkeypatch, tmp_path, capsys):
     assert "a@acme.test" in out
     assert "Big sale" in out
     assert "MOVED to Junk" in out
+
+
+# ── Finding #3: bracketed echo must attribute to the bare injected id ──────
+# The prompt shows each learned rule bracketed ([R-...]) and _ATTRIBUTION_
+# INSTRUCTION asks the model to echo the EXACT bracketed id, but the whitelist
+# and every downstream reader key off the BARE id. These pin the consumption-
+# side normalization that revives the whole attribution chain.
+
+def test_normalize_rule_echo_strips_brackets():
+    assert spam_filter._normalize_rule_echo("[R-20260101-abcd12]") == \
+        "R-20260101-abcd12"
+
+
+def test_normalize_rule_echo_leaves_bare_id_untouched():
+    assert spam_filter._normalize_rule_echo("R-20260101-abcd12") == \
+        "R-20260101-abcd12"
+
+
+def test_normalize_rule_echo_trims_whitespace_around_brackets():
+    assert spam_filter._normalize_rule_echo("  [R-20260101-abcd12] ") == \
+        "R-20260101-abcd12"
+
+
+def test_normalize_rule_echo_non_string_is_empty():
+    assert spam_filter._normalize_rule_echo(None) == ""
+    assert spam_filter._normalize_rule_echo(7) == ""
+
+
+def test_whitelist_matches_bracketed_echo():
+    # THE finding-#3 revert-proof case: on old code the inline comparison did
+    # `"[R-x]" in {"R-x"}` -> False, so attribution was silently dead.
+    assert spam_filter._whitelist_echoed_rules(
+        ["[R-20260101-abcd12]"], {"R-20260101-abcd12"}) == \
+        ["R-20260101-abcd12"]
+
+
+def test_whitelist_matches_bare_echo():
+    assert spam_filter._whitelist_echoed_rules(
+        ["R-20260101-abcd12"], {"R-20260101-abcd12"}) == \
+        ["R-20260101-abcd12"]
+
+
+def test_whitelist_tolerates_whitespace_and_mixed_shapes():
+    got = spam_filter._whitelist_echoed_rules(
+        [" [R-a] ", "R-b", "[S-1a2b3c4d]"], {"R-a", "R-b", "S-1a2b3c4d"})
+    assert got == ["R-a", "R-b", "S-1a2b3c4d"]
+
+
+def test_whitelist_rejects_non_injected_id_no_forgery():
+    # Normalization can only resolve to an injected id or fail; a crafted
+    # echo for an id that was never shown is still dropped.
+    assert spam_filter._whitelist_echoed_rules(
+        ["[R-evil]", "R-also-evil"], {"R-20260101-abcd12"}) == []
+
+
+def test_whitelist_empty_and_none_inputs():
+    assert spam_filter._whitelist_echoed_rules([], {"R-x"}) == []
+    assert spam_filter._whitelist_echoed_rules(None, {"R-x"}) == []
+    assert spam_filter._whitelist_echoed_rules(["[R-x]"], set()) == []

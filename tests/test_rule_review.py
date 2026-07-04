@@ -741,3 +741,211 @@ def test_classify_prompt_byte_identical_after_retire_then_unretire(signals_path)
     spam_filter.unretire_ai_refinement("R-round-trip", _LOGGER)
     got = spam_filter.build_classifier_prompt(spam_filter.load_signals())
     assert got == baseline
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 7. Finding #18 — mid-run DROP/RESTORE refreshes the in-memory classify
+#    snapshot, so mail LATER in the SAME run no longer uses the retired rule
+#    (and a restored rule is used immediately). REAL build_classifier_prompt /
+#    injected_rule_ids; stateful load_signals + retire/unretire.
+# ═════════════════════════════════════════════════════════════════════════
+
+_RULE_ID = "R-20260703-aaaa"
+
+
+def _active_rule_store():
+    return {"signals": {}, "ai_refinements": [
+        {"id": _RULE_ID, "status": "active", "verdict": "spam",
+         "rule_class": "protect", "headline": "Urgent fundraising",
+         "rationale": "asks for gift cards", "scope": "all"}]}
+
+
+def _plain_msg():
+    m = _mwr_msg(subject="Weekly newsletter from Acme",
+                 body="Hello, here is our weekly update.",
+                 from_email="news@acme.test")
+    m["message_id"] = "<plain-2@acme.test>"
+    return m
+
+
+def _snapshot_harness(monkeypatch, *, store, uids, msg_map):
+    """Drive run_filter (live) with REAL build_classifier_prompt /
+    injected_rule_ids and a stateful signals store. retire/unretire mutate the
+    store; load_signals returns a fresh deep copy each call. Captures every
+    prompt build result and every system_prompt handed to classify_email."""
+    import copy
+    calls = {"build_results": [], "classify_prompts": [], "retire": [],
+             "unretire": [], "dequeue": []}
+    cfg = {
+        "filter": {"dry_run": False, "confidence_threshold": 0.85,
+                   "max_emails_per_run": 50, "log_level": "INFO"},
+        "anthropic": {"api_key": "", "model": "x", "max_tokens": 1,
+                      "classify_mode": "single"},
+        "smtp": {"host": "smtp.example.com", "username": "owner@example.com",
+                 "from_address": "owner@example.com"},
+        "summary": {"recipient_address": "owner@example.com"},
+        "eula": {"current_version": "1.0", "sent_to_accounts": {}},
+        "accounts": [{"name": "Acct", "enabled": True,
+                      "username": "owner@example.com",
+                      "imap_host": "imap.example.com", "junk_folder": "Junk",
+                      "folders_to_scan": ["INBOX"]}],
+    }
+    monkeypatch.setattr(spam_filter, "load_config", lambda: cfg)
+    monkeypatch.setattr(spam_filter, "setup_logging", lambda level: _LOGGER)
+    monkeypatch.setattr(spam_filter, "save_last_filter_run", lambda when: None)
+    monkeypatch.setattr(spam_filter, "load_processed_ids", lambda: {"ids": {}})
+    monkeypatch.setattr(spam_filter, "load_signals",
+                        lambda: copy.deepcopy(store))
+    monkeypatch.setattr(spam_filter, "load_whitelist",
+                        lambda logger: {"domains": [], "addresses": [],
+                                        "_addresses_set": set(),
+                                        "_domains_set": set()})
+    monkeypatch.setattr(spam_filter, "load_blacklist",
+                        lambda logger: {"addresses": [], "domains": [],
+                                        "display_names": [],
+                                        "subject_keywords": []})
+    monkeypatch.setattr(spam_filter, "load_approved_senders",
+                        lambda logger: {"domains": [], "_domains_set": set()})
+    monkeypatch.setattr(spam_filter, "detect_conflicts",
+                        lambda wl, bl, logger: [])
+    monkeypatch.setattr(spam_filter, "load_token_usage", lambda: {})
+    monkeypatch.setattr(spam_filter, "new_token_delta", lambda: {})
+    monkeypatch.setattr(spam_filter, "load_pending_signals",
+                        lambda: {"conversations": []})
+    monkeypatch.setattr(spam_filter, "persist_progress",
+                        lambda processed, tu, td: None)
+    monkeypatch.setattr(spam_filter, "_maybe_send_dry_run_reminder",
+                        lambda config, accounts, logger: None)
+    monkeypatch.setattr(spam_filter, "prune_decisions_log", lambda: None)
+    monkeypatch.setattr(spam_filter, "prune_pending_signals", lambda: None)
+    monkeypatch.setattr(spam_filter, "autoseed_trusted_infra",
+                        lambda signals, config: False)
+    monkeypatch.setattr(spam_filter, "migrate_fp_narrowings",
+                        lambda signals, logger: False)
+    monkeypatch.setattr(spam_filter, "scan_train_folder",
+                        lambda conn, account, config, logger: None)
+    monkeypatch.setattr(spam_filter, "deliver_eula_if_needed",
+                        lambda *a, **k: True)
+    monkeypatch.setattr(spam_filter, "log_decision", lambda *a, **k: None)
+    monkeypatch.setattr(spam_filter, "_command_sender_is_owner",
+                        lambda *a, **k: True)
+    monkeypatch.setattr(spam_filter, "_command_auth_ok", lambda *a, **k: True)
+    monkeypatch.setattr(spam_filter, "_notify_unverified_command",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(spam_filter, "load_report_approvals_store",
+                        lambda logger: _token_store())
+    monkeypatch.setattr(spam_filter, "load_rule_reviews_store",
+                        lambda logger: {_RULE_ID: {
+                            "headline": "Urgent fundraising"}})
+
+    # REAL build_classifier_prompt, wrapped only to count/record results.
+    _real_bcp = spam_filter.build_classifier_prompt
+
+    def _bcp(signals, username=None, approvals_active=False):
+        p = _real_bcp(signals, username, approvals_active=approvals_active)
+        calls["build_results"].append(p)
+        return p
+    monkeypatch.setattr(spam_filter, "build_classifier_prompt", _bcp)
+
+    def _retire(rid, logger):
+        calls["retire"].append(rid)
+        for r in store["ai_refinements"]:
+            if r["id"] == rid and r["status"] == "active":
+                r["status"] = "retired"
+                return True
+        return False
+    monkeypatch.setattr(spam_filter, "retire_ai_refinement", _retire)
+
+    def _unretire(rid, logger):
+        calls["unretire"].append(rid)
+        for r in store["ai_refinements"]:
+            if r["id"] == rid and r["status"] == "retired":
+                r["status"] = "active"
+                return r
+        return None
+    monkeypatch.setattr(spam_filter, "unretire_ai_refinement", _unretire)
+
+    def _dequeue(rid, logger):
+        calls["dequeue"].append(rid)
+        return True
+    monkeypatch.setattr(spam_filter, "dequeue_rule_review", _dequeue)
+    monkeypatch.setattr(spam_filter, "enqueue_rule_reviews",
+                        lambda pairs, signals, logger: [])
+    monkeypatch.setattr(spam_filter, "send_email",
+                        lambda config, subject, body, logger, to_addr=None: None)
+    monkeypatch.setattr(spam_filter, "mark_uid_seen",
+                        lambda conn, uid, logger: None)
+
+    def _classify(client, system_prompt, *a, **k):
+        calls["classify_prompts"].append(system_prompt)
+        return ({"decision": "NOT_SPAM", "confidence": 0.0,
+                 "signals_hit": []}, None)
+    monkeypatch.setattr(spam_filter, "classify_email", _classify)
+    monkeypatch.setattr(spam_filter, "execute_spam_action",
+                        lambda *a, **k: "moved")
+
+    class _FakeConn:
+        def logout(self):
+            pass
+    monkeypatch.setattr(spam_filter, "connect_imap",
+                        lambda account, logger: _FakeConn())
+    monkeypatch.setattr(spam_filter, "fetch_unseen_uids",
+                        lambda conn, folder, logger: list(uids))
+    monkeypatch.setattr(spam_filter, "fetch_raw_email",
+                        lambda conn, uid, logger: uid)
+    monkeypatch.setattr(spam_filter, "extract_email_data",
+                        lambda raw, own_hosts=None: dict(msg_map[raw]))
+    spam_filter.run_filter(force=True)
+    return calls
+
+
+def test_drop_rebuilds_snapshot_excluding_dropped_rule(monkeypatch):
+    # A DROP mid-run must rebuild the classify snapshot from fresh signals.
+    # Old code built the prompt once (rule active) and never refreshed.
+    calls = _snapshot_harness(
+        monkeypatch, store=_active_rule_store(),
+        uids=[b"1"], msg_map={b"1": _mwr_msg(body="DROP 1")})
+    assert calls["retire"] == [_RULE_ID]
+    # Two builds: the per-account build (rule active) + the post-DROP rebuild.
+    assert len(calls["build_results"]) == 2
+    assert _RULE_ID in calls["build_results"][0]        # initial: rule present
+    assert _RULE_ID not in calls["build_results"][1]    # rebuild: rule gone
+
+
+def test_dropped_rule_not_in_prompt_for_later_message_same_run(monkeypatch):
+    # End-to-end: the DROP reply is message 1; message 2 (ordinary mail) must
+    # be classified against a prompt that no longer carries the dropped rule.
+    calls = _snapshot_harness(
+        monkeypatch, store=_active_rule_store(),
+        uids=[b"1", b"2"],
+        msg_map={b"1": _mwr_msg(body="DROP 1"), b"2": _plain_msg()})
+    assert calls["retire"] == [_RULE_ID]
+    assert len(calls["classify_prompts"]) == 1          # only msg 2 is classified
+    assert _RULE_ID not in calls["classify_prompts"][0]
+
+
+def test_restore_rebuilds_snapshot_including_restored_rule(monkeypatch):
+    # RESTORE mid-run reactivates a rule the run-start snapshot excluded; the
+    # rebuild must bring it back for the rest of the run.
+    store = _active_rule_store()
+    store["ai_refinements"][0]["status"] = "retired"    # dropped before this run
+    calls = _snapshot_harness(
+        monkeypatch, store=store,
+        uids=[b"1", b"2"],
+        msg_map={b"1": _mwr_msg(body="RESTORE 1"), b"2": _plain_msg()})
+    assert calls["unretire"] == [_RULE_ID]
+    assert len(calls["classify_prompts"]) == 1
+    assert _RULE_ID in calls["classify_prompts"][0]     # restored rule now used
+
+
+def test_keep_does_not_rebuild_snapshot(monkeypatch):
+    # KEEP only resolves the review queue (no status change) — it must NOT
+    # trigger a snapshot rebuild. Guards the rules_changed gate against
+    # over-refreshing.
+    calls = _snapshot_harness(
+        monkeypatch, store=_active_rule_store(),
+        uids=[b"1"], msg_map={b"1": _mwr_msg(body="KEEP 1")})
+    assert calls["retire"] == []
+    assert calls["unretire"] == []
+    assert calls["dequeue"] == [_RULE_ID]
+    assert len(calls["build_results"]) == 1             # per-account build only
