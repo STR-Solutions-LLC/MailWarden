@@ -1581,35 +1581,72 @@ def prune_pending_signals(max_age_days: int = 90):
         save_lifetime_stats(stats)
 
 
-def persist_pending_merge(pending: dict):
+def persist_pending_merge(pending: dict, touched_ids=(), *, created_ids=()):
     """Persist run_filter's pending_signals changes by MERGING them onto a fresh
-    copy under lock (audit T5).
+    copy under lock (audit T5; re-scoped for audit finding #2 — 2026-07-03).
 
     The filter loads `pending` once at run start and resolves conversations in
-    place across the whole multi-account run, saving repeatedly. A learner can
-    APPEND a brand-new proposal to pending_signals.json during that run; a blind
-    save of the filter's stale snapshot would erase it before its email goes
-    out. The learner only ever ADDS conversations (it never resolves an existing
-    one — only the filter does), so the merge is unambiguous: start from the
-    fresh file, then overlay the filter's conversations by id (the filter wins
-    for any conversation it touched), and keep any fresh conversation the filter
-    has never seen (a concurrent learner addition).
+    place across the whole multi-account run, calling this after each mutation.
+    Meanwhile pending_signals.json has OTHER concurrent writers: the learner
+    (which only ever APPENDS a new conversation), and the Dashboard / daily
+    report (which RESOLVE an existing conversation's status, or DELETE it
+    entirely via withdraw). A blind "filter's whole snapshot wins" merge (the
+    old behavior) would revert any concurrent Dashboard/report change on every
+    id the filter's stale run-start snapshot happened to still be carrying —
+    resurrecting a withdrawn proposal or reverting an approval.
+
+    The fix: the caller tells us exactly which ids it changed THIS CALL.
+    - `touched_ids`: ids of EXISTING conversations the filter mutated. Overlaid
+      onto fresh only if still present there; if a touched id is missing from
+      fresh, a concurrent withdraw deleted it — that deletion wins and the
+      filter's stale copy is NOT resurrected.
+    - `created_ids`: ids of BRAND-NEW conversations the filter appended this
+      call (e.g. a new FP-analysis proposal). Always appended if not already
+      in fresh (near-impossible collision — SFIDs are random and regenerated
+      on collision against the snapshot; see generate_sfid).
+    Every other id in fresh (including ones the filter's snapshot also
+    carries) is left exactly as fresh has it — untouched ids can never revert
+    to their run-start state.
+
+    `touched_ids`/`created_ids` are scoped to THIS CALL only, not accumulated
+    across the run: each call site passes just the id(s) it changed right
+    before calling this function. This is deliberate — if this call's overlay
+    won and a LATER call re-asserted the same id from the stale snapshot, that
+    would reintroduce the same clobber this fix removes.
+
+    Known accepted residual (not fixed here, by design — out of scope for this
+    pass): if the filter and the Dashboard both resolve the SAME conversation
+    within the same run before either merge lands, whichever write reaches
+    disk last wins. Both are terminal, owner-honest outcomes (no corruption,
+    no data loss) — this is a cosmetic "who wins" race, not a bug, and is left
+    for a future pass that would need the filter to re-check live status
+    mid-run rather than just fix this merge's overlay scope.
     """
+    touched_ids = set(touched_ids)
+    created_ids = set(created_ids)
     with file_lock.locked(PENDING_SIGNALS_PATH):
         fresh = load_pending_signals()
         merged = list(fresh.get("conversations", []))
         idx_by_id = {c.get("id"): i for i, c in enumerate(merged) if c.get("id")}
-        for conv in pending.get("conversations", []):
-            cid = conv.get("id")
+        by_id = {c.get("id"): c for c in pending.get("conversations", [])
+                 if c.get("id")}
+        for cid in touched_ids | created_ids:
+            conv = by_id.get(cid)
+            if conv is None:
+                continue
             if cid in idx_by_id:
-                merged[idx_by_id[cid]] = conv   # filter's version wins
-            else:
+                merged[idx_by_id[cid]] = conv   # filter's version wins for this id
+            elif cid in created_ids:
                 idx_by_id[cid] = len(merged)
                 merged.append(conv)             # filter-created proposal
+            # else: touched but absent from fresh — a concurrent withdraw
+            # deleted it. Deletion wins; do not resurrect.
         fresh["conversations"] = merged
         save_pending_signals(fresh)
-    # Keep the in-memory snapshot in step with what is now on disk, so the rest
-    # of this run sees the learner's concurrent additions too.
+    # Keep the in-memory snapshot in step with what is now on disk, so the
+    # rest of this run sees every concurrent writer's current state (learner
+    # additions, Dashboard/report resolutions, and withdrawals/deletions) —
+    # not just the filter's own edits.
     pending["conversations"] = fresh["conversations"]
 
 
@@ -2900,7 +2937,7 @@ def _send_scope_clarification(
     clarifying email asking the owner to confirm scope.
     History is recorded once by the caller (the SFID-reply dispatch, before
     classify_reply), so this helper must not append again."""
-    persist_pending_merge(pending)
+    persist_pending_merge(pending, {sfid})
 
     quoted = reply_text[:200].strip()
     if conv_kind == "spam_example_proposal":
@@ -6314,7 +6351,7 @@ CURRENT SIGNAL DEFINITIONS:
                                 "resolution": None,
                             }
                             pending["conversations"].append(conv)
-                            persist_pending_merge(pending)
+                            persist_pending_merge(pending, created_ids={sfid})
 
                             # Send analysis email
                             email_body = f"""Your false positive has been analyzed.
@@ -7226,7 +7263,7 @@ Conversation ID: {sfid}
                         # Check expiry
                         if datetime.now().isoformat() > conv.get("expires", ""):
                             conv["status"] = "expired"
-                            persist_pending_merge(pending)
+                            persist_pending_merge(pending, {sfid})
                             send_email(config,
                                 f"Re: [{sfid}] — Expired",
                                 f"This proposal expired on {conv['expires'][:10]}. "
@@ -7261,7 +7298,7 @@ Conversation ID: {sfid}
                             ref["rationale"] = (
                                 f"{prev}\n\nUser context: {user_ctx}").strip()
                             conv["proposed_refinement"] = ref
-                            persist_pending_merge(pending)
+                            persist_pending_merge(pending, {sfid})
                             append_refinement_log({
                                 "ts": datetime.now().isoformat(),
                                 "event": "context_added",
@@ -7294,7 +7331,7 @@ Conversation ID: {sfid}
                             ref["what_this_doesnt_cover"] = (
                                 f"{prev}\nUser narrowing: {narrow_txt}").strip()
                             conv["proposed_refinement"] = ref
-                            persist_pending_merge(pending)
+                            persist_pending_merge(pending, {sfid})
                             append_refinement_log({
                                 "ts": datetime.now().isoformat(),
                                 "event": "narrow_added",
@@ -7342,7 +7379,7 @@ Conversation ID: {sfid}
                                 blacklist = load_blacklist(logger)
                                 conv["status"] = "approved"
                                 conv["resolution"] = "approved"
-                                persist_pending_merge(pending)
+                                persist_pending_merge(pending, {sfid})
                                 append_refinement_log({
                                     "ts": datetime.now().isoformat(),
                                     "event": "applied",
@@ -7391,7 +7428,7 @@ Conversation ID: {sfid}
                                         "content": ("Apply failed: empty "
                                                     "refinement; kept pending"),
                                     })
-                                    persist_pending_merge(pending)
+                                    persist_pending_merge(pending, {sfid})
                                     append_refinement_log({
                                         "ts": datetime.now().isoformat(),
                                         "event": "apply_failed",
@@ -7411,7 +7448,7 @@ Conversation ID: {sfid}
                                         source="email", sfid=sfid)
                                     conv["status"] = "approved"
                                     conv["resolution"] = "approved"
-                                    persist_pending_merge(pending)
+                                    persist_pending_merge(pending, {sfid})
                                     send_email(
                                         config,
                                         f"The refinement has been applied [{sfid}]",
@@ -7444,7 +7481,7 @@ Conversation ID: {sfid}
                                         "content": ("Apply failed: no readable "
                                                     "proposed change; kept pending"),
                                     })
-                                    persist_pending_merge(pending)
+                                    persist_pending_merge(pending, {sfid})
                                     append_refinement_log({
                                         "ts": datetime.now().isoformat(),
                                         "event": "apply_failed",
@@ -7463,7 +7500,7 @@ Conversation ID: {sfid}
                                         proposed, logger)
                                     conv["status"] = "approved"
                                     conv["resolution"] = "approved"
-                                    persist_pending_merge(pending)
+                                    persist_pending_merge(pending, {sfid})
                                     append_refinement_log({
                                         "ts": datetime.now().isoformat(),
                                         "event": "applied",
@@ -7490,7 +7527,7 @@ Conversation ID: {sfid}
                         elif classification == "negative":
                             conv["status"] = "rejected"
                             conv["resolution"] = "rejected"
-                            persist_pending_merge(pending)
+                            persist_pending_merge(pending, {sfid})
                             refinement_id = (conv.get("proposed_refinement") or {}).get("id", "")
                             append_refinement_log({
                                 "ts": datetime.now().isoformat(),
@@ -7557,7 +7594,7 @@ USER'S FOLLOW-UP:
                                     "timestamp": datetime.now().isoformat(),
                                     "content": followup_reply[:200],
                                 })
-                                persist_pending_merge(pending)
+                                persist_pending_merge(pending, {sfid})
 
                                 send_email(config,
                                     f"Re: False Positive Analysis [{sfid}] — {conv.get('original_subject', '')[:40]}",
