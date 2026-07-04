@@ -196,13 +196,14 @@ def test_e2e_creation_parses_markdown_heading_analysis(monkeypatch):
 def test_e2e_yes_on_unparseable_keeps_pending_and_acks_honestly(monkeypatch):
     """REGRESSION (the exact production failure): YES on a conversation whose
     proposed_changes is empty and whose api_analysis is unparseable must:
-      - NOT approve, NOT call apply_signal_changes,
+      - NOT approve, NOT call apply_ai_refinement (finding #17: the FP YES branch
+        now routes through the modern refinements store),
       - stay awaiting_reply, log an 'apply_failed' (never 'applied') event,
       - send the honest 'Could not apply' ack."""
     monkeypatch.setattr(
-        spam_filter, "apply_signal_changes",
+        spam_filter, "apply_ai_refinement",
         lambda *a, **k: (_ for _ in ()).throw(
-            AssertionError("apply_signal_changes must NOT be called")))
+            AssertionError("apply_ai_refinement must NOT be called")))
     events = _apply_failed_events(monkeypatch)
 
     from datetime import datetime, timedelta
@@ -234,15 +235,16 @@ def test_e2e_yes_on_unparseable_keeps_pending_and_acks_honestly(monkeypatch):
 def test_e2e_yes_self_heals_from_api_analysis(monkeypatch):
     """A conversation stored (on the M1) with EMPTY proposed_changes but a
     perfectly good Markdown-heading api_analysis must self-heal on YES:
-    re-parse, apply, approve, and send the success ack."""
-    applied = {"called": False, "arg": None}
+    re-parse, build a LEGITIMATE refinement (finding #17), approve, and send the
+    success ack. The self-healed narrowing text must reach the refinement."""
+    applied = {"called": False, "ref": None}
 
-    def _fake_apply(proposed, logger):
+    def _fake_apply(refinement, logger, source="email", sfid=""):
         applied["called"] = True
-        applied["arg"] = proposed
+        applied["ref"] = refinement
         return "narrowed the promo-keyword signal"
-    monkeypatch.setattr(spam_filter, "apply_signal_changes", _fake_apply)
-    events = _apply_failed_events(monkeypatch)
+    monkeypatch.setattr(spam_filter, "apply_ai_refinement", _fake_apply)
+    _apply_failed_events(monkeypatch)
 
     from datetime import datetime, timedelta
     sfid = "SFID-SELFHEAL1"
@@ -262,20 +264,25 @@ def test_e2e_yes_self_heals_from_api_analysis(monkeypatch):
         dry_run=False, pending=pending)
 
     assert applied["called"] is True
-    assert applied["arg"]["signals_to_narrow"].get("from_analysis", "").strip() != ""
+    # the self-healed PROPOSED CHANGE text became the refinement headline
+    assert applied["ref"]["headline"].strip() != ""
+    assert applied["ref"]["verdict"] == "legitimate"
+    assert applied["ref"]["scope"] == "all"
     assert conv["status"] == "approved"
-    ev_types = [e.get("event") for e in events]
-    assert "applied" in ev_types
     subjects = [s for (s, _b) in calls["send_email_args"]]
-    assert any("Signal Update Applied" in s for s in subjects)
+    assert any("The refinement has been applied" in s for s in subjects)
 
 
 def test_e2e_yes_bare_label_still_applies(monkeypatch):
-    """No regression: a well-formed bare-label proposal still applies + acks."""
-    applied = {"called": False}
-    monkeypatch.setattr(spam_filter, "apply_signal_changes",
-                        lambda proposed, logger: applied.__setitem__("called", True)
-                        or "narrowed X")
+    """No regression: a well-formed bare-label proposal still applies + acks.
+    Finding #17: it now applies as a LEGITIMATE refinement, not a soft_signal."""
+    applied = {"called": False, "ref": None}
+
+    def _fake_apply(refinement, logger, source="email", sfid=""):
+        applied["called"] = True
+        applied["ref"] = refinement
+        return "narrowed X"
+    monkeypatch.setattr(spam_filter, "apply_ai_refinement", _fake_apply)
     _apply_failed_events(monkeypatch)
 
     from datetime import datetime, timedelta
@@ -297,9 +304,11 @@ def test_e2e_yes_bare_label_still_applies(monkeypatch):
         dry_run=False, pending=pending)
 
     assert applied["called"] is True
+    assert applied["ref"]["headline"] == "narrow X"
+    assert applied["ref"]["verdict"] == "legitimate"
     assert conv["status"] == "approved"
     subjects = [s for (s, _b) in calls["send_email_args"]]
-    assert any("Signal Update Applied" in s for s in subjects)
+    assert any("The refinement has been applied" in s for s in subjects)
 
 
 def test_e2e_modern_branch_empty_refinement_keeps_pending(monkeypatch):

@@ -3234,6 +3234,129 @@ def apply_signal_changes(proposed_changes: dict, logger: logging.Logger) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Finding #17: route false-positive narrowings through the MODERN refinements
+# store instead of the legacy global soft_signals list.
+#
+# The legacy path (apply_signal_changes, above) appended a
+# "REFINEMENT (<name>): <text>" string to signals['signals']['soft_signals'].
+# That entry was UNSCOPED (injected into every account's prompt), MISLABELED
+# (rendered under the spam-signal header though its content is a not-spam
+# exclusion), and INVISIBLE/UNDELETABLE in the Dashboard. The helpers below
+# turn such a narrowing into a LEGITIMATE ai_refinement — verdict "legitimate"
+# (rendered as a NOT_SPAM steer), scope "all" (SAME global reach preserved),
+# and a real R- id (Dashboard-manageable + item-(b) eligible).
+# ---------------------------------------------------------------------------
+
+# A legacy narrowing line. signal_name is captured loosely ([^)]*) and the
+# body may span multiple lines (DOTALL), because the PROPOSED CHANGE block the
+# FP analysis produced is often several lines long.
+_LEGACY_FP_NARROWING_RE = re.compile(
+    r"^\s*REFINEMENT \([^)]*\):\s*(?P<text>.*)$", re.DOTALL)
+
+
+def _fp_narrowing_headline(proposed_changes: dict) -> str:
+    """Join the non-blank narrowing texts of a parsed FP proposal into one
+    plain-English headline. In practice signals_to_narrow carries a single
+    'from_analysis' entry (the PROPOSED CHANGE block); joining is defensive."""
+    narrowings = (proposed_changes or {}).get("signals_to_narrow") or {}
+    parts = [str(v).strip() for v in narrowings.values() if str(v).strip()]
+    return "\n".join(parts)
+
+
+def _mint_refinement_id(signals: dict) -> str:
+    """Mint an R-YYYYMMDD-<token> id unique against this signals dict's
+    ai_refinements. Same format as learn_signals.next_refinement_id, but with
+    NO pending_signals read, so it is safe to call while already holding the
+    SIGNALS_PATH lock (no nested/foreign lock, no extra file IO)."""
+    existing = {r.get("id", "") for r in (signals.get("ai_refinements") or [])}
+    today = datetime.now().strftime("%Y%m%d")
+    while True:
+        rid = f"R-{today}-{random_token()}"
+        if rid not in existing:
+            return rid
+
+
+def _fp_narrowing_to_refinement(proposed_changes: dict, conv: dict,
+                                signals: dict, *, source: str) -> dict:
+    """Build a LEGITIMATE ai_refinement record from an approved FP narrowing.
+
+    verdict 'legitimate' so _build_learned_lines renders it as a NOT_SPAM
+    exclusion (fixes the mislabel); scope 'all' so it keeps the global reach the
+    legacy soft_signals narrowing had (effect preserved); a real R- id so it is
+    visible/deletable in the Dashboard and eligible for item-(b) attribution.
+    PURE (no IO). ``signals`` is used only to keep the minted id unique."""
+    now = datetime.now().isoformat()
+    subject = (conv.get("original_subject") or "").strip()
+    return {
+        "id": _mint_refinement_id(signals),
+        "kind": "fp_narrowing",
+        "verdict": "legitimate",
+        "rule_class": None,
+        "headline": _fp_narrowing_headline(proposed_changes),
+        "rationale": (proposed_changes.get("tradeoffs") or "").strip(),
+        "what_this_doesnt_cover": "",
+        "confidence": "medium",
+        "evidence": [subject or "false-positive-forward"],
+        "first_learned": now,
+        "last_reinforced": now,
+        "match_count": 1,
+        "status": "active",
+        "scope": "all",
+        "source": source,
+    }
+
+
+def migrate_fp_narrowings(signals: dict, logger: logging.Logger) -> bool:
+    """Finding #17: drain legacy false-positive narrowings out of the global,
+    mislabeled soft_signals list into the modern ai_refinements store.
+
+    Mutates ``signals`` in place. Returns True iff anything changed (caller
+    saves only then, mirroring autoseed_trusted_infra). IDEMPOTENT: a second
+    pass finds no 'REFINEMENT (' entries and returns False. LOSSLESS: an entry
+    that does not cleanly match the legacy shape (a shipped default, or a
+    malformed/empty 'REFINEMENT (...)' with no body) is left in soft_signals
+    untouched — never dropped; every matched entry becomes exactly one
+    refinement with scope 'all', so its prior global reach is preserved."""
+    sig = signals.get("signals")
+    if not isinstance(sig, dict):
+        return False
+    soft = sig.get("soft_signals")
+    if not isinstance(soft, list):
+        return False
+    kept = []
+    migrated = []
+    for entry in soft:
+        m = _LEGACY_FP_NARROWING_RE.match(entry) if isinstance(entry, str) else None
+        text = m.group("text").strip() if m else ""
+        if not text:
+            # Not a legacy narrowing (a shipped default), OR a malformed/empty
+            # 'REFINEMENT (...)' with no readable body: keep it, never drop it.
+            kept.append(entry)
+            continue
+        proposed = {"signals_to_narrow": {"from_analysis": text}, "tradeoffs": ""}
+        ref = _fp_narrowing_to_refinement(
+            proposed, {}, signals, source="migrated_fp_narrowing")
+        ref["evidence"] = ["migrated-legacy-narrowing"]
+        # Append before minting the next id so the batch stays collision-free.
+        signals.setdefault("ai_refinements", []).append(ref)
+        migrated.append(ref)
+    if not migrated:
+        return False
+    sig["soft_signals"] = kept
+    for ref in migrated:
+        append_refinement_log({
+            "ts": datetime.now().isoformat(),
+            "event": "migrated",
+            "id": ref["id"],
+            "headline": ref["headline"][:200],
+            "source": "migrated_fp_narrowing",
+        })
+    logger.info(f"  [FP MIGRATION] Moved {len(migrated)} legacy narrowing(s) "
+                f"from soft_signals into ai_refinements (scope=all)")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # False-positive analysis parsing
 #
 # The FP-analysis prompt asks for bare uppercase section labels
@@ -6075,9 +6198,18 @@ def run_filter(force: bool = False):
     if not dry_run:
         with file_lock.locked(SIGNALS_PATH):
             signals = load_signals()
+            dirty = False
             if autoseed_trusted_infra(signals, config):
-                save_signals(signals)
+                dirty = True
                 logger.info("Trusted infrastructure updated from account config")
+            # Finding #17: one-time, idempotent, lossless migration of legacy FP
+            # narrowings out of soft_signals into ai_refinements. Live-only (S4),
+            # under the same SIGNALS_PATH lock; migrate_fp_narrowings logs its own
+            # summary when it moves anything.
+            if migrate_fp_narrowings(signals, logger):
+                dirty = True
+            if dirty:
+                save_signals(signals)
     else:
         signals = load_signals()
     whitelist = load_whitelist(logger)
@@ -7730,25 +7862,31 @@ Conversation ID: {sfid}
                                         logger,
                                         to_addr=account.get("username", ""))
                                 else:
-                                    change_desc = apply_signal_changes(
-                                        proposed, logger)
+                                    # Finding #17: route the approved FP narrowing
+                                    # through the MODERN refinements store instead
+                                    # of the legacy global soft_signals list — a
+                                    # LEGITIMATE (NOT_SPAM) refinement, scope "all"
+                                    # (preserves the narrowing's prior global
+                                    # reach), Dashboard-manageable, item-(b)
+                                    # eligible. apply_ai_refinement logs the
+                                    # "applied" event, so no separate log here.
+                                    refinement = _fp_narrowing_to_refinement(
+                                        proposed, conv, signals, source="email")
+                                    change_desc = apply_ai_refinement(
+                                        refinement, logger,
+                                        source="email", sfid=sfid)
                                     conv["status"] = "approved"
                                     conv["resolution"] = "approved"
                                     persist_pending_merge(pending, {sfid})
-                                    append_refinement_log({
-                                        "ts": datetime.now().isoformat(),
-                                        "event": "applied",
-                                        "sfid": sfid,
-                                        "headline": "False-positive narrowing",
-                                        "source": "email",
-                                    })
-                                    send_email(config,
-                                        f"Signal Update Applied [{sfid}]",
-                                        f"The proposed signal change has been applied.\n\n"
-                                        f"WHAT CHANGED:\n{change_desc}\n\n"
-                                        f"Updated signals take effect within 15 minutes.\n\n"
-                                        f"To reverse this change: open a new Claude conversation, share your CLAUDE.md, "
-                                        f"and ask Claude to revert the change to signals.json.",
+                                    send_email(
+                                        config,
+                                        f"The refinement has been applied [{sfid}]",
+                                        f"The refinement has been applied and is now active in "
+                                        f"the filter.\n\n"
+                                        f"{change_desc}\n\n"
+                                        f"Refinement ID: {refinement.get('id', '')}\n"
+                                        f"To remove it later, open Dashboard -> Signal History "
+                                        f"and click Delete on the refinement card.\n",
                                         logger,
                                         to_addr=account.get("username", ""))
 
