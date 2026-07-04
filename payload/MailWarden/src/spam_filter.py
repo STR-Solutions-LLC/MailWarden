@@ -369,6 +369,30 @@ def add_approved_domain(domain: str, logger: logging.Logger) -> bool:
         return True
 
 
+def add_whitelist_domain(domain: str, logger: logging.Logger) -> bool:
+    """Locked read-modify-write: add ONE trusted domain (lowercased,
+    @-stripped) to whitelist.json's domain tier. Mirrors add_approved_domain —
+    the atomic write is delegated to save_whitelist. Returns True when newly
+    added, False when already present or the value is empty.
+
+    Finding #6: a report APPROVE on a pre-classifier (built-in hard-signal /
+    DNSBL) block lands here rather than in approved_senders.json — the domain
+    whitelist runs BEFORE the pre-classifier (and AFTER the blacklist and
+    subject-keyword checks), so this genuinely unblocks the sender without
+    being able to override an owner-set block."""
+    d = (domain or "").strip().lower().lstrip("@")
+    if not d:
+        return False
+    with file_lock.locked(WHITELIST_PATH):
+        data = load_whitelist(logger)
+        if d in data.get("_domains_set", set()):
+            return False
+        data.setdefault("domains", []).append(d)
+        data["_domains_set"] = set(data.get("_domains_set", set())) | {d}
+        save_whitelist(data)
+        return True
+
+
 def load_report_approvals_store(logger: logging.Logger) -> dict:
     """Lightweight READ-ONLY view of memory/report_approvals.json (the
     token-keyed number->sender maps written by daily_report.py at report-send
@@ -7724,7 +7748,46 @@ USER'S FOLLOW-UP:
                                     invalid_nums.append(n)
                                     continue
                                 resolved_any = True
-                                if add_approved_domain(dom, logger):
+                                # Finding #6: branch on what actually junked
+                                # this item. Legacy token records written
+                                # before block_source existed default to the
+                                # AI path — identical to prior behavior.
+                                source = (entry.get("block_source") or "ai")
+                                if source == "subject_keyword":
+                                    # Case A: a deterministic rule the owner
+                                    # set — no approval store can override it.
+                                    # Honest no-op + the real undo path.
+                                    ack_lines.append(
+                                        f"Item {n} was blocked by a "
+                                        f"subject-keyword rule you set up, "
+                                        f"so approving the sender won't stop "
+                                        f"it. To remove the keyword, open "
+                                        f"the Dashboard, go to the Blacklist "
+                                        f"tab, select the keyword, and click "
+                                        f"Remove. No change was made.")
+                                elif source == "pre_classifier":
+                                    # Case B: built-in hard signals / DNSBL.
+                                    # The domain whitelist runs BEFORE the
+                                    # pre-classifier, so this genuinely
+                                    # unblocks. Deliberate non-goal: no
+                                    # same-run whitelist reload — the rescue
+                                    # takes effect from the next run.
+                                    if add_whitelist_domain(dom, logger):
+                                        logger.info(
+                                            f"  WHITELISTED sender domain: "
+                                            f"{dom} (item {n}, "
+                                            f"MWR-{mwr_token})")
+                                        ack_lines.append(
+                                            f"Added {dom} to your trusted "
+                                            f"senders — future mail from "
+                                            f"this domain won't be blocked "
+                                            f"by MailWarden's built-in spam "
+                                            f"checks.")
+                                    else:
+                                        ack_lines.append(
+                                            f"{dom} is already on your "
+                                            f"trusted senders — no change.")
+                                elif add_approved_domain(dom, logger):
                                     logger.info(
                                         f"  APPROVED sender domain: {dom} "
                                         f"(item {n}, MWR-{mwr_token})")

@@ -63,7 +63,8 @@ TEACH_QUICK_REFERENCE = (
     "  Fwd: False Positive (or NOT SPAM) — a real email got junked; correct it\n"
     "  Fwd: SPAM Example — spam got through; teach it\n\n"
     "Reply to any MailWarden email to answer it:\n"
-    "  APPROVE n — rescue a sender wrongly junked in your daily report\n"
+    "  APPROVE n — rescue a sender wrongly junked in your daily report (if one\n"
+    "    of your own rules blocked it, the reply explains how to change the rule)\n"
     "  DROP n / KEEP n — retire or keep a self-taught rule that's up for review\n"
     "  YES / NO — accept or reject a proposed refinement\n\n"
     "Always send from your own account, the normal way — MailWarden ignores any\n"
@@ -357,7 +358,8 @@ uses AI to identify spam, and moves flagged mail into your junk folder.
 Once a day (at 8:00 AM by default), you'll get a report summarizing what
 was filtered. Every junked sender in that report is numbered — if MailWarden
 ever junks someone you want to hear from, reply APPROVE and the number (for
-example, APPROVE 3) to rescue them.
+example, APPROVE 3) to rescue them. If the block came from a rule you set
+yourself, MailWarden replies with how to change that rule instead.
 
 ----------------------------------------------------------------------
 TEACH MAILWARDEN — QUICK REFERENCE

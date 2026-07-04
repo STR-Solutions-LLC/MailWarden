@@ -114,9 +114,10 @@ def test_parse_approve_forms(text, expected):
     "approve nothing",
     # The report's own instruction line: APPROVE never at line start.
     "To rescue a sender, reply to this report with APPROVE and the item "
-    "number (example: APPROVE 3). MailWarden will stop junking that "
-    "sender's domain — but only when a message proves it really came "
-    "from them.",
+    "number (example: APPROVE 3). MailWarden will trust mail from that "
+    "sender's domain going forward. If an item was blocked by a rule you "
+    "set yourself, MailWarden will reply with how to change that rule "
+    "instead.",
 ])
 def test_parse_approve_non_commands(text):
     assert spam_filter.parse_approve_command(text) == []
@@ -129,7 +130,8 @@ def test_parse_approve_with_quoted_reply_noise():
     text = ("APPROVE 5\n\n"
             "On Tue, Jul 1, 2026 MailWarden wrote:\n"
             "To rescue a sender, reply to this report with APPROVE and the "
-            "item number (example: APPROVE 3).")
+            "item number (example: APPROVE 3). MailWarden will trust mail "
+            "from that sender's domain going forward.")
     assert spam_filter.parse_approve_command(text) == [5]
 
 
@@ -179,12 +181,18 @@ def _fresh_token_store(token="abc123", entries=None):
 
 def _approve_harness(monkeypatch, *, msg_data, dry_run=False,
                      sender_is_owner=True, auth_ok=True,
-                     approvals_store=None, add_returns=True):
+                     approvals_store=None, add_returns=True,
+                     add_wl_returns=True, whitelist=None):
     """Drive spam_filter.run_filter(force=True) with all IO/network mocked
     (modeled on test_fixes._dry_run_filter_harness), instrumented for the
-    APPROVE branch."""
+    APPROVE branch.
+
+    ``add_wl_returns`` controls the stubbed add_whitelist_domain result
+    (finding #6, Case B). ``whitelist`` overrides the default empty
+    whitelist the run loads (finding #6 pre-classifier bypass tests)."""
     calls = {
         "add_approved_domain": [],
+        "add_whitelist_domain": [],
         "send_email": [],           # (subject, body, to_addr)
         "notify_unverified": 0,
         "mark_uid_seen": 0,
@@ -221,9 +229,10 @@ def _approve_harness(monkeypatch, *, msg_data, dry_run=False,
     monkeypatch.setattr(spam_filter, "load_processed_ids", lambda: {"ids": {}})
     monkeypatch.setattr(spam_filter, "load_signals", lambda: {"signals": {}})
     monkeypatch.setattr(spam_filter, "load_whitelist",
-                        lambda logger: {"domains": [], "addresses": [],
-                                        "_addresses_set": set(),
-                                        "_domains_set": set()})
+                        lambda logger: (dict(whitelist) if whitelist
+                                        else {"domains": [], "addresses": [],
+                                              "_addresses_set": set(),
+                                              "_domains_set": set()}))
     monkeypatch.setattr(spam_filter, "load_blacklist",
                         lambda logger: {"addresses": [], "domains": [],
                                         "display_names": [],
@@ -266,6 +275,11 @@ def _approve_harness(monkeypatch, *, msg_data, dry_run=False,
         calls["add_approved_domain"].append(domain)
         return add_returns
     monkeypatch.setattr(spam_filter, "add_approved_domain", _add)
+
+    def _add_wl(domain, logger):
+        calls["add_whitelist_domain"].append(domain)
+        return add_wl_returns
+    monkeypatch.setattr(spam_filter, "add_whitelist_domain", _add_wl)
 
     monkeypatch.setattr(spam_filter, "load_report_approvals_store",
                         lambda logger: dict(approvals_store or {}))
@@ -358,7 +372,11 @@ def test_branch_own_report_body_never_self_triggers(monkeypatch):
     report_body = ("SPAM FILTER DAILY REPORT\nJuly 01, 2026 — 8:00 AM\n\n"
                    "1. 07:01 | News <n@newsletter.test>\n\n"
                    "To rescue a sender, reply to this report with APPROVE "
-                   "and the item number (example: APPROVE 3).")
+                   "and the item number (example: APPROVE 3). MailWarden "
+                   "will trust mail from that sender's domain going forward. "
+                   "If an item was blocked by a rule you set yourself, "
+                   "MailWarden will reply with how to change that rule "
+                   "instead.")
     calls = _approve_harness(
         monkeypatch,
         msg_data=_mwr_msg(
@@ -496,9 +514,10 @@ def test_report_rescue_copy_line_present_when_entries_exist():
         _report_config(), _decisions(moved=1, dry=0), None, 0,
         {"derived_from_examples": 0})
     assert ("To rescue a sender, reply to this report with APPROVE and the "
-            "item number (example: APPROVE 3). MailWarden will stop junking "
-            "that sender's domain — but only when a message proves it really "
-            "came from them.") in body
+            "item number (example: APPROVE 3). MailWarden will trust mail "
+            "from that sender's domain going forward. If an item was blocked "
+            "by a rule you set yourself, MailWarden will reply with how to "
+            "change that rule instead.") in body
 
 
 def test_report_rescue_copy_line_absent_when_no_entries():
@@ -777,11 +796,14 @@ def test_precedence_whitelist_blocks_unchanged():
     assert "wl_match = check_whitelist(from_header_raw, whitelist)" in src
     assert "# --- Precedence check 1: Whitelist specific address ---" in src
     assert "# --- Precedence check 4: Whitelist domain ---" in src
-    # The APPROVE branch itself references no whitelist machinery.
+    # Finding #6: the APPROVE branch may WRITE the whitelist's domain tier
+    # (add_whitelist_domain, Case B) but must never READ whitelist state —
+    # the precedence checks above remain the only readers in run_filter.
     branch = src[src.index("Detection branch 2b"):
                  src.index("# --- Precedence check 1")]
     assert "check_whitelist" not in branch
-    assert "whitelist" not in branch
+    assert "load_whitelist" not in branch
+    assert "WHITELIST_PATH" not in branch
 
 
 def test_approved_store_separate_file():
@@ -811,3 +833,329 @@ def test_setup_assistant_seeds_approved_senders():
     from mailwarden_app import setup_assistant
     src = inspect.getsource(setup_assistant.SetupAssistant._install_defaults)
     assert '"approved_senders.json"' in src
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 9. Finding #6 — block-source classification, report partition, and
+#    per-source honest APPROVE
+# ═════════════════════════════════════════════════════════════════════════
+
+def _log_rec(ts, decision, action, acct="Acct",
+             from_line="Bad <b@bad.test>", subject="pitch", signals="x"):
+    """One decisions.log record in log_decision's exact line format
+    (without the trailing '  ---\\n' separator)."""
+    return (f"[{ts}] ACCOUNT: {acct}\n"
+            f"  MESSAGE-ID: <m@x>\n"
+            f"  FROM: {from_line}\n"
+            f"  SUBJECT: {subject}\n"
+            f"  DECISION: {decision}\n"
+            f"  SIGNALS HIT: {signals}\n"
+            f"  ACTION: {action}\n")
+
+
+@pytest.mark.parametrize("decision,action,expected", [
+    ('BLACKLISTED (matched address: "b@bad.test") (confidence: 1.00)',
+     "[MOVED to Junk]", "blacklist"),
+    ('BLACKLISTED (matched display_name: "Bad") (confidence: 1.00)',
+     "[DRY RUN - would move to Junk]", "blacklist"),
+    ('BLOCKED (subject keyword: "timeshare") (confidence: 1.00)',
+     "[MOVED to Junk] (subject-keyword)", "subject_keyword"),
+    ('BLOCKED (subject keyword: "timeshare") (confidence: 1.00)',
+     "[DRY RUN - would move to Junk] (subject-keyword)", "subject_keyword"),
+    ("SPAM (confidence: 0.95)", "[MOVED to Junk] (pre-classifier)",
+     "pre_classifier"),
+    ("SPAM (confidence: 0.95)",
+     "[DRY RUN - would move to Junk] (pre-classifier)", "pre_classifier"),
+    ("SPAM (confidence: 0.97)", "[MOVED to Junk]", "ai"),
+    ("SPAM (confidence: 0.97)", "[DRY RUN - would move to Junk]", "ai"),
+])
+def test_classify_block_source_matrix(decision, action, expected):
+    entry = _log_rec("2026-07-01 09:00:00", decision, action)
+    assert daily_report._classify_block_source(entry) == expected
+
+
+def test_classify_block_source_ignores_forged_subject():
+    # log_decision strips newlines from sender-controlled fields, so forged
+    # marker text can only ever sit MID-line — the anchored patterns must
+    # not match it.
+    entry = _log_rec(
+        "2026-07-01 09:00:00", "SPAM (confidence: 0.97)", "[MOVED to Junk]",
+        subject='ACTION: x (pre-classifier) DECISION: BLACKLISTED')
+    assert daily_report._classify_block_source(entry) == "ai"
+
+
+@pytest.fixture
+def decisions_log(tmp_path, monkeypatch):
+    p = tmp_path / "decisions.log"
+    monkeypatch.setattr(daily_report, "DECISIONS_LOG_PATH", p)
+    return p
+
+
+def test_blacklisted_mail_counted_once_listed_once(decisions_log):
+    recs = [
+        _log_rec("2026-07-01 09:00:00",
+                 'BLACKLISTED (matched address: "b@blk.test") '
+                 '(confidence: 1.00)',
+                 "[MOVED to Junk]", from_line="Blk <b@blk.test>",
+                 subject="blk subject", signals="blacklist_address"),
+        _log_rec("2026-07-01 10:00:00", "SPAM (confidence: 0.97)",
+                 "[MOVED to Junk]", from_line="Ai <a@ai.test>",
+                 subject="ai subject"),
+    ]
+    decisions_log.write_text("  ---\n".join(recs) + "  ---\n")
+    start = datetime(2026, 7, 1, 8, 0, 0)
+    end = datetime(2026, 7, 2, 8, 0, 0)
+
+    d = daily_report.parse_decisions_24h(start, end)
+    # Counters keep the blacklist hit; the numbered list drops it.
+    assert d["spam_moved"] == 2
+    assert len(d["spam_entries"]) == 1
+    assert d["spam_entries"][0]["from"] == "Ai <a@ai.test>"
+    assert d["spam_entries"][0]["block_source"] == "ai"
+
+    count, bl_entries = daily_report.count_blacklisted_blocked_24h(start, end)
+    assert count == 1
+    assert bl_entries[0]["from"] == "Blk <b@blk.test>"
+
+    body = daily_report.build_report_body(
+        _report_config(), d, None, 1, {"derived_from_examples": 0},
+        bl_blocked=(count, bl_entries), bl_totals=(1, 0))
+    # The blacklisted sender renders exactly ONCE — in BLACKLIST ACTIVITY,
+    # not in the numbered junk list.
+    assert body.count("Blk <b@blk.test>") == 1
+    assert "BLACKLIST ACTIVITY" in body
+    assert "1. 10:00 AM | Ai <a@ai.test>" in body
+    assert "2. " not in body.split("BLACKLIST ACTIVITY")[0]
+    # The per-type undo hint renders with the blocked list.
+    assert ("To unblock one of these senders: for an address or name, "
+            "forward a message from that sender with the subject "
+            "\"Fwd: Remove from Blacklist\". For a domain or subject "
+            "keyword, open the Dashboard's Blacklist tab, select the "
+            "entry, and click Remove.") in body
+
+
+def test_unblock_hint_absent_without_blacklist_activity():
+    body = daily_report.build_report_body(
+        _report_config(), _decisions(moved=1, dry=0), None, 0,
+        {"derived_from_examples": 0})
+    assert "To unblock one of these senders" not in body
+
+
+def test_token_map_excludes_blacklist_and_carries_block_source(decisions_log):
+    recs = [
+        _log_rec("2026-07-01 09:00:00",
+                 'BLACKLISTED (matched address: "b@blk.test") '
+                 '(confidence: 1.00)',
+                 "[MOVED to Junk]", from_line="Blk <b@blk.test>",
+                 signals="blacklist_address"),
+        _log_rec("2026-07-01 09:10:00",
+                 'BLOCKED (subject keyword: "timeshare") (confidence: 1.00)',
+                 "[MOVED to Junk] (subject-keyword)",
+                 from_line="Kw <k@kw.test>", subject="timeshare deal",
+                 signals="subject_keyword"),
+        _log_rec("2026-07-01 09:20:00", "SPAM (confidence: 0.95)",
+                 "[MOVED to Junk] (pre-classifier)",
+                 from_line="Pre <p@dnsbl.test>", signals="dnsbl_listed"),
+        _log_rec("2026-07-01 09:30:00", "SPAM (confidence: 0.97)",
+                 "[MOVED to Junk]", from_line="Ai <a@ai.test>"),
+    ]
+    decisions_log.write_text("  ---\n".join(recs) + "  ---\n")
+    d = daily_report.parse_decisions_24h(datetime(2026, 7, 1, 8, 0, 0),
+                                         datetime(2026, 7, 2, 8, 0, 0))
+    entries = daily_report.build_approval_entries(d)
+    # Blacklist entry excluded; numbering is 1..3 over the survivors in
+    # rendered order.
+    assert set(entries.keys()) == {"1", "2", "3"}
+    assert entries["1"]["from_domain"] == "kw.test"
+    assert entries["1"]["block_source"] == "subject_keyword"
+    assert entries["2"]["from_domain"] == "dnsbl.test"
+    assert entries["2"]["block_source"] == "pre_classifier"
+    assert entries["3"]["from_domain"] == "ai.test"
+    assert entries["3"]["block_source"] == "ai"
+
+
+def test_token_map_block_source_defaults_ai_for_legacy_entries():
+    # _decisions() spam entries predate block_source — the token map must
+    # degrade them to the AI path, not crash.
+    entries = daily_report.build_approval_entries(_decisions(moved=1, dry=0))
+    assert entries["1"]["block_source"] == "ai"
+
+
+# --- APPROVE handler: per-source branches (run_filter harness) -----------
+
+def _token_store_with_sources():
+    return _fresh_token_store(entries={
+        "1": {"from_domain": "kw.test", "from": "Kw <k@kw.test>",
+              "subject": "timeshare deal", "block_source": "subject_keyword"},
+        "2": {"from_domain": "dnsbl.test", "from": "Pre <p@dnsbl.test>",
+              "subject": "hello", "block_source": "pre_classifier"},
+        "3": {"from_domain": "ai.test", "from": "Ai <a@ai.test>",
+              "subject": "buy", "block_source": "ai"},
+    })
+
+
+def test_branch_keyword_item_honest_noop(monkeypatch):
+    calls = _approve_harness(monkeypatch, msg_data=_mwr_msg(body="APPROVE 1"),
+                             approvals_store=_token_store_with_sources())
+    assert calls["add_approved_domain"] == []
+    assert calls["add_whitelist_domain"] == []
+    assert calls["mark_uid_seen"] == 1
+    assert calls["classify_email"] == 0
+    subject, body, to_addr = calls["send_email"][0]
+    assert body == ("Item 1 was blocked by a subject-keyword rule you set "
+                    "up, so approving the sender won't stop it. To remove "
+                    "the keyword, open the Dashboard, go to the Blacklist "
+                    "tab, select the keyword, and click Remove. No change "
+                    "was made.")
+
+
+def test_branch_pre_classifier_item_whitelists_domain(monkeypatch):
+    calls = _approve_harness(monkeypatch, msg_data=_mwr_msg(body="APPROVE 2"),
+                             approvals_store=_token_store_with_sources())
+    assert calls["add_whitelist_domain"] == ["dnsbl.test"]
+    assert calls["add_approved_domain"] == []
+    subject, body, to_addr = calls["send_email"][0]
+    assert body == ("Added dnsbl.test to your trusted senders — future mail "
+                    "from this domain won't be blocked by MailWarden's "
+                    "built-in spam checks.")
+
+
+def test_branch_pre_classifier_item_already_trusted(monkeypatch):
+    calls = _approve_harness(monkeypatch, msg_data=_mwr_msg(body="APPROVE 2"),
+                             approvals_store=_token_store_with_sources(),
+                             add_wl_returns=False)
+    assert calls["add_whitelist_domain"] == ["dnsbl.test"]
+    subject, body, to_addr = calls["send_email"][0]
+    assert body == ("dnsbl.test is already on your trusted senders — "
+                    "no change.")
+
+
+def test_branch_ai_item_unchanged_by_sources(monkeypatch):
+    calls = _approve_harness(monkeypatch, msg_data=_mwr_msg(body="APPROVE 3"),
+                             approvals_store=_token_store_with_sources())
+    assert calls["add_approved_domain"] == ["ai.test"]
+    assert calls["add_whitelist_domain"] == []
+    subject, body, to_addr = calls["send_email"][0]
+    assert body == ("Approved: ai.test (item 3). This applies whenever a "
+                    "message is verified as genuinely from that domain. "
+                    "Mail that can't be verified will still be judged "
+                    "normally.")
+
+
+def test_branch_legacy_token_without_block_source_uses_ai_path(monkeypatch):
+    # _fresh_token_store's default entries predate block_source — behavior
+    # must stay byte-identical to the pre-#6 AI path.
+    calls = _approve_harness(monkeypatch, msg_data=_mwr_msg(body="APPROVE 1"),
+                             approvals_store=_fresh_token_store())
+    assert calls["add_approved_domain"] == ["newsletter.test"]
+    assert calls["add_whitelist_domain"] == []
+    subject, body, to_addr = calls["send_email"][0]
+    assert body.startswith("Approved: newsletter.test (item 1).")
+
+
+def test_branch_mixed_sources_each_number_honest(monkeypatch):
+    calls = _approve_harness(monkeypatch,
+                             msg_data=_mwr_msg(body="APPROVE 1 2 3"),
+                             approvals_store=_token_store_with_sources())
+    assert calls["add_whitelist_domain"] == ["dnsbl.test"]
+    assert calls["add_approved_domain"] == ["ai.test"]
+    subject, body, to_addr = calls["send_email"][0]
+    assert "Item 1 was blocked by a subject-keyword rule" in body
+    assert "Added dnsbl.test to your trusted senders" in body
+    assert "Approved: ai.test (item 3)." in body
+    # One ack line per number, in one email.
+    assert len(calls["send_email"]) == 1
+
+
+# --- Case B mechanics with REAL files -------------------------------------
+
+def test_add_whitelist_domain_real_store(tmp_path, monkeypatch):
+    wl_path = tmp_path / "whitelist.json"
+    monkeypatch.setattr(spam_filter, "WHITELIST_PATH", wl_path)
+    assert spam_filter.add_whitelist_domain("@Blocked.Example.COM",
+                                            _LOGGER) is True
+    assert spam_filter.add_whitelist_domain("blocked.example.com",
+                                            _LOGGER) is False
+    assert spam_filter.add_whitelist_domain("", _LOGGER) is False
+    assert spam_filter.add_whitelist_domain(None, _LOGGER) is False
+    on_disk = json.loads(wl_path.read_text())
+    assert on_disk["domains"] == ["blocked.example.com"]
+    assert "last_updated" in on_disk
+    assert not any(k.startswith("_") for k in on_disk)
+    leftovers = [f for f in os.listdir(tmp_path) if f.endswith(".tmp")]
+    assert leftovers == []
+
+
+def test_add_whitelist_domain_preserves_existing_entries(tmp_path,
+                                                         monkeypatch):
+    wl_path = tmp_path / "whitelist.json"
+    wl_path.write_text(json.dumps({"version": "1.0",
+                                   "addresses": ["keep@x.test"],
+                                   "domains": ["old.test"]}))
+    monkeypatch.setattr(spam_filter, "WHITELIST_PATH", wl_path)
+    assert spam_filter.add_whitelist_domain("new.test", _LOGGER) is True
+    on_disk = json.loads(wl_path.read_text())
+    assert on_disk["addresses"] == ["keep@x.test"]
+    assert on_disk["domains"] == ["old.test", "new.test"]
+
+
+def test_case_b_domain_passes_whitelist_check_incl_subdomain(tmp_path,
+                                                             monkeypatch):
+    wl_path = tmp_path / "whitelist.json"
+    monkeypatch.setattr(spam_filter, "WHITELIST_PATH", wl_path)
+    spam_filter.add_whitelist_domain("dnsbl.test", _LOGGER)
+    wl = spam_filter.load_whitelist(_LOGGER)
+    # The rescued domain (and its subdomains, F4) now passes the domain
+    # whitelist that runs BEFORE the pre-classifier.
+    assert spam_filter.check_whitelist("Pre <p@dnsbl.test>", wl)
+    assert spam_filter.check_whitelist("Pre <p@mail.dnsbl.test>", wl)
+    assert not spam_filter.check_whitelist("Evil <e@notdnsbl.test>", wl)
+
+
+def test_case_b_whitelist_domain_cannot_override_blacklist(tmp_path,
+                                                           monkeypatch):
+    # The whitelist-domain tier runs AFTER the blacklist in run_filter, so
+    # a Case B rescue can never override an owner-set block: check_blacklist
+    # still matches the sender.
+    wl_path = tmp_path / "whitelist.json"
+    bl_path = tmp_path / "blacklist.json"
+    monkeypatch.setattr(spam_filter, "WHITELIST_PATH", wl_path)
+    monkeypatch.setattr(spam_filter, "BLACKLIST_PATH", bl_path)
+    bl_path.write_text(json.dumps({"version": "1.0",
+                                   "addresses": ["p@dnsbl.test"],
+                                   "display_names": [], "domains": [],
+                                   "subject_keywords": []}))
+    spam_filter.add_whitelist_domain("dnsbl.test", _LOGGER)
+    bl = spam_filter.load_blacklist(_LOGGER)
+    mt, mv = spam_filter.check_blacklist("Pre <p@dnsbl.test>", bl,
+                                         account_name="owner@example.com")
+    assert mt  # blacklist still fires despite the whitelisted domain
+
+
+def test_case_b_rescued_domain_bypasses_pre_classifier(monkeypatch):
+    # A message whose ONLY problem is a pre-classifier SPAM verdict: junked
+    # without the rescue, passed through once the domain is whitelisted.
+    monkeypatch.setattr(spam_filter, "record_pre_classifier_skip",
+                        lambda *a, **k: None)
+
+    def _pre(*a, **k):
+        return {"pre_classifier_verdict": "SPAM",
+                "pre_classifier_confidence": 0.99,
+                "hard_signals": ["dnsbl_listed"], "soft_signals": []}
+    monkeypatch.setattr(spam_filter, "check_header_signals", _pre)
+
+    md = _mwr_msg(subject="hello there", body="ordinary text",
+                  from_email="p@dnsbl.test")
+
+    # Control: no whitelist -> pre-classifier junks it.
+    calls = _approve_harness(monkeypatch, msg_data=md, approvals_store={})
+    assert calls["execute_spam_action"] == 1
+
+    # Rescued: domain on the whitelist tier -> passed through, no spam
+    # action, no classification.
+    wl = {"domains": ["dnsbl.test"], "addresses": [],
+          "_addresses_set": set(), "_domains_set": {"dnsbl.test"}}
+    calls = _approve_harness(monkeypatch, msg_data=md, approvals_store={},
+                             whitelist=wl)
+    assert calls["execute_spam_action"] == 0
+    assert calls["classify_email"] == 0

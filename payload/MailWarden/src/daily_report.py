@@ -440,6 +440,10 @@ def build_approval_entries(decisions: dict) -> dict:
             # APPROVE rescue can queue them for review without re-scanning
             # decisions.log.
             "rule_ids": e.get("rule_ids", []),
+            # Finding #6: what junked it, so the APPROVE handler can pick the
+            # honest path per block type. Absent in pre-#6 token records; the
+            # handler defaults those to "ai" (prior behavior).
+            "block_source": e.get("block_source", "ai"),
         }
     return entries
 
@@ -631,7 +635,11 @@ def count_blacklisted_blocked_24h(window_start, window_end) -> tuple:
         entry = entry.strip()
         if not entry:
             continue
-        if "BLACKLISTED" not in entry:
+        # Finding #6: anchored to the DECISION: line (like
+        # _classify_block_source) so this section and the numbered junk list
+        # partition the junked mail exactly — a subject merely containing
+        # "BLACKLISTED" can't land an email in both.
+        if not re.search(r'^\s*DECISION: BLACKLISTED\b', entry, re.MULTILINE):
             continue
         ts_match = re.search(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]', entry)
         if not ts_match:
@@ -900,6 +908,27 @@ def get_last_filter_run(window_start, window_end) -> tuple:
     return last_run, runs_24h, errors_24h
 
 
+def _classify_block_source(entry: str) -> str:
+    """What junked this decisions.log entry: "blacklist", "subject_keyword",
+    "pre_classifier", or "ai" (finding #6).
+
+    Matches only MailWarden-emitted text on its own DECISION:/ACTION: lines
+    (log_decision sanitizes newlines out of sender-controlled fields, so a
+    subject can never start a line and forge a source). Order matters: the
+    filter's precedence is blacklist, then subject-keyword, then the
+    pre-classifier, then the AI."""
+    if re.search(r'^\s*DECISION: BLACKLISTED\b', entry, re.MULTILINE):
+        return "blacklist"
+    if (re.search(r'^\s*DECISION: BLOCKED \(subject keyword', entry,
+                  re.MULTILINE)
+            or re.search(r'^\s*ACTION:.*\(subject-keyword\)', entry,
+                         re.MULTILINE)):
+        return "subject_keyword"
+    if re.search(r'^\s*ACTION:.*\(pre-classifier\)', entry, re.MULTILINE):
+        return "pre_classifier"
+    return "ai"
+
+
 def parse_decisions_24h(window_start, window_end) -> dict:
     """Parse decisions.log for entries within an explicit window.
     Now takes an explicit (window_start, window_end) half-open window."""
@@ -986,6 +1015,15 @@ def parse_decisions_24h(window_start, window_end) -> dict:
                 result["per_account"][acct_name]["spam_dry_run"] = (
                     result["per_account"][acct_name].get("spam_dry_run", 0) + 1)
 
+            # Finding #6: blacklisted mail keeps its counter contribution
+            # above but is NOT added to the numbered junk list — it already
+            # renders (with its match type) in the BLACKLIST ACTIVITY section,
+            # and an APPROVE on it could never work: the blacklist runs before
+            # every approval mechanism.
+            block_source = _classify_block_source(entry)
+            if block_source == "blacklist":
+                continue
+
             # Extract details for the spam list (anchored to line start)
             from_match = re.search(r'^\s*FROM: (.+)', entry, re.MULTILINE)
             subj_match = re.search(r'^\s*SUBJECT: (.+)', entry, re.MULTILINE)
@@ -1008,6 +1046,10 @@ def parse_decisions_24h(window_start, window_end) -> dict:
                 "account": acct_name,
                 "dry_run": "would move to" in entry,
                 "rule_ids": rule_ids,
+                # Finding #6: what junked it ("subject_keyword",
+                # "pre_classifier", or "ai") — the APPROVE handler branches
+                # on this so its ack is truthful per block type.
+                "block_source": block_source,
             }
             result["spam_entries"].append(spam_entry)
         elif "No action taken" in entry or "NOT SPAM" in entry:
@@ -1153,7 +1195,7 @@ def build_report_body(config: dict, decisions: dict, last_run: datetime,
 
     if moved_entries or dry_run_entries:
         lines.append("")
-        lines.append("To rescue a sender, reply to this report with APPROVE and the item number (example: APPROVE 3). MailWarden will stop junking that sender's domain — but only when a message proves it really came from them.")
+        lines.append("To rescue a sender, reply to this report with APPROVE and the item number (example: APPROVE 3). MailWarden will trust mail from that sender's domain going forward. If an item was blocked by a rule you set yourself, MailWarden will reply with how to change that rule instead.")
 
     if not moved_entries and not dry_run_entries:
         lines.append("No spam moved to Junk in the last 24 hours.")
@@ -1252,6 +1294,9 @@ def build_report_body(config: dict, decisions: dict, last_run: datetime,
                 lines.append(f"  - {b['time']} | {b['from']}")
                 if b.get("subject"):
                     lines.append(f"    \"{b['subject'][:60]}\" [matched: {b['match_type']}]")
+            # Finding #6: blacklist blocks are the owner's own rules, so they
+            # are not APPROVE-able above — point to the real undo per type.
+            lines.append("To unblock one of these senders: for an address or name, forward a message from that sender with the subject \"Fwd: Remove from Blacklist\". For a domain or subject keyword, open the Dashboard's Blacklist tab, select the entry, and click Remove.")
             lines.append("")
 
         lines.append(f"Blacklist totals: {bl_total_addrs} addresses | {bl_total_names} display names")
