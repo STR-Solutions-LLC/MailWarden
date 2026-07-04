@@ -22,7 +22,7 @@ You pay Anthropic directly for what Claude reads. As a rough guide, about **$0.5
 
 ## Platform support
 - ✅ **Apple Silicon (M1–M4+)** — fully tested.
-- ⚠️ **Intel Macs** — not supported yet, but subject to further refinement. We'd genuinely welcome your feedback: if you try it and it fails, copy the diagnostic windows and send them to **info@rentalist.pro**.
+- ❌ **Intel Macs** — not supported. MailWarden requires an Apple Silicon Mac (M1 or later).
 - ❌ **Windows** — not supported.
 - Requires macOS Sonoma (14.x) or later.
 
