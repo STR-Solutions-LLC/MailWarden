@@ -547,7 +547,7 @@ Each landed fix went through the standard gate: plan → master vet → implemen
 → independent review on a different model (Sonnet) → commit on PASS. Every fix kept the offline
 eval prompt byte-identical (the classifier prompt is untouched by all of this work).
 
-**DONE — 8 of 20 fixed and pushed** (branch `calibration-security-build1`):
+**DONE — 17 of 20 fixed and pushed** (branch `calibration-security-build1`, HEAD `53a0b13`):
 
 | # | Fix | Commit |
 |---|-----|--------|
@@ -559,19 +559,23 @@ eval prompt byte-identical (the classifier prompt is untouched by all of this wo
 | 12 | Dry-run spam classified once, not re-billed every tick | `beb546f` |
 | 10 | DROP "reversible" promise made real via a `RESTORE n` reply verb | `1feb96d` |
 | 17 | Legacy false-positive teachings migrated into the visible/scoped store | `ac52930` |
+| 7, 15 | Block-sender approval verifies before acking; multi-verb replies say what was ignored — Batch 1 | `633245f` |
+| 14, 5 | Forwarded analysis no longer mints a bogus rule; swallowed FP API failures now speak — Batch 2 | `b3bf9df` |
+| 8 | Approving a proposal for a dropped rule no longer lies "now active" — Batch 3 | `706e70c` |
+| 3, 18 | Revived the dead rule-attribution chain; mid-run rule changes no longer stale — Batch 4 | `80d5ed5` |
+| 13, 20 | MailWarden's own mail stays unread; already-processed messages not re-downloaded — Batch 5 | `53a0b13` |
 
-**REMAINING — 12, triaged 2026-07-04 (all still real), grouped into 6 prompt-neutral batches:**
+Each landed fix: plan → master vet → Opus 4.8 implement → independent Sonnet review PASS → commit; offline eval byte-identical throughout.
 
-- **Batch 1 — #7, #15** (reply-command ack honesty): plan vetted + approved, ready to implement.
-- **Batch 2 — #14, #5** (FP-forward misroute + swallowed teach-path API failures).
-- **Batch 3 — #8** (retired-rule approval falsely acked "now active"). Owner decision: reply
-  honestly and point to `RESTORE`, don't silently resurrect a dropped rule.
-- **Batch 4 — #3, #18** (dead rule-attribution chain + mid-run staleness after DROP).
-- **Batch 5 — #13, #20** (own suggestion mail left unread + stop re-downloading processed mail).
-  Owner decision on #13: leave MailWarden's own proposal/analysis mail unread.
-- **Batch 6 — #16, #19, #9** (missing "expired" history events + silent proposal-send failure +
-  report "reply YES" copy fix). Owner decision on #9: fix the wording to point at the proposal
-  email.
+**IN PROGRESS — Batch 6 (#16, #19, #9): BUILT, NOT yet committed (held mid-flight 2026-07-04):**
 
-After the batches land, a fresh signed installer is needed — the live M1 build currently has
-none of these 20 fixes.
+- **#16** (write the "expired" history events the Dashboard already filters for) and **#19** (stop `handle_new_pattern` reporting success when the proposal email failed to send) are built and PASSED independent review — but sit UNCOMMITTED, held with #9.
+- **#9 FAILED review** (blocking): the copy overclaimed. `build_pending_signals_section` lists ALL pending kinds unfiltered, but the new copy said "reply to the proposal email, subject *starts with* `[SFID]`" — false for false-positive proposals (SFID is mid-subject) and for block-sender / Check-an-Email teach proposals (which send NO email; Dashboard-only). Needs a kind-aware rewrite (soften "starts with" → "has `[SFID]` in its subject"; branch the no-email kinds straight to "approve in the Dashboard"). Best finalized alongside Feature 1 below (FP Dashboard Approve), which changes the approval landscape.
+
+**NEXT — four owner-approved features (2026-07-04), to land BEFORE the installer:**
+1. Dashboard **Approve** button for false-positive proposals (mirror the email YES; needs a new config_io twin — heavier than the Batch 3 twin because the parse/convert helpers live only in `spam_filter.py`).
+2. Dashboard **Restore** control + a **"Dropped rules"** panel in Signal History (restore by rule id; removes the email path's 30-day / report-number limits; also fixes the now-false "the Dashboard can't restore a dropped rule" message).
+3. **`enabled`-account default → ON** (owner decision): unify every site — a missing key currently means "not filtered" in the filter but "reported anyway" in the report.
+4. **Train-folder** silent-reinforce gate (owner direction): put the one un-approved path (a reason-less drop auto-strengthening an existing rule) behind approval + clearer "MailWarden guessed this — review before approving" proposal copy. NOT the big reason-capture UX.
+
+**THEN the installer — now Apple-Silicon ONLY** (owner decision 2026-07-04): drop universal2/Intel entirely (arm64-only build; remove the Rosetta/x86_64 test gates). The README **and** the GitHub release page must carry: **"❌ Intel Macs — not supported. MailWarden requires an Apple Silicon Mac (M1 or later)."** The live M1 build has NONE of these fixes or features yet.
