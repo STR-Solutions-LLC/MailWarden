@@ -538,3 +538,40 @@ Recommended fix order for sessions (hardest-first per instruction, but note #1 a
 tiny-diff/high-impact and should ride along with the first session regardless):
 **#2 → #4 → #6 → #11 → #12 → #17 → #10 → then the simple batch (#1, #3, #5, #7, #8, #9, #13-#16,
 #18-#20).**
+
+---
+
+## FIX STATUS — updated 2026-07-04
+
+Each landed fix went through the standard gate: plan → master vet → implementation (Opus 4.8)
+→ independent review on a different model (Sonnet) → commit on PASS. Every fix kept the offline
+eval prompt byte-identical (the classifier prompt is untouched by all of this work).
+
+**DONE — 8 of 20 fixed and pushed** (branch `calibration-security-build1`):
+
+| # | Fix | Commit |
+|---|-----|--------|
+| 1 | Learner proposal emails self-destructed one tick after sending | `4f3d385` |
+| 2 | `persist_pending_merge` reverted concurrent Dashboard/report changes | `b26d40e` |
+| 4 | SFID/MWR reply handlers marked mail read before finishing | `922e536` |
+| 6 | APPROVE-rescue honest per block source; blacklist no longer double-listed | `7a208fd` |
+| 11 | HTML-only replies now read; unreadable replies get an honest ack | `0c37735` |
+| 12 | Dry-run spam classified once, not re-billed every tick | `beb546f` |
+| 10 | DROP "reversible" promise made real via a `RESTORE n` reply verb | `1feb96d` |
+| 17 | Legacy false-positive teachings migrated into the visible/scoped store | `ac52930` |
+
+**REMAINING — 12, triaged 2026-07-04 (all still real), grouped into 6 prompt-neutral batches:**
+
+- **Batch 1 — #7, #15** (reply-command ack honesty): plan vetted + approved, ready to implement.
+- **Batch 2 — #14, #5** (FP-forward misroute + swallowed teach-path API failures).
+- **Batch 3 — #8** (retired-rule approval falsely acked "now active"). Owner decision: reply
+  honestly and point to `RESTORE`, don't silently resurrect a dropped rule.
+- **Batch 4 — #3, #18** (dead rule-attribution chain + mid-run staleness after DROP).
+- **Batch 5 — #13, #20** (own suggestion mail left unread + stop re-downloading processed mail).
+  Owner decision on #13: leave MailWarden's own proposal/analysis mail unread.
+- **Batch 6 — #16, #19, #9** (missing "expired" history events + silent proposal-send failure +
+  report "reply YES" copy fix). Owner decision on #9: fix the wording to point at the proposal
+  email.
+
+After the batches land, a fresh signed installer is needed — the live M1 build currently has
+none of these 20 fixes.
