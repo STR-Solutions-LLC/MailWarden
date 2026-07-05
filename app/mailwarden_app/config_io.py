@@ -480,6 +480,52 @@ def delete_active_refinement(refinement_id: str, source: str = "dashboard",
     return True
 
 
+def list_retired_refinements() -> list[dict]:
+    """Retired (email-dropped) refinements, for the Dashboard's Dropped-rules
+    panel. Mirrors list_active_refinements' shape but with an EXACT predicate:
+    only records explicitly marked "retired" count — an absent status must NOT
+    (unlike list_active_refinements, which treats an absent status as active).
+    Only the email DROP corridor (spam_filter.retire_ai_refinement) sets this
+    status; the Dashboard Delete button removes the record outright, so a
+    deleted rule never lands here."""
+    return [r for r in load_signals().get("ai_refinements", [])
+            if r.get("status") == "retired"]
+
+
+def restore_refinement(refinement_id: str, source: str = "dashboard") -> dict | None:
+    """Config_io twin of spam_filter.unretire_ai_refinement — MUST stay in sync
+    with it (the two trees never import each other, so the semantics are
+    duplicated; the engine body is the source of truth). RESTORE a dropped rule:
+    flip its ai_refinement status from "retired" back to "active". The retired
+    record was never deleted, so this is a pure status flip — the rule is used
+    again on the next filter tick. Returns the reactivated refinement dict on
+    success, or None if no matching RETIRED rule was found (missing OR already
+    active — idempotent, safe on repeated clicks)."""
+    # Lock the signals.json RMW span (C7): a fresh read under the lock means a
+    # concurrent learner merge-save / Dashboard edit isn't clobbered by this one.
+    restored = None
+    with file_lock.locked(paths.SIGNALS_PATH):
+        data = load_signals()
+        for r in data.get("ai_refinements", []) or []:
+            if r.get("id") == refinement_id and r.get("status") == "retired":
+                r["status"] = "active"
+                r.pop("retired_at", None)
+                r["last_reinforced"] = now_iso()
+                restored = r
+                break
+        if restored is not None:
+            save_signals(data)
+    if restored is not None:
+        append_refinement_log({
+            "ts": now_iso(),
+            "event": "restored_by_owner",
+            "id": refinement_id,
+            "headline": restored.get("headline", ""),
+            "source": source,
+        })
+    return restored
+
+
 def set_refinement_scope(refinement_id: str, scope) -> bool:
     """Set the per-account ``scope`` on an active refinement and persist.
 

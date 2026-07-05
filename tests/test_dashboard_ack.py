@@ -2,10 +2,12 @@
 # (c) 2026 STR Solutions, LLC. All rights reserved.
 """Finding #8 — the Dashboard's retired-refinement ack.
 
-When an owner approves a pending refinement from the Dashboard whose rule was
-already dropped, the Dashboard cannot reactivate it (there is no GUI restore
-control) and must not claim it is "now active". Instead it points the owner at
-the existing email RESTORE reply. This locks that copy in place.
+When an owner APPROVES a pending refinement from the Dashboard whose rule was
+already dropped, approving does not un-drop it and the ack must not claim it is
+"now active". Feature 2 added a real Dashboard restore control (Signal History →
+Dropped rules), so the ack now points the owner there — and notes the email
+RESTORE reply still works — instead of saying the Dashboard can't restore. This
+locks that copy in place.
 """
 import os
 import sys
@@ -24,6 +26,9 @@ def test_pending_retired_message_points_to_email_restore():
     assert "now active" not in msg.lower()
 
 
-def test_pending_retired_message_says_dashboard_cannot_restore():
+def test_pending_retired_message_points_to_dropped_rules_panel():
+    # Feature 2: the ack now directs the owner to the real restore control
+    # instead of the retired "Dashboard can't restore a dropped rule" claim.
     msg = dashboard.pending_retired_message()
-    assert "Dashboard can't restore" in msg
+    assert "Dropped rules" in msg
+    assert "can't restore" not in msg

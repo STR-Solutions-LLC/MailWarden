@@ -142,16 +142,18 @@ def pending_proposal_label(refinement):
 def pending_retired_message():
     """Owner-facing ack when a Dashboard approval names a rule the owner dropped.
 
-    Finding #8: the Dashboard has no restore control, and approving a proposal
-    does not un-drop a rule, so this points the owner at the working email
-    RESTORE reply (finding #10) instead of falsely claiming it is now active.
+    Finding #8: approving a proposal does not un-drop a rule. The Dashboard CAN
+    now restore a dropped rule (Feature 2: Signal History -> Dropped rules), so
+    this points the owner there — and notes the email RESTORE reply (finding #10)
+    still works — instead of falsely claiming the rule is now active.
     Pure (no tk, no IO) so the copy is unit-tested headlessly.
     """
     return (
         "This proposal matches a learned rule you dropped earlier, so it was not "
         "turned back on. Approving here does not un-drop a rule.\n\n"
-        "To turn it back on, reply RESTORE with the rule's number to the daily-report "
-        "email or drop confirmation that lists it. The Dashboard can't restore a dropped rule."
+        "To turn it back on, open Signal History → Dropped rules and click "
+        "Restore next to it. (Replying RESTORE to the daily-report email still "
+        "works too.)"
     )
 
 
@@ -2638,6 +2640,12 @@ class SignalsTab(ttk.Frame):
             self._f, text="Active AI refinements (in effect)", height=200)
         self._active_box.pack(fill=tk.X, pady=(0, 8))
 
+        self._dropped_box = _ScrollSection(
+            self._f,
+            text="Dropped rules (retired — click Restore to turn back on)",
+            height=160)
+        self._dropped_box.pack(fill=tk.X, pady=(0, 8))
+
         self._pending_box = _ScrollSection(
             self._f, text="Pending proposals (awaiting your reply)", height=180)
         self._pending_box.pack(fill=tk.X, pady=(0, 8))
@@ -2664,6 +2672,7 @@ class SignalsTab(ttk.Frame):
 
     def refresh(self):
         self._render_active()
+        self._render_dropped()
         self._render_pending()
         self._render_history()
         self._render_examples()
@@ -2671,9 +2680,9 @@ class SignalsTab(ttk.Frame):
         # Re-bind wheel handlers on every section after rendering. The old
         # bindings were destroyed along with the old child widgets, so
         # scrolling would go dead after the first refresh without this.
-        for section in (self._active_box, self._pending_box,
-                         self._history_box, self._examples_box,
-                         self._standard_box):
+        for section in (self._active_box, self._dropped_box,
+                         self._pending_box, self._history_box,
+                         self._examples_box, self._standard_box):
             section.bind_wheel_recursive()
 
     def _make_card(self, parent) -> ttk.Frame:
@@ -2792,6 +2801,76 @@ class SignalsTab(ttk.Frame):
             return
         if config_io.delete_active_refinement(refinement_id, source="dashboard"):
             self.refresh()
+
+    # ---- Dropped (retired) rules ----
+
+    def _render_dropped(self):
+        """Feature 2: retired (email-dropped) rules, newest drop first, each with
+        a Restore button. Always shown (empty-state label, not hidden) so the
+        owner learns where dropped rules go. Only the email DROP corridor retires
+        a rule; the Delete button removes it outright, so deleted rules never
+        appear here."""
+        self._dropped_box.clear()
+        body = self._dropped_box.body
+        retired = sorted(
+            config_io.list_retired_refinements(),
+            key=lambda r: r.get("retired_at", ""),
+            reverse=True)
+        if not retired:
+            ttk.Label(
+                body, style="Muted.TLabel", wraplength=720,
+                text=("No dropped rules. When you reply DROP to a daily-report "
+                      "rule review, the rule lands here so you can restore it "
+                      "anytime.")
+            ).pack(anchor=tk.W)
+            return
+        for r in retired:
+            self._render_dropped_card(body, r)
+
+    def _render_dropped_card(self, body, r: dict):
+        card = self._make_card(body)
+        headline = r.get("headline") or "(no headline)"
+        self._card_label(card, headline, style="Subheading.TLabel")
+        meta = (f"{r.get('kind', 'new_pattern')}  ·  "
+                f"confidence {r.get('confidence', 'medium')}  ·  "
+                f"dropped {r.get('retired_at', '')[:16]}  ·  "
+                f"first learned {r.get('first_learned', '')[:16]}  ·  "
+                f"ID {r.get('id', '')}")
+        self._card_label(card, meta, style="Muted.TLabel")
+        if r.get("rationale"):
+            self._card_label(card, f"Why: {r['rationale']}", pady=(4, 0))
+        evidence = r.get("evidence") or []
+        if evidence:
+            shown = ", ".join(evidence[:5])
+            more = (f"  (+{len(evidence) - 5} more)"
+                    if len(evidence) > 5 else "")
+            self._card_label(card, f"Evidence: {shown}{more}",
+                              style="Muted.TLabel")
+        # No scope-toggle row: a retired rule isn't firing, so there is nothing
+        # to scope. Restore first; scope it from the Active section afterwards.
+        btns = ttk.Frame(card)
+        btns.pack(anchor=tk.W, pady=(6, 0))
+        rid = r.get("id", "")
+        ttk.Button(btns, text="Restore", style="Primary.TButton",
+                   command=lambda i=rid: self._on_restore_dropped(i)).pack(
+                       side=tk.LEFT)
+
+    def _on_restore_dropped(self, refinement_id: str):
+        if not refinement_id:
+            return
+        restored = config_io.restore_refinement(refinement_id, source="dashboard")
+        if restored is not None:
+            messagebox.showinfo(
+                "Restored",
+                f"Rule {restored.get('id', '')} is active again and will be "
+                f"used on the next check.")
+        else:
+            # #7/#8 honesty: NEVER claim a restore that didn't happen.
+            messagebox.showinfo(
+                "Nothing to restore",
+                "That rule is no longer in your dropped list — it may have "
+                "been restored or removed already. Refreshing.")
+        self.refresh()
 
     # ---- Pending proposals ----
 
