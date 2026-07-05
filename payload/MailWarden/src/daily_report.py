@@ -55,6 +55,11 @@ LIFETIME_STATS_PATH = PROJECT_ROOT / "memory" / "lifetime_stats.json"
 # config.json; the report reads it for the "Last ran" line, falling back to the
 # legacy config value for installs that predate the change.
 LEARNER_STATE_PATH = PROJECT_ROOT / "memory" / "learner_state.json"
+# Append-only refinement-event log the Dashboard's Signal History renders. The
+# report is one of four independent appenders (the others live in spam_filter,
+# learn_signals, and config_io); it records an "expired" event when a pending
+# proposal times out (finding #16) so the history is not perpetually empty.
+REFINEMENTS_LOG_PATH = PROJECT_ROOT / "memory" / "signal_refinements.log"
 LOG_PATH = PROJECT_ROOT / "logs" / "spam_filter.log"
 
 
@@ -794,6 +799,16 @@ def save_pending_signals(data: dict):
         raise
 
 
+def append_refinement_log(event: dict) -> None:
+    """Append one JSON record to signal_refinements.log (finding #16).
+
+    Byte-identical to the appenders in learn_signals.py / spam_filter.py so the
+    Dashboard's Signal History renders report-written events the same way."""
+    REFINEMENTS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with REFINEMENTS_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
 def expire_pending_signals(logger: logging.Logger) -> dict:
     """Expire pending conversations past their expiry date.
     Returns dict with 'expired' list and 'active' list for the report."""
@@ -821,6 +836,21 @@ def expire_pending_signals(logger: logging.Logger) -> dict:
 
         if changed:
             save_pending_signals(pending)
+
+    # Finding #16: record each expiry to the refinement log so the Dashboard's
+    # "Rejected / expired / withdrawn" history is populated. Written AFTER the
+    # locked RMW (mirrors config_io's convention) — it touches a different file
+    # than the locked pending/lifetime pair, so it never lengthens that hold.
+    for conv in result["expired"]:
+        _ref = conv.get("proposed_refinement") or {}
+        append_refinement_log({
+            "ts": datetime.now().isoformat(),
+            "event": "expired",
+            "id": _ref.get("id", ""),
+            "sfid": conv.get("id", ""),
+            "headline": _ref.get("headline", "") or conv.get("original_subject", ""),
+            "source": "report",
+        })
 
     # Gather lifetime stats. The per-run scalars count the conversations still
     # ON DISK; the persistent lifetime counters add back the conversations that

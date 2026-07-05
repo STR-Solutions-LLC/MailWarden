@@ -1485,6 +1485,23 @@ def handle_new_pattern(classification: dict, example: dict,
         f"  [LEARNER] Proposed {refinement_id} ({sfid}) to {to_addr} "
         f"({'sent' if sent else 'send FAILED'}): {headline[:60]}"
     )
+    if not sent:
+        # Finding #19: the proposal email did NOT reach the owner. Record it
+        # honestly and durably (mirrors spam_filter's "apply_failed" convention)
+        # instead of swallowing the failure. No retry / re-queue: _send already
+        # retried once, and the proposal is already saved to pending_signals.json
+        # so it still shows in the Dashboard's Pending proposals — re-sending
+        # would re-bill/re-classify each tick (the anti-pattern earlier findings
+        # removed). return True stays: a signal WAS derived from this example.
+        append_refinement_log({
+            "ts": datetime.now().isoformat(),
+            "event": "send_failed",
+            "id": refinement_id,
+            "sfid": sfid,
+            "headline": headline,
+            "reason": f"proposal email to {to_addr} failed to send",
+            "source": "learner",
+        })
     return True
 
 

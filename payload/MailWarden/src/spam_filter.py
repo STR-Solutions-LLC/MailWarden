@@ -7917,6 +7917,18 @@ Conversation ID: {sfid}
                         if datetime.now().isoformat() > conv.get("expires", ""):
                             conv["status"] = "expired"
                             persist_pending_merge(pending, {sfid})
+                            # Finding #16: log the expiry (reply-triggered path,
+                            # source="reply") so the Dashboard's expired-history
+                            # is populated. Additive — expiry behavior unchanged.
+                            append_refinement_log({
+                                "ts": datetime.now().isoformat(),
+                                "event": "expired",
+                                "id": (conv.get("proposed_refinement") or {}).get("id", ""),
+                                "sfid": sfid,
+                                "headline": (conv.get("proposed_refinement") or {}).get("headline", "")
+                                            or conv.get("original_subject", ""),
+                                "source": "reply",
+                            })
                             send_email(config,
                                 f"Re: [{sfid}] — Expired",
                                 f"This proposal expired on {conv['expires'][:10]}. "
