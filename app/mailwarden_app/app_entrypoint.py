@@ -56,7 +56,7 @@ def _cli_status() -> int:
     print(f"  accounts ({len(accounts)}):")
     for a in accounts:
         print(f"    - name={a.get('name','?')} user={a.get('username','?')} "
-              f"junk={a.get('junk_folder','?')} enabled={a.get('enabled', False)}")
+              f"junk={a.get('junk_folder','?')} enabled={a.get('enabled', True)}")
     print(f"  config at: {paths.CONFIG_PATH}")
     return 0
 

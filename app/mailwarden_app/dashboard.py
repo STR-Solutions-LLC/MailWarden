@@ -1004,10 +1004,10 @@ class HomeTab(ttk.Frame):
         for a in config.get("accounts", []):
             row = ttk.Frame(self._accounts_frame)
             row.pack(fill=tk.X, pady=2)
-            badge = "●" if a.get("enabled") else "○"
+            badge = "●" if a.get("enabled", True) else "○"
             ttk.Label(row,
                       text=f"{badge}  {a.get('name','(unnamed)')}  —  {a.get('username','(no address)')}",
-                      foreground=("#1a7f37" if a.get("enabled") else "#666")).pack(side=tk.LEFT)
+                      foreground=("#1a7f37" if a.get("enabled", True) else "#666")).pack(side=tk.LEFT)
 
         # Stats from decisions.log
         today, week, life = _decision_counts()
@@ -1338,7 +1338,7 @@ class AccountsTab(ttk.Frame):
                 a.get("name", ""),
                 a.get("username", ""),
                 a.get("junk_folder", "—"),
-                "Yes" if a.get("enabled") else "No",
+                "Yes" if a.get("enabled", True) else "No",
             ))
 
     def _selected_index(self) -> int | None:
@@ -3513,7 +3513,7 @@ class SettingsTab(ttk.Frame):
         )
 
         paused = config.get("ui", {}).get("paused", False) or (
-            config.get("accounts") and not any(a.get("enabled") for a in config["accounts"]))
+            config.get("accounts") and not any(a.get("enabled", True) for a in config["accounts"]))
         self._pause_btn.config(text=("Resume all filtering" if paused else "Pause all filtering"))
 
     def _on_save_api(self):
@@ -4237,7 +4237,7 @@ class SettingsTab(ttk.Frame):
             if not accounts:
                 return
             ui = config.setdefault("ui", {})
-            currently_paused = not any(a.get("enabled") for a in accounts)
+            currently_paused = not any(a.get("enabled", True) for a in accounts)
             if currently_paused:
                 # Restore per-position. The old version keyed on account name,
                 # which collapsed duplicate/empty names into the same bucket
@@ -4257,7 +4257,7 @@ class SettingsTab(ttk.Frame):
                 ui.pop("_pre_pause_enabled", None)
                 ui["paused"] = False
             else:
-                ui["_pre_pause_enabled_list"] = [bool(a.get("enabled")) for a in accounts]
+                ui["_pre_pause_enabled_list"] = [bool(a.get("enabled", True)) for a in accounts]
                 ui.pop("_pre_pause_enabled", None)  # clear any legacy key
                 for a in accounts:
                     a["enabled"] = False

@@ -1225,7 +1225,7 @@ def build_report_body(config: dict, decisions: dict, last_run: datetime,
     lines.append("")
 
     # Activity
-    accounts = [a for a in config.get("accounts", []) if a.get("enabled")]
+    accounts = [a for a in config.get("accounts", []) if a.get("enabled", True)]
     acct_names = ", ".join(a["name"] for a in accounts)
 
     lines.append("ACTIVITY — LAST 24 HOURS")

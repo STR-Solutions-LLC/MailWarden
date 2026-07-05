@@ -1397,7 +1397,7 @@ def deliver_eula_if_needed(config: dict, logger: logging.Logger) -> bool:
     newly_sent: dict = {}
 
     for account in config.get("accounts", []):
-        if not account.get("enabled", False):
+        if not account.get("enabled", True):
             continue
         acct_name = account.get("name", "")
         username = account.get("username", "")
@@ -2692,7 +2692,7 @@ def _owner_identities(config: dict) -> set[str]:
     """
     identities: set[str] = set()
     for acct in config.get("accounts", []):
-        if acct.get("enabled", False):
+        if acct.get("enabled", True):
             username = (acct.get("username", "") or "").strip().lower()
             if username:
                 identities.add(username)
@@ -6489,7 +6489,7 @@ def run_filter(force: bool = False):
     accounts_checked = 0
 
     for account in config.get("accounts", []):
-        if not account.get("enabled", False):
+        if not account.get("enabled", True):
             continue
 
         account_name = account.get("name", "Unknown")
@@ -9048,7 +9048,7 @@ USER'S FOLLOW-UP:
     # user that no mail is being filtered (and clear the clock when it's off).
     # Runs once per pass, after all accounts, before the final flush.
     enabled_accounts = [a for a in config.get("accounts", [])
-                        if a.get("enabled", False)]
+                        if a.get("enabled", True)]
     try:
         _maybe_send_dry_run_reminder(config, enabled_accounts, logger)
     except Exception as e:

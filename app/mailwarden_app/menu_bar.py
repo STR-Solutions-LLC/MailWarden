@@ -329,7 +329,7 @@ def toggle_pause() -> tuple[bool, str]:
             result["msg"] = "No accounts configured."
             return
         ui = config.setdefault("ui", {})
-        currently_paused = not any(a.get("enabled") for a in accounts)
+        currently_paused = not any(a.get("enabled", True) for a in accounts)
         if currently_paused:
             # Restore per-position (index-keyed to survive duplicate/empty names).
             pre_list = ui.get("_pre_pause_enabled_list")
@@ -347,7 +347,7 @@ def toggle_pause() -> tuple[bool, str]:
             result["paused"] = False
             result["msg"] = "Filtering resumed."
         else:
-            ui["_pre_pause_enabled_list"] = [bool(a.get("enabled")) for a in accounts]
+            ui["_pre_pause_enabled_list"] = [bool(a.get("enabled", True)) for a in accounts]
             ui.pop("_pre_pause_enabled", None)  # clear any legacy key
             for a in accounts:
                 a["enabled"] = False
@@ -548,7 +548,7 @@ class MailWardenMenuBar(rumps.App if rumps else object):
 
         config = config_io.load_config()
         paused = config.get("ui", {}).get("paused", False) or not any(
-            a.get("enabled") for a in config.get("accounts", []))
+            a.get("enabled", True) for a in config.get("accounts", []))
         self.pause_item.title = "Resume Filtering" if paused else "Pause Filtering"
 
     def on_run_now(self, _sender):
