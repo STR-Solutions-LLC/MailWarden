@@ -1280,15 +1280,63 @@ def handle_duplicate(classification: dict, example: dict,
     ``delta`` and applied to a FRESH file at save time via
     merge_save_signals_delta — see audit L1. ``delta`` maps refinement-id ->
     {"increment": n, "last_reinforced": iso, "new_evidence": [filenames]}.
+
+    CONTRADICTION GUARD (Feature 4, Option B): when the matched rule is one the
+    owner explicitly taught as verdict=="legitimate" (via the dashboard's Check
+    an Email flow), reinforcing it would strengthen a rule AGAINST the owner's
+    own correction. In that case NOTHING is written — no match_count bump, no
+    evidence, no delta — and this function returns False, mirroring the
+    "rule not found" fallback below so the caller's accounting (signals_needs_save
+    / derived_count in _run) treats this example as yielding no signal. The
+    watermark still advances because _run persists it unconditionally — the
+    example WAS processed, it just wasn't reinforced.
     """
     rid = classification.get("refinement_id", "")
     target = None
     for r in signals_data.get("ai_refinements", []):
-        if r.get("id") == rid:
+        # Only an ACTIVE rule can be matched. A retired rule (dropped by the
+        # owner via retire_ai_refinement — id kept, status flipped, never
+        # deleted) must not be silently reinforced if a stale/hallucinated
+        # duplicate_of still names it; it falls through to the "not found"
+        # path below exactly like a truly-missing id.
+        if r.get("id") == rid and r.get("status", "active") == "active":
             target = r
             break
     if target is None:
         logger.warning(f"  [LEARNER] duplicate_of {rid} but not found; treating as new")
+        return False
+
+    if (target.get("verdict") or "").strip().lower() == "legitimate":
+        # The owner taught this rule as "legitimate" — a Train drop that
+        # matches it contradicts that correction. Refuse to reinforce; do not
+        # touch match_count / evidence / last_reinforced / delta. Normalize the
+        # verdict the SAME way _build_learned_lines does (.strip().lower()) so a
+        # legacy/hand-edited "Legitimate" or " legitimate " — which the
+        # classifier already treats as legitimate — is blocked here too, closing
+        # the asymmetry where the classifier and the guard could disagree.
+        append_refinement_log({
+            "ts": datetime.now().isoformat(),
+            "event": "reinforce_blocked_contradiction",
+            "id": rid,
+            "example": example["filename"],
+            "note": classification.get("note", ""),
+        })
+        logger.info(f"  [LEARNER] Blocked reinforcement of {rid} (marked "
+                    f"legitimate) — Train drop {example['filename']} contradicts "
+                    f"it: {target.get('headline', '')[:60]}")
+        to_addr = _pick_recipient(example, config)
+        subject = ("MailWarden left a rule unchanged — your Train drop looked "
+                   "like a 'legitimate' rule")
+        body = (
+            f"MailWarden guessed that the email you dropped into Train "
+            f"matched a rule you taught it to treat as legitimate, so it "
+            f"left that rule unchanged.\n\n"
+            f"Rule:  {target.get('headline', '')}\n"
+            f"Refinement ID: {rid}\n\n"
+            f"If it really is spam, use Check an Email in the Dashboard, or "
+            f"drop it into Train again with a short note on why it's spam.\n"
+        )
+        _send(config, to_addr, subject, body, logger, smtp_conn)
         return False
 
     reinforced_at = datetime.now().isoformat()
@@ -1323,18 +1371,18 @@ def handle_duplicate(classification: dict, example: dict,
                 f"{target.get('headline', '')[:60]}")
 
     to_addr = _pick_recipient(example, config)
-    subject = f"Another example of {target.get('headline', 'a known pattern')[:60]}"
+    subject = ("MailWarden strengthened a rule from your Train drop — please "
+               "double-check")
     body = (
-        f"MailWarden recognized your forwarded example as another instance of "
-        f"a pattern it has already learned.\n\n"
+        f"You dropped an email into Train. MailWarden guessed it's another "
+        f"example of a rule it already learned, and strengthened that rule "
+        f"automatically.\n\n"
         f"Pattern:  {target.get('headline', '')}\n"
         f"Refinement ID: {rid}\n"
         f"Examples matched so far: {target['match_count']}\n\n"
-        f"No action is required. The refinement remains active.\n\n"
-        f"If you disagree and think this example is NOT like the others, "
-        f"you can remove the refinement from Dashboard -> Signal History, "
-        f"or reply to this email with the words \"not a match\" and I'll "
-        f"flag it for review.\n"
+        f"This was a guess, not something you approved — please glance at "
+        f"it. If it's wrong, reply \"not a match\" or remove the rule in "
+        f"Dashboard -> Signal History.\n"
     )
     _send(config, to_addr, subject, body, logger, smtp_conn)
     return True
