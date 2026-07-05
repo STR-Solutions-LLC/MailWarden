@@ -4521,6 +4521,48 @@ def _format_sender_history_line(record: dict, from_domain: str,
     return line
 
 
+def _match_approved_domain(auth: dict, approved_domains) -> str:
+    """The owner-approved domain that a cryptographically authenticated,
+    brand-matched message aligns with — or "" when none / not authenticated.
+
+    This is the SINGLE source of truth for "is this sender owner-approved AND
+    cryptographically verified to that domain": both the OWNER-APPROVED SENDER
+    prompt block (build_user_message) and the Feature-2 AI-skip gate call it, so
+    the prompt and the skip can never diverge. Same gate as before —
+    is_authenticated_brand_matched(auth) plus _domain_is_brand_match against each
+    approved domain, first match wins in the same iteration order."""
+    if not (approved_domains and is_authenticated_brand_matched(auth)):
+        return ""
+    for d in auth.get("authenticated_domains", []) or []:
+        for ad in sorted(approved_domains):
+            if _domain_is_brand_match(d, ad):
+                return ad
+    return ""
+
+
+def _owner_approved_authenticated_domain(msg_data: dict, approved_domains) -> str:
+    """The owner-approved + cryptographically-authenticated domain for this
+    message, or "" — computed straight from msg_data using the SAME
+    summarize_authentication + local-DKIM path build_user_message uses. Returns
+    "" on any doubt, so the Feature-2 caller fails toward the normal AI path.
+
+    The security bar is exactly RULE 1 / the OWNER-APPROVED block: DKIM=pass OR
+    DMARC=pass AND an authenticated domain aligned to the From domain AND to an
+    owner-approved domain. An UNverified From that merely CLAIMS an approved
+    domain never matches (spoof-proof)."""
+    if not approved_domains:
+        return ""
+    raw_from_email = msg_data.get('from_email', '') or ''
+    from_domain = raw_from_email.split('@', 1)[1] if '@' in raw_from_email else ''
+    auth = summarize_authentication({
+        "Authentication-Results": msg_data.get("auth_results", ""),
+        "Received-SPF":           msg_data.get("received_spf", ""),
+        "DKIM-Signature":         msg_data.get("dkim_signature", ""),
+    }, from_domain=from_domain,
+        locally_verified=_locally_verified_dkim(msg_data))
+    return _match_approved_domain(auth, approved_domains)
+
+
 def build_user_message(msg_data: dict, approved_domains: set = None,
                        sender_history_index: dict = None) -> str:
     """Build the per-email user message for the classifier.
@@ -4618,23 +4660,15 @@ def build_user_message(msg_data: dict, approved_domains: set = None,
     # An UNverified From that merely CLAIMS an approved domain never fires
     # (spoof-proofing). Empty/None approved_domains -> byte-identical prompt.
     approved_block = ""
-    if approved_domains and is_authenticated_brand_matched(auth):
-        matched_approved = ""
-        for d in auth.get("authenticated_domains", []) or []:
-            for ad in sorted(approved_domains):
-                if _domain_is_brand_match(d, ad):
-                    matched_approved = ad
-                    break
-            if matched_approved:
-                break
-        if matched_approved:
-            approved_block = (
-                "\n\nOWNER-APPROVED SENDER (set by the account owner; "
-                "trustworthy, not part of the email content):\n"
-                f"  This message is cryptographically verified as "
-                f"{matched_approved}, and the owner has explicitly approved "
-                f"this domain."
-            )
+    matched_approved = _match_approved_domain(auth, approved_domains)
+    if matched_approved:
+        approved_block = (
+            "\n\nOWNER-APPROVED SENDER (set by the account owner; "
+            "trustworthy, not part of the email content):\n"
+            f"  This message is cryptographically verified as "
+            f"{matched_approved}, and the owner has explicitly approved "
+            f"this domain."
+        )
 
     # --- Sender-history evidence (trusted, outside <untrusted_email>) -------
     # Asymmetric legitimacy signal: an established DELIVERED track record for
@@ -5109,9 +5143,151 @@ def _capture_parse_failure(raw_text, model: str, site: str, kind: str):
         pass
 
 
+# ---------------------------------------------------------------------------
+# Adaptive prompt caching (F-cache)
+# ---------------------------------------------------------------------------
+# The system prompt (BASE_SYSTEM_PROMPT + the learned-signals block) is STABLE
+# across every email in a run — it changes only on teach/learn events. Per-email
+# volatile content lives in the user message. So the system prompt is an ideal
+# cache prefix: sent as a 1-hour ephemeral cache_control content block, it is
+# written once and re-read on every subsequent email, cutting input-token cost.
+# The block CONTENT is byte-identical to the plain-string prompt — only the
+# request structure/metadata differs, so verdicts are unchanged.
+
+# Per-model minimum prompt size (in input tokens) for an ephemeral cache
+# breakpoint to be honored by the API. Attaching cache_control to a prefix
+# SHORTER than the model's minimum is a silent no-op (billed at the normal
+# price; usage shows cache_creation_input_tokens=0), so we only attach when the
+# measured stable prefix meets the minimum. These are the Anthropic-published
+# minimums; they are overridable via config (anthropic.min_cacheable_tokens) so a
+# future requirement change needs no code edit. Matched by longest key-prefix
+# against the model id; an unknown model falls back to the conservative default.
+_DEFAULT_MIN_CACHEABLE_TOKENS = {
+    "claude-haiku-4-5": 4096,
+    "claude-sonnet-4-6": 2048,
+    "claude-fable-5": 2048,
+    "claude-sonnet-4-5": 1024,
+    "claude-sonnet-4-1": 1024,
+    "claude-sonnet-4-0": 1024,
+    "claude-sonnet-3-7": 1024,
+    "claude-opus-4-8": 4096,
+    "claude-opus-4-7": 4096,
+    "claude-opus-4-6": 4096,
+    "claude-opus-4-5": 4096,
+}
+_CONSERVATIVE_MIN_CACHEABLE_TOKENS = 4096
+
+# In-process measurement cache: (model, sha1(stable prompt text)) -> token count.
+# Keyed on the prompt hash so it re-measures ONLY when the learned block or the
+# model changes — never per email. Module-global (one process = one filter run);
+# tests reset it via _reset_prompt_token_cache().
+_prompt_token_cache: dict = {}
+
+
+def _reset_prompt_token_cache():
+    """Clear the in-process prompt-token measurement cache (test seam)."""
+    _prompt_token_cache.clear()
+
+
+def resolve_min_cacheable_tokens(api_config: dict | None = None) -> dict:
+    """Merge any config override (anthropic.min_cacheable_tokens) over the
+    hardcoded per-model defaults. Config wins per key; malformed override values
+    are skipped so a bad config entry can never crash the classifier."""
+    table = dict(_DEFAULT_MIN_CACHEABLE_TOKENS)
+    override = (api_config or {}).get("min_cacheable_tokens") or {}
+    if isinstance(override, dict):
+        for k, v in override.items():
+            try:
+                table[str(k)] = int(v)
+            except (TypeError, ValueError):
+                continue
+    return table
+
+
+def _min_cacheable_for_model(model: str, table: dict) -> int:
+    """Minimum cacheable prefix size for ``model``: the value of the LONGEST
+    table key that ``model`` starts with (so ``claude-haiku-4-5-20251001``
+    matches ``claude-haiku-4-5``), else the conservative default for an unknown
+    model."""
+    best_key = None
+    for k in table:
+        if model.startswith(k) and (best_key is None or len(k) > len(best_key)):
+            best_key = k
+    return table[best_key] if best_key is not None \
+        else _CONSERVATIVE_MIN_CACHEABLE_TOKENS
+
+
+def _measure_stable_prompt_tokens(client, model: str, text: str,
+                                  logger: logging.Logger) -> int:
+    """Token size of the stable system prefix ``text`` for ``model``, measured
+    once per (model, prompt-hash) via the FREE count_tokens API and memoized in
+    process. On ANY count_tokens failure (network, error, unsupported client)
+    fall back to a conservative local estimate (len//4). The API silently no-ops
+    a cache breakpoint below the model minimum, so an occasional over/under-count
+    only costs a missed cache hit — never a wrong verdict."""
+    key = (model, hashlib.sha1(text.encode("utf-8")).hexdigest())
+    if key in _prompt_token_cache:
+        return _prompt_token_cache[key]
+    try:
+        resp = client.messages.count_tokens(
+            model=model,
+            system=text,
+            messages=[{"role": "user", "content": "."}],
+        )
+        tokens = int(resp.input_tokens)
+    except Exception as e:
+        tokens = len(text) // 4
+        logger.debug(
+            f"count_tokens unavailable for {model}; using local estimate "
+            f"~{tokens} tok ({e})")
+    _prompt_token_cache[key] = tokens
+    return tokens
+
+
+def _system_param_for_call(client, model: str, system_prompt: str,
+                           min_tokens_table: dict, logger: logging.Logger):
+    """Return the ``system`` value for messages.create: either the plain string
+    (no caching) or a one-element content-block list whose block CONTENT is
+    byte-identical to ``system_prompt`` and carries a 1-hour ephemeral
+    cache_control. cache_control is attached only when the measured stable-prefix
+    token size meets the model's minimum. The screen and confirm stages are
+    separate calls with different models and minimums, so this is evaluated
+    independently per call and their caches are model-scoped. Logs whether
+    caching was attempted (and why not) at debug level."""
+    minimum = _min_cacheable_for_model(model, min_tokens_table)
+    tokens = _measure_stable_prompt_tokens(client, model, system_prompt, logger)
+    if tokens >= minimum:
+        logger.debug(
+            f"prompt caching ON: model={model} stable~{tokens}tok >= "
+            f"min {minimum}")
+        return [{
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        }]
+    logger.debug(
+        f"prompt caching OFF: model={model} stable~{tokens}tok < min {minimum} "
+        "(cache_control below the model minimum is a silent no-op)")
+    return system_prompt
+
+
+def _log_cache_usage(response, model: str, logger: logging.Logger):
+    """Log prompt-cache read/creation token counts from a response so the logs
+    prove real savings. Regular logger only — decisions.log is untouched."""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    logger.debug(
+        f"cache usage model={model}: "
+        f"read={getattr(usage, 'cache_read_input_tokens', None)} "
+        f"created={getattr(usage, 'cache_creation_input_tokens', None)} "
+        f"input={getattr(usage, 'input_tokens', None)}")
+
+
 def _classify_create(client: anthropic.Anthropic, model: str, max_tokens: int,
                      system_prompt: str, user_message: str,
-                     logger: logging.Logger):
+                     logger: logging.Logger,
+                     min_cacheable_tokens: dict | None = None):
     """One messages.create for classification, temperature pinned to 0.
 
     temperature=0 is the determinism pin from commit 344c0df — every model
@@ -5119,13 +5295,26 @@ def _classify_create(client: anthropic.Anthropic, model: str, max_tokens: int,
     models 400-reject sampling parameters entirely; for those, retry ONCE
     without temperature and warn that responses may not be deterministic.
     Any other error propagates to the caller's existing handlers unchanged.
+
+    F-cache: the system prompt is sent as a 1-hour ephemeral cache_control
+    content block whenever its measured token size meets the model's minimum, so
+    the stable BASE_SYSTEM_PROMPT + learned-signals prefix is written once and
+    re-read across emails. The block CONTENT is byte-identical to
+    ``system_prompt`` — only the request structure/metadata differs.
+    ``min_cacheable_tokens`` is the resolved per-model minimum table
+    (config-overridable); None uses the hardcoded defaults. After the response,
+    cache read/creation token counts are logged.
     """
+    table = min_cacheable_tokens if min_cacheable_tokens is not None \
+        else resolve_min_cacheable_tokens()
+    system_param = _system_param_for_call(
+        client, model, system_prompt, table, logger)
     try:
-        return client.messages.create(
+        response = client.messages.create(
             model=model,
             max_tokens=max_tokens,
             temperature=0,
-            system=system_prompt,
+            system=system_param,
             messages=[{"role": "user", "content": user_message}],
         )
     except anthropic.BadRequestError as e:
@@ -5134,19 +5323,22 @@ def _classify_create(client: anthropic.Anthropic, model: str, max_tokens: int,
         logger.warning(
             f"Model {model} rejected temperature=0; retrying once without "
             "temperature (responses may not be deterministic on this model)")
-        return client.messages.create(
+        response = client.messages.create(
             model=model,
             max_tokens=max_tokens,
-            system=system_prompt,
+            system=system_param,
             messages=[{"role": "user", "content": user_message}],
         )
+    _log_cache_usage(response, model, logger)
+    return response
 
 
 def classify_email(client: anthropic.Anthropic, system_prompt: str,
                    msg_data: dict, model: str, max_tokens: int,
                    logger: logging.Logger,
                    approved_domains: set = None,
-                   sender_history_index: dict = None) -> tuple:
+                   sender_history_index: dict = None,
+                   min_cacheable_tokens: dict = None) -> tuple:
     """Send email to Claude API for classification.
     Returns (parsed_result_dict, raw_response) or (None, None).
 
@@ -5161,12 +5353,14 @@ def classify_email(client: anthropic.Anthropic, system_prompt: str,
         msg_data, approved_domains=approved_domains,
         sender_history_index=sender_history_index)
     return _classify_once(client, system_prompt, user_message, model,
-                          max_tokens, logger)
+                          max_tokens, logger,
+                          min_cacheable_tokens=min_cacheable_tokens)
 
 
 def _classify_once(client: anthropic.Anthropic, system_prompt: str,
                    user_message: str, model: str, max_tokens: int,
-                   logger: logging.Logger, site: str = "classify") -> tuple:
+                   logger: logging.Logger, site: str = "classify",
+                   min_cacheable_tokens: dict | None = None) -> tuple:
     """One classification call on an ALREADY-BUILT user message.
 
     Extracted from classify_email so the cascade's confirm stage can re-judge
@@ -5188,7 +5382,8 @@ def _classify_once(client: anthropic.Anthropic, system_prompt: str,
         try:
             logger.info(f"API call: model={model} site={site}")
             response = _classify_create(client, model, max_tokens,
-                                        system_prompt, user_message, logger)
+                                        system_prompt, user_message, logger,
+                                        min_cacheable_tokens=min_cacheable_tokens)
             text = response.content[0].text.strip()
 
             # Try to parse JSON, handling possible markdown fences
@@ -5298,7 +5493,8 @@ def classify_email_cascade(client: anthropic.Anthropic, system_prompt: str,
                            confirm_model: str, max_tokens: int,
                            threshold: float, logger: logging.Logger,
                            approved_domains: set = None,
-                           sender_history_index: dict = None) -> tuple:
+                           sender_history_index: dict = None,
+                           min_cacheable_tokens: dict = None) -> tuple:
     """Two-stage cascade classification (screen -> confirm, rescue-only).
 
     Stage 1 (``screen_model``) judges every email exactly like classify_email.
@@ -5329,7 +5525,8 @@ def classify_email_cascade(client: anthropic.Anthropic, system_prompt: str,
 
     screen_result, screen_resp = _classify_once(
         client, system_prompt, user_message, screen_model, max_tokens,
-        logger, site="classify_screen")
+        logger, site="classify_screen",
+        min_cacheable_tokens=min_cacheable_tokens)
     calls = [(screen_model, screen_resp)]
 
     if screen_result is None:
@@ -5349,7 +5546,8 @@ def classify_email_cascade(client: anthropic.Anthropic, system_prompt: str,
     meta["confirm_called"] = True
     confirm_result, confirm_resp = _classify_once(
         client, system_prompt, user_message, confirm_model, max_tokens,
-        logger, site="classify_confirm")
+        logger, site="classify_confirm",
+        min_cacheable_tokens=min_cacheable_tokens)
     calls.append((confirm_model, confirm_resp))
     if confirm_result is not None:
         meta["confirm_decision"] = confirm_result.get("decision")
@@ -6514,6 +6712,10 @@ def run_filter(force: bool = False):
     classify_mode = api_config.get("classify_mode", "cascade")
     screen_model = api_config.get("screen_model", "claude-haiku-4-5-20251001")
     confirm_model = api_config.get("confirm_model", "claude-sonnet-4-6")
+    # F-cache: resolved per-model minimum-cacheable-tokens table (config override
+    # merged over hardcoded defaults). Computed once per run; passed to every
+    # classify call so the stable system prompt is cached per model.
+    min_cacheable_tokens = resolve_min_cacheable_tokens(api_config)
 
     total_evaluated = 0
     total_spam = 0
@@ -8952,6 +9154,38 @@ USER'S FOLLOW-UP:
                         total_evaluated += 1
                         continue
 
+                    # --- Owner-approved + authenticated: deliver without AI ---
+                    # Cost optimization ONLY: if the sender's from-domain is one
+                    # the owner explicitly approved AND the message is
+                    # cryptographically verified+aligned to that domain (the SAME
+                    # bar RULE 1 / the OWNER-APPROVED prompt block enforce, via the
+                    # shared _match_approved_domain logic), deliver without any AI
+                    # call. Any doubt about auth alignment -> "" -> fall through to
+                    # the normal AI path. Runs AFTER the list + pre-classifier
+                    # gates, so a hard-signal junk still wins.
+                    approved_domain = _owner_approved_authenticated_domain(
+                        msg_data, approved_domains)
+                    if approved_domain:
+                        total_evaluated += 1
+                        logger.info(
+                            "  OWNER-APPROVED + AUTHENTICATED "
+                            f"({approved_domain}) — delivering without AI review")
+                        approved_result = {
+                            "decision": "NOT_SPAM",
+                            "confidence": 0.0,
+                            "signals_hit": [],
+                        }
+                        approved_action = (
+                            "No action taken — owner-approved + authenticated "
+                            f"sender ({approved_domain}), delivered without AI "
+                            "review")
+                        log_decision(account_name, msg_data, approved_result,
+                                     approved_action)
+                        record_pre_classifier_skip(token_usage, delta=token_delta)
+                        _record_processed(processed, account_key,
+                                          account_processed, msg_id)
+                        continue
+
                     # Finding #12: in Dry Run, a message already classified in
                     # a prior tick is recorded in the dry-run sidecar. Skip it
                     # BEFORE the paid classifier call so it is billed and
@@ -8974,6 +9208,7 @@ USER'S FOLLOW-UP:
                             confirm_model, max_tokens, threshold, logger,
                             approved_domains=approved_domains,
                             sender_history_index=sender_history_index,
+                            min_cacheable_tokens=min_cacheable_tokens,
                         )
                         # Record token usage for BOTH stages, each against the
                         # model that produced it.
@@ -8988,6 +9223,7 @@ USER'S FOLLOW-UP:
                             client, system_prompt, msg_data, model, max_tokens, logger,
                             approved_domains=approved_domains,
                             sender_history_index=sender_history_index,
+                            min_cacheable_tokens=min_cacheable_tokens,
                         )
 
                         # Record token usage

@@ -337,7 +337,7 @@ def test_cascade_history_reaches_both_stages(monkeypatch):
     seen = []
 
     def _fake_once(client, system_prompt, user_message, model, max_tokens,
-                   logger, site="classify"):
+                   logger, site="classify", min_cacheable_tokens=None):
         seen.append((site, user_message))
         # screen says SPAM (forces the confirm call); confirm also SPAM
         return ({"decision": "SPAM", "confidence": 0.99,
@@ -405,7 +405,7 @@ def test_offline_path_never_reads_decisions_log(monkeypatch, tmp_path):
     captured = {}
 
     def _fake_once(client, system_prompt, user_message, model, max_tokens,
-                   logger, site="classify"):
+                   logger, site="classify", min_cacheable_tokens=None):
         captured["msg"] = user_message
         return ({"decision": "NOT_SPAM", "confidence": 0.10,
                  "signals_hit": [], "reasoning": ""}, None)

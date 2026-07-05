@@ -1011,6 +1011,27 @@ def get_last_filter_run(window_start, window_end) -> tuple:
     return last_run, runs_24h, errors_24h
 
 
+# Feature 3 (owner decision "Option C"): human-readable name for each of the 4
+# HARD pre-classifier tripwires. Mail these catch is junked with NO AI review, so
+# the daily report flags it distinctly and names the tripwire — a rare mistake
+# then jumps out and the owner can rescue the sender with APPROVE.
+_TRIPWIRE_LABELS = {
+    "SPF_DKIM_BOTH_FAIL": "failed both authentication checks",
+    "LEAKED_AI_PROMPT": "hidden AI-prompt text in the message",
+    "PROMPT_INJECTION_HARD": "a prompt-injection attempt in the message",
+    "IP_DNSBL_MULTIPLE": "sending server listed on multiple spam blocklists",
+}
+
+
+def _tripwire_reason(signals: str) -> str:
+    """Plain-English name(s) for the hard pre-classifier tripwire(s) a junking
+    tripped, parsed from its SIGNALS HIT field. Falls back to the raw signal
+    text for any unmapped signal so the flag line is never empty."""
+    hit = [s.strip() for s in (signals or "").split(",") if s.strip()]
+    named = [_TRIPWIRE_LABELS.get(s, s) for s in hit]
+    return ", ".join(named)
+
+
 def _classify_block_source(entry: str) -> str:
     """What junked this decisions.log entry: "blacklist", "subject_keyword",
     "pre_classifier", or "ai" (finding #6).
@@ -1297,12 +1318,22 @@ def build_report_body(config: dict, decisions: dict, last_run: datetime,
     def _render_spam_list(entry_list, start_index=1):
         for i, spam in enumerate(entry_list, start_index):
             prefix = f"{spam['account']}: " if multi_acct else ""
-            lines.append(f"{i}. {spam['time']} | {prefix}{spam['from']}")
+            # Feature 3: flag mail junked by a HARD pre-classifier tripwire (no AI
+            # review) so a rare mistake stands out in the digest.
+            tripwire = spam.get("block_source") == "pre_classifier"
+            marker = "[TRIPWIRE] " if tripwire else ""
+            lines.append(f"{i}. {marker}{spam['time']} | {prefix}{spam['from']}")
             lines.append(f"   SUBJECT: {spam['subject']}")
             lines.append(
                 f"   CONFIDENCE: {spam['confidence']} | "
                 f"SIGNALS: {spam['signals']}"
             )
+            if tripwire:
+                lines.append(
+                    "   Junked by a built-in tripwire "
+                    f"({_tripwire_reason(spam.get('signals', ''))}) — no AI "
+                    f"review. If it's legitimate, reply APPROVE {i} to rescue "
+                    "this sender.")
             lines.append("")
 
     if moved_entries:
