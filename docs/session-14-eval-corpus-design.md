@@ -1,6 +1,10 @@
 # Session 14 — Private Eval Corpus + Scoring Harness (approved design)
 
-Status: design approved by Matt 2026-06-24. Implementation not yet started.
+Status: design approved by Matt 2026-06-24; implemented same day in `d5e9fcd` (completion logged in
+`337ac58`) — `tools/eval_corpus.py` (Component 1 builder + Component 2 scorer), `tools/eval_run.py`
+(Component 2 harness, runs `classify_eml_offline` at shipped defaults), and 21 tests in
+`tests/test_eval_corpus.py`. Component 3 (regenerate the stale `tests/_out` baselines) was done
+locally/uncommitted, since `tests/_out` is git-ignored.
 Audit reference: AUDIT-2026-06-11-bug-report.md, Part 3 item 5; Part 4 "Session 14".
 
 ## Purpose (and its limits)

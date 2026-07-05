@@ -507,9 +507,11 @@ watermarks.
 - **Dashboard pending window:** false_positive conversations have Withdraw but no Approve button —
   approval is email-only (`dashboard.py:2874-2877`). Matt has already flagged ACCEPT (+ WITHDRAW)
   buttons as future work. Recorded here as the known gap; do not implement without his go-ahead.
+  **[RESOLVED — Feature 1, `77be272`: the Dashboard Approve button now exists.]**
 - **Enabled-account default mismatch:** `spam_filter.py:5903` treats a missing `enabled` key as
   disabled; `daily_report.py:1404` treats it as enabled. An account entry without the key gets
   daily reports for an inbox that is never filtered. One-line alignment when convenient.
+  **[RESOLVED — Feature 3, `cb12e48`: a missing `enabled` key now defaults to ON/filtered in both places.]**
 - **Sibling-disease sweep result (rigid regex on LLM output):** post-`29a7c42`, `fp_analysis`
   parsing is tolerant and fails honestly (`_parse_fp_proposed_changes` + `_fp_changes_appliable` +
   `_FP_APPLY_FAILED_BODY`); residual rigidity: the capture still requires the TRADEOFF and
@@ -541,13 +543,13 @@ tiny-diff/high-impact and should ride along with the first session regardless):
 
 ---
 
-## FIX STATUS — updated 2026-07-04
+## FIX STATUS — updated 2026-07-05
 
 Each landed fix went through the standard gate: plan → master vet → implementation (Opus 4.8)
 → independent review on a different model (Sonnet) → commit on PASS. Every fix kept the offline
 eval prompt byte-identical (the classifier prompt is untouched by all of this work).
 
-**DONE — 17 of 20 fixed and pushed** (branch `calibration-security-build1`, HEAD `53a0b13`):
+**DONE — all 20 of 20 fixed and pushed** (branch `calibration-security-build1`, HEAD `cba6865`):
 
 | # | Fix | Commit |
 |---|-----|--------|
@@ -564,18 +566,34 @@ eval prompt byte-identical (the classifier prompt is untouched by all of this wo
 | 8 | Approving a proposal for a dropped rule no longer lies "now active" — Batch 3 | `706e70c` |
 | 3, 18 | Revived the dead rule-attribution chain; mid-run rule changes no longer stale — Batch 4 | `80d5ed5` |
 | 13, 20 | MailWarden's own mail stays unread; already-processed messages not re-downloaded — Batch 5 | `53a0b13` |
+| 16, 19 | Signal expirations logged to Dashboard history; honest `send_failed` events when a proposal email fails to send — Batch 6 | `eff03e4` |
+| 9 | Kind-aware pending-review copy (no-email teach kinds point to the Dashboard; "has `[SFID]` in its subject", not "starts with") — folded into Feature 1 | `77be272` |
 
 Each landed fix: plan → master vet → Opus 4.8 implement → independent Sonnet review PASS → commit; offline eval byte-identical throughout.
 
-**IN PROGRESS — Batch 6 (#16, #19, #9): BUILT, NOT yet committed (held mid-flight 2026-07-04):**
+**Batch 6 outcome (split):** #16 and #19 shipped together in `eff03e4`. #9 (the pending-review
+copy that first FAILED review for overclaiming — it said proposals' subjects *start with* `[SFID]`,
+false for false-positive proposals and for the no-email block-sender / Check-an-Email teach kinds)
+was pulled out of the batch and finalized alongside Feature 1 in `77be272`, since Feature 1's
+Dashboard Approve button is what the no-email kinds now point to.
 
-- **#16** (write the "expired" history events the Dashboard already filters for) and **#19** (stop `handle_new_pattern` reporting success when the proposal email failed to send) are built and PASSED independent review — but sit UNCOMMITTED, held with #9.
-- **#9 FAILED review** (blocking): the copy overclaimed. `build_pending_signals_section` lists ALL pending kinds unfiltered, but the new copy said "reply to the proposal email, subject *starts with* `[SFID]`" — false for false-positive proposals (SFID is mid-subject) and for block-sender / Check-an-Email teach proposals (which send NO email; Dashboard-only). Needs a kind-aware rewrite (soften "starts with" → "has `[SFID]` in its subject"; branch the no-email kinds straight to "approve in the Dashboard"). Best finalized alongside Feature 1 below (FP Dashboard Approve), which changes the approval landscape.
+**DONE — four owner-approved features (2026-07-04), landed before the installer:**
+1. ✅ Dashboard **Approve** button for false-positive proposals (mirrors the email YES; new config_io twin) — `77be272` (this commit also carries the #9 copy fix).
+2. ✅ Dashboard **Restore** control + a **"Dropped rules"** panel in Signal History (restore by rule id; no 30-day / report-number limit; fixes the old "the Dashboard can't restore a dropped rule" message) — `7300cbc`.
+3. ✅ **`enabled`-account default → ON**: a missing `enabled` key now means filtered-and-reported everywhere (filter and report agree) — `cb12e48`.
+4. ✅ **Train-folder** silent-reinforce gate: the one un-approved path (a reason-less drop auto-strengthening an existing rule) is now behind approval, with "MailWarden guessed this — review before approving" copy — `9ff01c6`.
 
-**NEXT — four owner-approved features (2026-07-04), to land BEFORE the installer:**
-1. Dashboard **Approve** button for false-positive proposals (mirror the email YES; needs a new config_io twin — heavier than the Batch 3 twin because the parse/convert helpers live only in `spam_filter.py`).
-2. Dashboard **Restore** control + a **"Dropped rules"** panel in Signal History (restore by rule id; removes the email path's 30-day / report-number limits; also fixes the now-false "the Dashboard can't restore a dropped rule" message).
-3. **`enabled`-account default → ON** (owner decision): unify every site — a missing key currently means "not filtered" in the filter but "reported anyway" in the report.
-4. **Train-folder** silent-reinforce gate (owner direction): put the one un-approved path (a reason-less drop auto-strengthening an existing rule) behind approval + clearer "MailWarden guessed this — review before approving" proposal copy. NOT the big reason-capture UX.
+**DONE — installer, now Apple-Silicon ONLY** (owner decision 2026-07-04): universal2/Intel dropped,
+arm64-only build + version bump to `1.6.0-beta.18` — `e07dba2`. A notarization bug in that build
+(it fell back to the Xcode Command-Line-Tools Python 3.9, whose ad-hoc-signed framework Apple's
+notary rejects) was fixed in `5decd27`: `BUILD_PY` now requires a python.org 3.12, nested Mach-O
+signing is path-agnostic, and a local ad-hoc-signature assertion fails the build early. Help + report
+copy refreshed to match the shipped features (RESTORE, Dashboard restore, cascade model names) —
+`8406cb7` — and the version bumped to `1.6.0-beta.19` — `cba6865`.
 
-**THEN the installer — now Apple-Silicon ONLY** (owner decision 2026-07-04): drop universal2/Intel entirely (arm64-only build; remove the Rosetta/x86_64 test gates). The README **and** the GitHub release page must carry: **"❌ Intel Macs — not supported. MailWarden requires an Apple Silicon Mac (M1 or later)."** The live M1 build has NONE of these fixes or features yet.
+**Final artifact:** `dist/MailWarden-signed.pkg`, v1.6.0-beta.19, arm64-only, signed + notarized
+(Apple notary Accepted) + stapled. This is the shippable build.
+
+**REMAINING — human steps only (need Matt's hands):**
+1. Install `dist/MailWarden-signed.pkg` on the M1 and live-test. In particular the **Dashboard Approve button** (Feature 1) and the **Dropped-rules Restore panel** (Feature 2) have only been headless-tested so far — verify them in the running app.
+2. At publish, add the **"❌ Intel Macs — not supported. MailWarden requires an Apple Silicon Mac (M1 or later)."** line to the GitHub release page. (The README already carries it.)

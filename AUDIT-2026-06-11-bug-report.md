@@ -742,6 +742,13 @@ First holistic "is this approach right for the goal" review (prior audit = harde
 
 **Combined confirmation eval (`corpus-v3-afterF1F5-run1-2026-07-03.txt`, ~$1.65):** 0 FP · 93.0% (173/186) — two harvested-junk flips vs baseline. **Root-caused as API-side noise, NOT a leak ($0 proof):** exact system+user prompts for both flipped emails captured via monkeypatched _classify_once at HEAD `78b59a0` AND baseline commit `23b4c2a` — sha256-identical at both. Lesson: temp=0 reduces but does not eliminate serving-side variance; on 400+ emails expect ±2 borderline flips and attribute deltas with the prompt-hash technique before assuming regression.
 
-**Help-copy refresh:** help_content.py only (+46/−7) — four stale spots fixed (single-Haiku default framing ×3, report description missing APPROVE); new TEACH MAILWARDEN quick-reference block placed FIRST in the Help tab and early in the welcome email (Train folder, Fwd: teach vocabulary, APPROVE/DROP/KEEP/YES/NO reply commands); stale measured cost figure ($0.50/day, pre-cascade) removed rather than shipped inaccurate. Matt's standing copy rules recorded: accuracy-verified claims, action instructions never buried, no AI-trope filler. (Commit pending review gate at time of writing; see git log.)
+**Help-copy refresh:** help_content.py only (+46/−7) — four stale spots fixed (single-Haiku default framing ×3, report description missing APPROVE); new TEACH MAILWARDEN quick-reference block placed FIRST in the Help tab and early in the welcome email (Train folder, Fwd: teach vocabulary, APPROVE/DROP/KEEP/YES/NO reply commands); stale measured cost figure ($0.50/day, pre-cascade) removed rather than shipped inaccurate. Matt's standing copy rules recorded: accuracy-verified claims, action instructions never buried, no AI-trope filler. (Landed as `375f466`.)
 
-**Session tally:** ~$3.30 API of the $5 cap. **Remaining to "finished": installer build (VERSION bump + help copy ships in it) → M1 install → live-test gate — the two last steps need Matt's hands.**
+**Session tally:** ~$3.30 API of the $5 cap.
+
+**UPDATE 2026-07-05:** since this sprint, the 2026-07-03 integration audit (all 20 findings) and the
+four owner-approved features all landed (tracked in `INTEGRATION-AUDIT-2026-07-03.md`), and the
+installer was built: Apple-Silicon-only, help + report copy refreshed, version `1.6.0-beta.19`
+(`cba6865`). The final artifact `dist/MailWarden-signed.pkg` is arm64-only, signed + notarized
+(Apple notary Accepted) + stapled. **Remaining to "finished" — human steps only: install on the M1 +
+live-test, and add the "Intel Macs not supported" line to the GitHub release page at publish.**
