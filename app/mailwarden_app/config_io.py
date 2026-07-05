@@ -10,6 +10,8 @@ UI are interchangeable with files written by the filter.
 """
 import json
 import os
+import re
+import secrets
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -657,6 +659,255 @@ def apply_blocklist_proposal_from_pending(sfid: str,
         "source": source,
     })
     return entry
+
+
+# ---------------------------------------------------------------------------
+# False-positive narrowing helpers — DUPLICATED from spam_filter.py.
+#
+# config_io (the GUI package) and the engine (payload/MailWarden/src) are two
+# packages that never import each other — they share JSON sidecars only — so the
+# small PURE FP helpers the Dashboard "Approve" needs are copied here verbatim
+# rather than imported. They MUST stay byte-identical to their spam_filter.py
+# originals; a drift-guard test (tests/test_fp_dashboard_approve.py) feeds one
+# fixture to both parsers and asserts identical output. If you edit one copy,
+# edit the other. Keeping spam_filter.py untouched also keeps the offline eval
+# byte-identical to baseline.
+#
+# Mirrors spam_filter.py: _FP_SECTION_LABELS / _FP_LABEL_* (~3444),
+# _normalize_fp_analysis (~3466), _parse_fp_proposed_changes (~3482),
+# _fp_changes_appliable (~3500), _mint_refinement_id (~3339),
+# _fp_narrowing_headline (~3330), _fp_narrowing_to_refinement (~3352).
+# ---------------------------------------------------------------------------
+
+_FP_SECTION_LABELS = (
+    "WHY IT WAS FLAGGED", "WHY THE USER IS RIGHT",
+    "PROPOSED CHANGE", "TRADEOFF", "MY RECOMMENDATION",
+)
+_FP_LABEL_ALT = "|".join(re.escape(x) for x in _FP_SECTION_LABELS)
+# A label line WITH a colon; leading heading hashes and/or bold markers are
+# tolerated, and inline content may follow ("**TRADEOFF:** low risk"). The
+# colon may sit inside the bold span ("**LABEL:**") or outside ("**LABEL**:").
+_FP_LABEL_COLON = re.compile(
+    r'^[ \t]*#{0,6}[ \t]*(?:\*\*|__)?[ \t]*'
+    r'(?P<label>' + _FP_LABEL_ALT + r')'
+    r'[ \t]*(?::[ \t]*(?:\*\*|__)?|(?:\*\*|__)[ \t]*:)'
+    r'[ \t]*(?P<rest>.*?)[ \t]*$')
+# A Markdown HEADING label with no colon ("## PROPOSED CHANGE") — the label
+# must be the entire line, and at least one '#' is required so plain prose
+# ("PROPOSED CHANGE ideas …") is never mistaken for a section boundary.
+_FP_LABEL_BARE = re.compile(
+    r'^[ \t]*#{1,6}[ \t]*(?:\*\*|__)?[ \t]*'
+    r'(?P<label>' + _FP_LABEL_ALT + r')'
+    r'[ \t]*(?:\*\*|__)?[ \t]*$')
+
+
+def _normalize_fp_analysis(analysis: str) -> str:
+    """Rewrite Markdown-dressed FP section labels to bare 'LABEL:' lines so the
+    strict capture below can find them. Non-label lines pass through verbatim."""
+    out = []
+    for line in analysis.split("\n"):
+        m = _FP_LABEL_COLON.match(line) or _FP_LABEL_BARE.match(line)
+        if m:
+            rest = (m.groupdict().get("rest") or "").strip()
+            out.append(m.group("label") + ":")
+            if rest:
+                out.append(rest)
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _parse_fp_proposed_changes(analysis: str) -> dict:
+    """Extract PROPOSED CHANGE / TRADEOFF from an FP analysis, tolerating
+    Markdown heading/bold dressing on the labels. Preserves the original
+    capture contract: PROPOSED CHANGE is bounded by TRADEOFF, and TRADEOFF by
+    MY RECOMMENDATION."""
+    proposed = {"signals_to_narrow": {}, "tradeoffs": ""}
+    norm = _normalize_fp_analysis(analysis or "")
+    prop_match = re.search(
+        r'(?ms)^PROPOSED CHANGE:\s*\n(.*?)(?=^TRADEOFF:$)', norm)
+    trade_match = re.search(
+        r'(?ms)^TRADEOFF:\s*\n(.*?)(?=^MY RECOMMENDATION:$)', norm)
+    if prop_match:
+        proposed["signals_to_narrow"]["from_analysis"] = prop_match.group(1).strip()
+    if trade_match:
+        proposed["tradeoffs"] = trade_match.group(1).strip()
+    return proposed
+
+
+def _fp_changes_appliable(proposed_changes: dict) -> bool:
+    """True when a parsed FP proposal carries at least one non-blank narrowing."""
+    narrowings = (proposed_changes or {}).get("signals_to_narrow") or {}
+    return any(str(v).strip() for v in narrowings.values())
+
+
+def _mint_refinement_id(signals: dict) -> str:
+    """Mint an R-YYYYMMDD-<token> id unique against this signals dict's
+    ai_refinements. Same format as spam_filter._mint_refinement_id /
+    utils.random_token (secrets.token_hex(6)); no pending read, so it is safe
+    to call while already holding the SIGNALS_PATH lock."""
+    existing = {r.get("id", "") for r in (signals.get("ai_refinements") or [])}
+    today = datetime.now().strftime("%Y%m%d")
+    while True:
+        rid = f"R-{today}-{secrets.token_hex(6)}"
+        if rid not in existing:
+            return rid
+
+
+def _fp_narrowing_headline(proposed_changes: dict) -> str:
+    """Join the non-blank narrowing texts of a parsed FP proposal into one
+    plain-English headline (in practice a single 'from_analysis' entry)."""
+    narrowings = (proposed_changes or {}).get("signals_to_narrow") or {}
+    parts = [str(v).strip() for v in narrowings.values() if str(v).strip()]
+    return "\n".join(parts)
+
+
+def _fp_narrowing_to_refinement(proposed_changes: dict, conv: dict,
+                                signals: dict, *, source: str) -> dict:
+    """Build a LEGITIMATE ai_refinement record from an approved FP narrowing.
+
+    verdict 'legitimate' so the classifier renders it as a NOT_SPAM exclusion;
+    scope 'all' so it keeps the global reach the legacy soft_signals narrowing
+    had; a real R- id so it is visible/deletable in the Dashboard. PURE (no IO);
+    ``signals`` is used only to keep the minted id unique."""
+    now = now_iso()
+    subject = (conv.get("original_subject") or "").strip()
+    return {
+        "id": _mint_refinement_id(signals),
+        "kind": "fp_narrowing",
+        "verdict": "legitimate",
+        "rule_class": None,
+        "headline": _fp_narrowing_headline(proposed_changes),
+        "rationale": (proposed_changes.get("tradeoffs") or "").strip(),
+        "what_this_doesnt_cover": "",
+        "confidence": "medium",
+        "evidence": [subject or "false-positive-forward"],
+        "first_learned": now,
+        "last_reinforced": now,
+        "match_count": 1,
+        "status": "active",
+        "scope": "all",
+        "source": source,
+    }
+
+
+def apply_fp_narrowing_from_pending(sfid: str,
+                                    source: str = "dashboard") -> dict | None:
+    """Approve a pending false_positive narrowing from the Dashboard (Feature 1).
+
+    Mirrors the engine's email-YES false_positive arm in spam_filter.run_filter
+    and the spam-example twin apply_refinement_from_pending: verify-before-ack +
+    self-heal, then route the approved narrowing through the MODERN refinements
+    store (a LEGITIMATE, scope-"all" ai_refinement with a real R- id) and run the
+    same applied / already_active / retired state logic — so a Dashboard approval
+    lands in the identical state an email YES would.
+
+    Returns:
+      {"status": "applied"|"already_active"|"retired", "id": rid, "headline": h}
+      {"status": "no_change"}  — the proposal carried no readable change (the
+                                 self-heal re-parse also failed): NOTHING written,
+                                 conv left PENDING, logged "apply_failed".
+      None                     — sfid not found / not awaiting_reply / not a
+                                 false_positive proposal.
+    """
+    # ONE lock over BOTH sidecars for the whole op (C7). file_lock.locked sorts
+    # the pair into a fixed order internally, so this can never deadlock against
+    # another op taking the same pair in the opposite order. Fresh reads under
+    # the lock mean a concurrent learner save / parallel approval isn't clobbered.
+    with file_lock.locked(paths.PENDING_SIGNALS_PATH, paths.SIGNALS_PATH):
+        pending = load_pending_signals()
+        conv = None
+        for c in pending.get("conversations", []):
+            if c.get("id") == sfid:
+                conv = c
+                break
+        if conv is None:
+            return None
+        if conv.get("status") not in ("awaiting_reply",):
+            return None
+        # FP conversations predate the "kind" field, so the default matches the
+        # engine's own conv.get("kind", "false_positive").
+        if conv.get("kind", "false_positive") != "false_positive":
+            return None
+
+        # Verify-before-ack + self-heal (mirrors spam_filter's legacy-FP arm):
+        # an older parser may have stored an EMPTY proposed_changes for a
+        # Markdown-dressed analysis. Re-parse api_analysis with the tolerant
+        # parser and persist the healed changes before deciding.
+        proposed = conv.get("proposed_changes") or {}
+        if not _fp_changes_appliable(proposed):
+            proposed = _parse_fp_proposed_changes(conv.get("api_analysis", ""))
+            if _fp_changes_appliable(proposed):
+                conv["proposed_changes"] = proposed
+        if not _fp_changes_appliable(proposed):
+            # Nothing appliable: do NOT approve, do NOT write signals, leave the
+            # conv PENDING; record the honest no-op (never "applied").
+            append_refinement_log({
+                "ts": now_iso(),
+                "event": "apply_failed",
+                "sfid": sfid,
+                "reason": "analysis contained no readable proposed change",
+                "source": source,
+            })
+            return {"status": "no_change"}
+
+        # Build the modern refinement (fresh R- id) and run the same 3-way
+        # applied / already_active / retired logic as apply_refinement_from_pending.
+        data = load_signals()
+        refinements = data.setdefault("ai_refinements", [])
+        refinement = _fp_narrowing_to_refinement(proposed, conv, data,
+                                                 source=source)
+        rid = refinement.get("id")
+        existing = next((r for r in refinements if r.get("id") == rid),
+                        None) if rid else None
+        if existing is not None and existing.get("status", "active") != "active":
+            outcome = "retired"
+        elif existing is not None:
+            outcome = "already_active"
+        else:
+            outcome = "applied"
+            refinements.append(refinement)
+            save_signals(data)
+
+        if outcome != "retired":
+            # applied / already_active: resolve the conv (any self-heal write is
+            # persisted with it). "retired" leaves the conv PENDING so the owner
+            # can act on the honest ack.
+            conv["status"] = "approved"
+            conv["resolution"] = "approved"
+            conv.setdefault("conversation_history", []).append({
+                "role": "system",
+                "timestamp": now_iso(),
+                "content": f"Approved via {source}",
+            })
+            save_pending_signals(pending)
+    # Log ONLY a genuine append as "applied" (an already-active re-approval must
+    # not double-log; a retired-id approval is a no-op → "apply_failed").
+    if outcome == "applied":
+        append_refinement_log({
+            "ts": now_iso(),
+            "event": "applied",
+            "id": rid,
+            "sfid": sfid,
+            "headline": refinement.get("headline", ""),
+            "source": source,
+        })
+        return {"status": "applied", "id": rid,
+                "headline": refinement.get("headline", "")}
+    if outcome == "retired":
+        append_refinement_log({
+            "ts": now_iso(),
+            "event": "apply_failed",
+            "id": rid,
+            "sfid": sfid,
+            "reason": "referenced rule is retired",
+            "source": source,
+        })
+        return {"status": "retired", "id": rid,
+                "headline": refinement.get("headline", "")}
+    # already_active: truthful "it's active" for the caller; no re-log.
+    return {"status": "already_active", "id": rid,
+            "headline": refinement.get("headline", "")}
 
 
 def reject_pending(sfid: str, source: str = "dashboard",

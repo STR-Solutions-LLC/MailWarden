@@ -2880,17 +2880,21 @@ class SignalsTab(ttk.Frame):
         btns = ttk.Frame(card)
         btns.pack(anchor=tk.W, pady=(8, 0))
         sfid = conv.get("id", "")
-        if kind in ("spam_example_proposal", "block_sender_proposal"):
+        # Every pending kind is now one-click approvable from the Dashboard:
+        # false_positive narrowings route through apply_fp_narrowing_from_pending
+        # (Feature 1), joining the spam-example and block-sender proposals that
+        # already offered Approve + Reject here. FP conversations carry no
+        # explicit "kind", so they arrive as the "false_positive" default set at
+        # the top of this method. An unknown/future kind gets Withdraw only — we
+        # never offer to Approve a proposal we don't recognize.
+        if kind in ("spam_example_proposal", "block_sender_proposal",
+                    "false_positive"):
             ttk.Button(btns, text="Approve", style="Primary.TButton",
                        command=lambda s=sfid: self._on_approve_pending(s)).pack(
                            side=tk.LEFT)
             ttk.Button(btns, text="Reject",
                        command=lambda s=sfid: self._on_reject_pending(s)).pack(
                            side=tk.LEFT, padx=(6, 0))
-        else:
-            ttk.Label(btns, style="Muted.TLabel",
-                      text="(False-positive narrowings: reply to the email "
-                            "to approve.)").pack(side=tk.LEFT)
         ttk.Button(btns, text="Withdraw",
                    command=lambda s=sfid: self._on_withdraw_pending(s)).pack(
                        side=tk.LEFT, padx=(6, 0))
@@ -2906,7 +2910,10 @@ class SignalsTab(ttk.Frame):
         pending = config_io.load_pending_signals()
         conv = next((c for c in pending.get("conversations", [])
                      if c.get("id") == sfid), None)
-        kind = (conv or {}).get("kind", "")
+        # FP conversations carry no explicit "kind"; default to "false_positive"
+        # so they route to the FP branch below (matches _render_pending_card and
+        # the engine's own conv.get("kind", "false_positive")).
+        kind = (conv or {}).get("kind", "false_positive")
 
         if kind == "block_sender_proposal":
             entry = config_io.apply_blocklist_proposal_from_pending(
@@ -2924,13 +2931,41 @@ class SignalsTab(ttk.Frame):
             self.refresh()
             return
 
+        if kind == "false_positive":
+            # Feature 1: approve a false-positive narrowing here instead of only
+            # by email reply. Honor the #7/#8 honesty rule — NEVER showinfo on a
+            # no-op/failure. All five outcomes are mapped explicitly.
+            result = config_io.apply_fp_narrowing_from_pending(
+                sfid, source="dashboard")
+            status = (result or {}).get("status")
+            if result is None:
+                messagebox.showerror(
+                    "Could not apply",
+                    f"SFID {sfid} not found or not approvable from the Dashboard.")
+            elif status == "applied":
+                messagebox.showinfo(
+                    "Applied",
+                    f"Refinement {result.get('id', '')} is now active.")
+            elif status == "already_active":
+                messagebox.showinfo(
+                    "Already active",
+                    "That refinement is already active — nothing changed.")
+            elif status == "retired":
+                messagebox.showwarning("Not reactivated", pending_retired_message())
+            elif status == "no_change":
+                messagebox.showerror(
+                    "Couldn't apply",
+                    "MailWarden couldn't read a proposed change in that "
+                    "proposal, so nothing was applied. It's still pending.")
+            self.refresh()
+            return
+
         # Content ai_refinement (spam_example_proposal).
         result = config_io.apply_refinement_from_pending(sfid, source="dashboard")
         if result is None:
             messagebox.showerror(
                 "Could not apply",
-                f"SFID {sfid} not found or not approvable from the Dashboard "
-                f"(false-positive narrowings must be approved by email reply).")
+                f"SFID {sfid} not found or not approvable from the Dashboard.")
         elif result.get("status") == "retired":
             # Finding #8: the rule was dropped; approving here can't un-drop it.
             messagebox.showwarning("Not reactivated", pending_retired_message())

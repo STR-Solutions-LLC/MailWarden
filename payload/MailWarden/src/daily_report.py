@@ -869,6 +869,32 @@ def expire_pending_signals(logger: logging.Logger) -> dict:
     return result
 
 
+def _pending_was_emailed(conv: dict) -> bool:
+    """True when this pending proposal was delivered to the owner as an email, so
+    "reply YES to the proposal email" is an honest instruction (finding #9).
+
+    Emailed kinds:
+      * false_positive           — the FP analysis email (SFID bracketed
+        MID-subject). FP conversations carry no explicit "kind", so the default
+        lands here.
+      * spam_example_proposal WITH a non-empty forwarder — the forward-spam
+        learner (learn_signals.handle_new_pattern) emails these and stamps the
+        forwarding account. The Check-an-Email screen
+        (learn_signals.propose_from_teaching) hardcodes forwarder="" and sends NO
+        email, so an empty/absent forwarder is treated as Dashboard-only — the
+        SAFE default (never tell the owner to reply to an email that may not
+        exist; block_sender_proposal is handled by kind, so its own non-empty
+        forwarder is irrelevant here).
+    Dashboard-only kinds: check-screen spam_example_proposal, block_sender_proposal.
+    """
+    kind = conv.get("kind", "false_positive")
+    if kind == "false_positive":
+        return True
+    if kind == "spam_example_proposal":
+        return bool((conv.get("forwarder") or "").strip())
+    return False
+
+
 def build_pending_signals_section(sig_status: dict) -> list:
     """Build PENDING SIGNAL REVIEWS section lines. Returns empty if nothing to show."""
     lines = []
@@ -880,13 +906,29 @@ def build_pending_signals_section(sig_status: dict) -> list:
         for conv in sig_status["expired"]:
             lines.append(f"1 proposal expired without response and was discarded.")
             lines.append(f"  Original: {conv.get('original_subject', 'Unknown')}")
-            lines.append(f"  To revisit: forward the original email again with \"Fwd: False Positive\" subject.")
+            # Kind-aware re-teach path (finding #9). "Fwd: False Positive" is
+            # correct ONLY for a false positive; every other kind (spam-example
+            # forward, check-screen proposals, block-sender) is re-taught from the
+            # Check an Email screen. Never emit the FP re-forward line for a
+            # non-FP kind — it would tell the owner to mark real spam legitimate.
+            if conv.get("kind", "false_positive") == "false_positive":
+                lines.append(f"  To revisit: forward the original email again with \"Fwd: False Positive\" subject.")
+            else:
+                lines.append(f"  To revisit: re-teach it from the Check an Email screen in the MailWarden Dashboard.")
 
         for conv in sig_status["active"]:
             expires = conv.get("expires", "")[:10]
+            sfid = conv.get("id")
             lines.append(f"1 proposal awaiting your response (expires {expires}):")
-            lines.append(f"  [{conv.get('id')}] — {conv.get('original_subject', 'Unknown')}")
-            lines.append(f"  Reply YES to apply, NO to reject, or ask a question.")
+            lines.append(f"  [{sfid}] — {conv.get('original_subject', 'Unknown')}")
+            # Feature 1 made EVERY pending kind approvable in the Dashboard, so
+            # lead with that now-universal path. Only add the email-reply option
+            # when an email actually exists (emailed kinds); never point the owner
+            # at a reply for a Dashboard-only proposal (finding #9).
+            if _pending_was_emailed(conv):
+                lines.append(f"  Approve it in the MailWarden Dashboard (Signal History -> Pending), or reply YES to the proposal email that has [{sfid}] in its subject line.")
+            else:
+                lines.append(f"  Approve it in the MailWarden Dashboard: Signal History -> Pending. (This one has no email to reply to.)")
 
     # Always show signal history if there have been any submissions
     if sig_status.get("total_submitted", 0) > 0:
