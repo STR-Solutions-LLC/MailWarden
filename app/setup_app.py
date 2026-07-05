@@ -20,7 +20,7 @@ from setuptools import setup
 
 HERE = Path(__file__).parent.resolve()
 APP_NAME = "MailWarden"
-VERSION = "1.6.0-beta.17.1"
+VERSION = "1.6.0-beta.18"
 
 # ----------------------------------------------------------------------------
 # Copy the shared bundled defaults and runtime payload into app/resources/
@@ -123,7 +123,7 @@ PLIST = {
 
 OPTIONS = {
     "argv_emulation": False,
-    "arch": "universal2",
+    "arch": "arm64",
     # site_packages=True copies the entire build-venv site-packages into the
     # bundle. This is heavier than curating a packages= list, but it is the
     # only reliable way to ship single-module packages (typing_extensions)

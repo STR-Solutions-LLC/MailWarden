@@ -30,7 +30,7 @@ from pathlib import Path
 
 from . import paths
 
-BUNDLED_FILTER_VERSION = "1.6.0-beta.17.1"
+BUNDLED_FILTER_VERSION = "1.6.0-beta.18"
 BUNDLED_INSTALLER_VERSION = "1.0"
 
 # Directories/files under Contents/Resources/ that we ship as payload.

@@ -22,7 +22,7 @@ DIST_DIR="$INSTALLER_ROOT/dist"
 COMPONENT_PKG="$INSTALLER_ROOT/build/MailWarden-component.pkg"
 FINAL_PKG="$DIST_DIR/MailWarden.pkg"
 APP_BUNDLE_ID="com.strsolutions.mailwarden"
-APP_VERSION="1.6.0-beta.17.1"
+APP_VERSION="1.6.0-beta.18"
 
 mkdir -p "$DIST_DIR" "$(dirname "$COMPONENT_PKG")"
 
@@ -99,19 +99,20 @@ BUILD_PY="${BUILD_PY:-/usr/bin/python3}"
 if ! "$BUILD_PY" -c "import tkinter" 2>/dev/null; then
     die "Build Python lacks tkinter. Set BUILD_PY=/path/to/python3 and retry."
 fi
-# Require a universal2 Python so the resulting bundle actually loads on both
-# Intel and Apple Silicon. A single-arch build_py still passes the dual-arch
-# runtime gate IF every native wheel happened to fuse correctly, but we want
-# to fail fast and obvious if the interpreter itself is wrong.
+# Require an ARM64-capable Python so py2app can extract an arm64 slice into
+# the bundle (the shipped app is arm64-only — see OPTIONS["arch"] in
+# setup_app.py). We don't require an x86_64 slice too — Intel is no longer a
+# build target — but we still fail fast and obvious if the interpreter has no
+# arm64 slice at all, rather than let py2app produce a broken bundle.
 BUILD_PY_REAL="$(readlink -f "$BUILD_PY" 2>/dev/null || echo "$BUILD_PY")"
 BUILD_PY_ARCHS="$(/usr/bin/file "$BUILD_PY_REAL" | grep -oE 'arm64|x86_64' \
                     | sort -u | tr '\n' ' ')"
 case "$BUILD_PY_ARCHS" in
-    "arm64 x86_64 "|"x86_64 arm64 ")
-        log "BUILD_PY is universal2 ($BUILD_PY_REAL)"
+    *arm64*)
+        log "BUILD_PY has an arm64 slice ($BUILD_PY_REAL: $BUILD_PY_ARCHS)"
         ;;
     *)
-        die "BUILD_PY=$BUILD_PY is not universal2 (archs: '$BUILD_PY_ARCHS'). "\
+        die "BUILD_PY=$BUILD_PY has no arm64 slice (archs: '$BUILD_PY_ARCHS'). "\
 "Use python.org's universal2 Python 3.12 at "\
 "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12"
         ;;
@@ -171,22 +172,10 @@ for item in typing_extensions.py PyObjCTools docstring_parser; do
 done
 
 # ----------------------------------------------------------------------------
-# Universal2 fat-binary fusion. pip installs native wheels matching the
-# BUILD machine's architecture only (arm64 wheels on Apple Silicon). Without
-# this step the .app loads on the build arch but crashes on the other.
-# ----------------------------------------------------------------------------
-log "Fusing single-arch .so files to universal2..."
-"$BUILD_VENV/bin/pip" install --quiet delocate 2>/dev/null || true
-# shellcheck disable=SC1091
-source "$BUILD_VENV/bin/activate"
-bash "$INSTALLER_ROOT/scripts/make_universal_sos.sh" "$BUILT_APP"
-deactivate
-
-# ----------------------------------------------------------------------------
-# Step 3.75 — runtime import gate. Invoke the REAL app binary with --diagnose
-# under BOTH architectures. Single-arch wheels that slip through pip land
-# here; we do not ship a bundle that works on one arch but crashes on the
-# other.
+# Step 3.75 — runtime import gate. Invoke the REAL app binary with --diagnose.
+# The build is arm64-only, so there is no other-arch slice to fuse or verify —
+# single-arch wheels are exactly what we want here. Missing dependencies still
+# surface as import failures, so this gate is unchanged in purpose.
 # ----------------------------------------------------------------------------
 log "Runtime import gate (--diagnose) — native arch..."
 if ! "$BUILT_APP/Contents/MacOS/MailWarden" --diagnose >/dev/null; then
@@ -194,13 +183,6 @@ if ! "$BUILT_APP/Contents/MacOS/MailWarden" --diagnose >/dev/null; then
     die "Runtime import gate failed on native arch. The bundle is missing a dependency — do not ship."
 fi
 log "  native arch: all imports OK"
-
-log "Runtime import gate (--diagnose) — x86_64 via Rosetta..."
-if ! /usr/bin/arch -x86_64 "$BUILT_APP/Contents/MacOS/MailWarden" --diagnose >/dev/null; then
-    /usr/bin/arch -x86_64 "$BUILT_APP/Contents/MacOS/MailWarden" --diagnose || true
-    die "Runtime import gate failed on x86_64. Intel Macs will not run this bundle — do not ship."
-fi
-log "  x86_64: all imports OK"
 
 log "Runtime import gate (--diagnose) — arm64 explicit..."
 if ! /usr/bin/arch -arm64 "$BUILT_APP/Contents/MacOS/MailWarden" --diagnose >/dev/null 2>&1; then
@@ -215,10 +197,6 @@ fi
 log "Runtime HTTPS gate (--test-validate) — native arch..."
 if ! "$BUILT_APP/Contents/MacOS/MailWarden" --test-validate; then
     die "HTTPS gate failed on native arch. The app will hang or error on Validate."
-fi
-log "Runtime HTTPS gate (--test-validate) — x86_64 via Rosetta..."
-if ! /usr/bin/arch -x86_64 "$BUILT_APP/Contents/MacOS/MailWarden" --test-validate; then
-    die "HTTPS gate failed on x86_64. Intel Macs would hang on Validate."
 fi
 
 # ----------------------------------------------------------------------------
