@@ -608,6 +608,9 @@ def build_rule_review_section(ordered: list) -> list:
                  "number (example: DROP 1).")
     lines.append("To KEEP a rule, reply KEEP 1. No reply leaves your rules "
                  "unchanged.")
+    lines.append("Changed your mind about a dropped rule? Reply RESTORE and "
+                 "its number (example: RESTORE 1), or restore it in the "
+                 "Dashboard under Signal History → Dropped rules.")
     return lines
 
 
@@ -740,13 +743,41 @@ def save_token_usage(data: dict):
         raise
 
 
+# Known model IDs -> friendly display labels, for the API USAGE line below.
+# No other reusable ID->label map exists in the codebase (dashboard.py's
+# MODEL_CHOICES pairs labels with classify-mode *selections*, not a plain
+# id->name lookup) so this is the single source of truth; extend it here if
+# new model IDs ship. Falls back to the raw ID for anything not listed.
+MODEL_DISPLAY_LABELS = {
+    "claude-haiku-4-5-20251001": "Claude Haiku 4.5",
+    "claude-sonnet-4-6": "Claude Sonnet 4.6",
+}
+
+
 def build_api_usage_section(config: dict) -> list:
-    """Build the API USAGE section lines (model + console link, no dollar amounts)."""
-    raw_model = config.get("anthropic", {}).get("model", "")
-    if raw_model == "claude-haiku-4-5-20251001" or not raw_model:
-        model_label = "Claude Haiku 4.5"
+    """Build the API USAGE section lines (model + console link, no dollar amounts).
+
+    classify_mode "cascade" is the shipped default (config_io.py DEFAULT_CONFIG
+    anthropic.classify_mode) and runs two models — screen_model judges every
+    email, confirm_model re-checks anything the screen stage would junk — so
+    the report names both stages instead of implying Haiku alone is deciding.
+    "single" mode keeps naming the one configured model, as before."""
+    anthropic_config = config.get("anthropic", {})
+    classify_mode = anthropic_config.get("classify_mode", "cascade")
+    if classify_mode == "cascade":
+        screen_model = anthropic_config.get(
+            "screen_model", "claude-haiku-4-5-20251001")
+        confirm_model = anthropic_config.get(
+            "confirm_model", "claude-sonnet-4-6")
+        screen_label = MODEL_DISPLAY_LABELS.get(screen_model, screen_model)
+        confirm_label = MODEL_DISPLAY_LABELS.get(confirm_model, confirm_model)
+        model_label = f"{screen_label} (screen) + {confirm_label} (confirm)"
     else:
-        model_label = raw_model
+        raw_model = anthropic_config.get("model", "")
+        if raw_model == "claude-haiku-4-5-20251001" or not raw_model:
+            model_label = "Claude Haiku 4.5"
+        else:
+            model_label = raw_model
 
     lines = []
     lines.append("-" * 39)

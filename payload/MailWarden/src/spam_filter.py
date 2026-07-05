@@ -3572,18 +3572,24 @@ _FP_APPLY_FAILED_BODY = (
 # Finding #8: honest ack sent when an owner approves a refinement whose rule id
 # is RETIRED (dropped). Approving a proposal does not un-drop a rule, so
 # apply_ai_refinement reports status "retired" and never writes — the caller
-# keeps the proposal open and sends this instead of the "now active" ack. The
-# only working restore path is the daily-report RESTORE reply (finding #10),
-# which is keyed by the rule's report NUMBER, not this SFID; the copy points
-# there truthfully. Same shape as _FP_APPLY_FAILED_BODY: keep the proposal
-# open, keep the {expires} placeholder.
+# keeps the proposal open and sends this instead of the "now active" ack.
+# Since Feature 2 there are two restore paths: the Dashboard (Signal History ->
+# Dropped rules -> one-click Restore, which works anytime) and the daily-report
+# RESTORE reply (finding #10, keyed by the rule's report NUMBER, which works
+# only while a recent report is still in the ~30-day window). Neither is keyed
+# by this SFID; the copy names the Dashboard first (unlimited) and the reply as
+# the recent-report alternative, mirroring dashboard.pending_retired_message.
+# Same shape as _FP_APPLY_FAILED_BODY: keep the proposal open, keep the
+# {expires} placeholder.
 _REFINEMENT_RETIRED_BODY = (
     "MailWarden did not turn that rule back on. This proposal matches a learned "
     "rule you dropped earlier, and approving a proposal does not un-drop a rule on its own.\n\n"
     "Your filter is unchanged and this proposal is still open.\n\n"
-    "To turn the rule back on, reply RESTORE followed by its number (for example, "
-    "RESTORE 2) to the daily-report email or drop confirmation that lists it. Once "
-    "it is active again, you can approve this proposal to reinforce it.\n\n"
+    "To turn the rule back on, open the Dashboard -> Signal History -> Dropped "
+    "rules and click Restore next to it (this works anytime). If the rule is "
+    "still on a recent daily report, replying RESTORE and its number (for "
+    "example, RESTORE 2) to that email works too. Once it is active again, you "
+    "can approve this proposal to reinforce it.\n\n"
     "If you do nothing, this proposal expires on {expires} and is discarded.\n"
 )
 
@@ -8682,8 +8688,10 @@ USER'S FOLLOW-UP:
                                             f"MailWarden will stop applying it "
                                             f"starting with the next scan. "
                                             f"Changed your mind? Reply "
-                                            f"RESTORE {n} to this email to "
-                                            f"turn it back on.")
+                                            f"RESTORE {n} to this email, or "
+                                            f"restore it anytime from Dashboard "
+                                            f"-> Signal History -> Dropped "
+                                            f"rules.")
                                     else:
                                         dequeue_rule_review(rid, logger)
                                         ack_lines.append(

@@ -688,8 +688,9 @@ def test_drop_ack_copy_no_longer_promises_reversibility(monkeypatch):
     assert "RESTORE 1" in body
     assert body == ('Dropped rule 1 ("Urgent fundraising"). MailWarden will '
                     "stop applying it starting with the next scan. Changed "
-                    "your mind? Reply RESTORE 1 to this email to turn it "
-                    "back on.")
+                    "your mind? Reply RESTORE 1 to this email, or restore it "
+                    "anytime from Dashboard -> Signal History -> Dropped "
+                    "rules.")
 
 
 # ═════════════════════════════════════════════════════════════════════════
