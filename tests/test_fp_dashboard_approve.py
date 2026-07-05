@@ -208,16 +208,23 @@ def test_twin_no_change_when_nothing_appliable(monkeypatch, tmp_path):
     assert "applied" not in [e["event"] for e in events]
 
 
+# The deterministic id the twin derives from _fp_conv()'s SFID (finding 3):
+# 'SFID-20260704-fp01' -> 'R-20260704-fp01'.
+_DETERMINISTIC_RID = "R-20260704-fp01"
+
+
 def test_twin_already_active_no_double_log(monkeypatch, tmp_path):
-    """A minted id that already names an ACTIVE rule is a no-op: no signals
-    write, no log, but the conv is still resolved."""
+    """When the DETERMINISTIC id already names an ACTIVE rule the apply is a
+    no-op: no signals write, no log, but the conv is still resolved. (This is
+    exactly the cross-channel case — a second Approve/YES for a proposal whose
+    rule the first channel already wrote.)"""
     conv = _fp_conv()
     result, conv, state, events, saved = _drive_fp_apply(
-        monkeypatch, tmp_path, conv, fixed_id="R-FIXED-active",
-        existing=[{"id": "R-FIXED-active", "status": "active", "headline": "h"}])
+        monkeypatch, tmp_path, conv,
+        existing=[{"id": _DETERMINISTIC_RID, "status": "active", "headline": "h"}])
 
     assert result["status"] == "already_active"
-    assert result["id"] == "R-FIXED-active"
+    assert result["id"] == _DETERMINISTIC_RID
     assert state["saved_signals"] is False
     assert events == []                            # re-approval never double-logs
     assert conv["status"] == "approved"
@@ -225,15 +232,15 @@ def test_twin_already_active_no_double_log(monkeypatch, tmp_path):
 
 def test_twin_retired_leaves_conv_pending_and_logs_apply_failed(
         monkeypatch, tmp_path):
-    """A minted id that names a RETIRED rule cannot be reactivated: no write,
-    conv stays pending, one apply_failed event."""
+    """When the DETERMINISTIC id names a RETIRED rule it cannot be reactivated:
+    no write, conv stays pending, one apply_failed event."""
     conv = _fp_conv()
     result, conv, state, events, saved = _drive_fp_apply(
-        monkeypatch, tmp_path, conv, fixed_id="R-FIXED-retired",
-        existing=[{"id": "R-FIXED-retired", "status": "retired", "headline": "h"}])
+        monkeypatch, tmp_path, conv,
+        existing=[{"id": _DETERMINISTIC_RID, "status": "retired", "headline": "h"}])
 
     assert result["status"] == "retired"
-    assert result["id"] == "R-FIXED-retired"
+    assert result["id"] == _DETERMINISTIC_RID
     assert state["saved_signals"] is False
     assert conv["status"] == "awaiting_reply"      # NOT resolved — honest
     assert [e["event"] for e in events] == ["apply_failed"]
@@ -263,6 +270,81 @@ def test_twin_has_no_dry_run_gate():
     twin genuinely never consults it (no gate to slip past)."""
     src = inspect.getsource(config_io.apply_fp_narrowing_from_pending)
     assert "dry_run" not in src
+
+
+# ---------------------------------------------------------------------------
+# Finding 3 — deterministic FP-narrowing id: Dashboard-Approve and email-YES
+# mint the SAME R- id for one proposal, so a second apply dedupes to a single
+# active rule instead of creating a duplicate.
+# ---------------------------------------------------------------------------
+
+def test_twin_applied_id_is_deterministic_from_sfid(monkeypatch, tmp_path):
+    """The applied refinement id is derived from the proposal's SFID, not a
+    fresh random token — 'SFID-20260704-fp01' -> 'R-20260704-fp01'."""
+    conv = _fp_conv()
+    result, *_ = _drive_fp_apply(monkeypatch, tmp_path, conv)
+    assert result["status"] == "applied"
+    assert result["id"] == _DETERMINISTIC_RID
+
+
+def test_fp_id_matches_across_engine_and_app_twins():
+    """The engine (email-YES) and app (Dashboard-Approve) twins derive the
+    IDENTICAL id from the same conv — the property that makes the two channels
+    idempotent against each other."""
+    conv = _fp_conv()
+    proposed = conv["proposed_changes"]
+    app_ref = config_io._fp_narrowing_to_refinement(
+        proposed, conv, {"ai_refinements": []}, source="dashboard")
+    eng_ref = spam_filter._fp_narrowing_to_refinement(
+        proposed, conv, {"ai_refinements": []}, source="email")
+    assert app_ref["id"] == eng_ref["id"] == _DETERMINISTIC_RID
+
+
+def test_fp_id_falls_back_to_random_when_no_sfid():
+    """migrate_fp_narrowings passes conv={} (no SFID) — the id must fall back to
+    a freshly minted unique R- id, never a crash, and stay unique in a batch."""
+    ref = spam_filter._fp_narrowing_to_refinement(
+        {"signals_to_narrow": {"from_analysis": "x"}}, {},
+        {"ai_refinements": []}, source="migrated_fp_narrowing")
+    assert ref["id"].startswith("R-")
+    assert ref["id"] != _DETERMINISTIC_RID
+
+
+def test_double_apply_same_proposal_yields_single_rule(monkeypatch, tmp_path):
+    """Approve in the Dashboard AND reply YES to the same proposal before the
+    next tick: the deterministic id makes the SECOND apply see the first's
+    already-active rule, so exactly ONE rule exists (no duplicate)."""
+    mem = tmp_path / "memory"
+    mem.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(app_paths, "PENDING_SIGNALS_PATH",
+                        mem / "pending_signals.json")
+    monkeypatch.setattr(app_paths, "SIGNALS_PATH", mem / "signals.json")
+
+    conv = _fp_conv()
+    # A shared signals store so apply #2 sees apply #1's write — this is the
+    # cross-channel condition the deterministic id must dedupe.
+    store = {"ai_refinements": []}
+    monkeypatch.setattr(config_io, "load_pending_signals",
+                        lambda: {"version": "1.0", "conversations": [conv]})
+    monkeypatch.setattr(config_io, "save_pending_signals", lambda data: None)
+    monkeypatch.setattr(config_io, "load_signals",
+                        lambda: {"signals": {},
+                                 "ai_refinements": list(store["ai_refinements"])})
+    monkeypatch.setattr(config_io, "save_signals",
+                        lambda data: store.__setitem__(
+                            "ai_refinements", list(data["ai_refinements"])))
+    monkeypatch.setattr(config_io, "append_refinement_log", lambda ev: None)
+
+    r1 = config_io.apply_fp_narrowing_from_pending(conv["id"], source="dashboard")
+    # The engine's per-run snapshot can't see the mid-tick Dashboard approval,
+    # so it re-processes the still-"awaiting_reply" conv it loaded earlier.
+    conv["status"] = "awaiting_reply"
+    r2 = config_io.apply_fp_narrowing_from_pending(conv["id"], source="email")
+
+    assert r1["status"] == "applied"
+    assert r2["status"] == "already_active"
+    assert r1["id"] == r2["id"] == _DETERMINISTIC_RID
+    assert len(store["ai_refinements"]) == 1        # ONE rule, not two
 
 
 # ---------------------------------------------------------------------------

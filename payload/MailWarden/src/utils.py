@@ -13,9 +13,37 @@ import ipaddress
 import re
 import secrets
 import smtplib
+import ssl
 
 
 _dnsbl_cache: dict = {}
+
+
+def make_tls_context() -> ssl.SSLContext:
+    """Return an SSL context that VERIFIES the server certificate and hostname.
+
+    imaplib.IMAP4_SSL / smtplib.SMTP_SSL / SMTP.starttls default to
+    ssl._create_stdlib_context() (PEP 476 deliberately excluded these modules
+    from verify-by-default), which accepts ANY certificate — self-signed,
+    expired, wrong host — so credentials are exposed to an active MITM.
+    ssl.create_default_context() flips that to CERT_REQUIRED + check_hostname.
+
+    CA source: the bundled python.org build ships no system CA store, so when
+    the default context loads zero CAs we fall back to certifi's bundle
+    (already shipped as an anthropic dependency). The launcher additionally
+    exports SSL_CERT_FILE=certifi.where() for the whole process, but this
+    fallback guarantees verification works even if the engine is ever started
+    outside the launcher. If certifi is somehow unavailable the default context
+    is kept as-is: it fails CLOSED (rejects the connection) rather than
+    silently skipping verification."""
+    ctx = ssl.create_default_context()
+    try:
+        if ctx.cert_store_stats().get("x509_ca", 0) == 0:
+            import certifi
+            ctx.load_verify_locations(cafile=certifi.where())
+    except Exception:
+        pass
+    return ctx
 
 
 def clear_dnsbl_cache() -> None:
@@ -48,8 +76,9 @@ def smtp_login(smtp_config: dict):
     password = smtp_config.get("password", "")
     use_starttls = smtp_config.get("use_starttls", True)
 
+    tls_context = make_tls_context()
     if port == 465:
-        server = smtplib.SMTP_SSL(host, port, timeout=30)
+        server = smtplib.SMTP_SSL(host, port, timeout=30, context=tls_context)
         server.ehlo()
     else:
         if not use_starttls:
@@ -60,7 +89,7 @@ def smtp_login(smtp_config: dict):
             )
         server = smtplib.SMTP(host, port, timeout=30)
         server.ehlo()
-        server.starttls()
+        server.starttls(context=tls_context)
         server.ehlo()
 
     server.login(username, password)

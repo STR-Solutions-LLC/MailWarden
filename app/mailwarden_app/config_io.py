@@ -800,6 +800,23 @@ def _mint_refinement_id(signals: dict) -> str:
             return rid
 
 
+def _fp_refinement_id(conv: dict, signals: dict) -> str:
+    """Deterministic R- id for an FP-narrowing approval (finding 3). Twin of
+    spam_filter._fp_refinement_id.
+
+    Both approval channels (Dashboard Approve + email YES) run the same conv
+    through this, so they mint the SAME id for one proposal — the apply-time
+    dedup then turns a second apply into a no-op (already_active) instead of a
+    duplicate rule. The SFID is 'SFID-YYYYMMDD-<token>' and unique per proposal,
+    so 'R-YYYYMMDD-<token>' (its tail re-prefixed) is unique too and keeps the
+    _mint_refinement_id format. Falls back to a random unique id only when no
+    SFID is present."""
+    sfid = (conv.get("id") or "").strip()
+    if sfid.startswith("SFID-") and len(sfid) > len("SFID-"):
+        return "R-" + sfid[len("SFID-"):]
+    return _mint_refinement_id(signals)
+
+
 def _fp_narrowing_headline(proposed_changes: dict) -> str:
     """Join the non-blank narrowing texts of a parsed FP proposal into one
     plain-English headline (in practice a single 'from_analysis' entry)."""
@@ -814,12 +831,16 @@ def _fp_narrowing_to_refinement(proposed_changes: dict, conv: dict,
 
     verdict 'legitimate' so the classifier renders it as a NOT_SPAM exclusion;
     scope 'all' so it keeps the global reach the legacy soft_signals narrowing
-    had; a real R- id so it is visible/deletable in the Dashboard. PURE (no IO);
-    ``signals`` is used only to keep the minted id unique."""
+    had; a real R- id so it is visible/deletable in the Dashboard. PURE (no IO).
+
+    Finding 3: the id is DETERMINISTIC — derived from the proposal's SFID — so
+    the Dashboard-Approve and email-YES channels mint the SAME id and a second
+    apply dedupes instead of creating a duplicate rule. ``signals`` is used only
+    for the fallback random id when no SFID is present."""
     now = now_iso()
     subject = (conv.get("original_subject") or "").strip()
     return {
-        "id": _mint_refinement_id(signals),
+        "id": _fp_refinement_id(conv, signals),
         "kind": "fp_narrowing",
         "verdict": "legitimate",
         "rule_class": None,

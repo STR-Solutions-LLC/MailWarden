@@ -390,3 +390,111 @@ def test_sidecar_legacy_string_list_migrates(tmp_path, monkeypatch):
     data = spam_filter.load_dry_run_verdicts()
     entries = data["ids"][_ACCOUNT_KEY]
     assert entries[0][0] == "<plain@x>" and len(entries[0]) == 2
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 7. Finding 1 — a FAILED spam move is NOT recorded processed (retried next
+#    tick) and decisions.log never claims a successful move
+# ═════════════════════════════════════════════════════════════════════════
+
+def test_failed_move_not_recorded_and_retried(tmp_path, monkeypatch):
+    """Real (non-dry) run where execute_spam_action FAILS ("[MOVE FAILED ...]").
+    The message must stay OUT of processed_ids (and out of the dry-run sidecar)
+    so the next tick re-classifies and re-attempts the move instead of leaving
+    the spam stranded in the inbox forever."""
+    msg = _spam_msg("<failmove-1@evil.example>")
+    env = _make_env(tmp_path, monkeypatch, dry_run=False)
+    _set_message(monkeypatch, msg)
+
+    attempts = []
+
+    def _failing_action(conn, uid, account, logger):
+        attempts.append(uid)
+        return "[MOVE FAILED to Junk]"
+    monkeypatch.setattr(spam_filter, "execute_spam_action", _failing_action)
+
+    spam_filter.run_filter(force=True)          # tick 1: classify, move FAILS
+    assert env["classify_calls"] == 1
+    assert len(attempts) == 1
+    assert msg["message_id"] not in _processed_ids(env), (
+        "a failed move must NOT be recorded processed")
+    assert msg["message_id"] not in _sidecar_ids(env), (
+        "a failed real-run move is not a dry-run verdict either")
+
+    spam_filter.run_filter(force=True)          # tick 2: must RETRY
+    assert env["classify_calls"] == 2, "stranded spam must be retried next tick"
+    assert len(attempts) == 2
+
+    # decisions.log must be honest — never claim a successful move.
+    assert _decision_records(tmp_path, "MOVED to Junk") == 0
+    assert _decision_records(tmp_path, "MOVE FAILED") >= 1
+
+
+def test_successful_move_is_recorded_processed(tmp_path, monkeypatch):
+    """Control for finding 1: when the move SUCCEEDS the message IS recorded
+    processed and is never re-billed — proving the guard is scoped to failures
+    and did not regress the happy path."""
+    msg = _spam_msg("<okmove-1@evil.example>")
+    env = _make_env(tmp_path, monkeypatch, dry_run=False)   # _action -> "MOVED"
+    _set_message(monkeypatch, msg)
+
+    spam_filter.run_filter(force=True)
+    assert env["classify_calls"] == 1
+    assert env["spam_actions"] == [b"1"]
+    assert msg["message_id"] in _processed_ids(env)
+
+    spam_filter.run_filter(force=True)          # tick 2: pure processed skip
+    assert env["classify_calls"] == 1, (
+        "a recorded successful move must never be re-classified")
+
+
+def test_failed_blacklist_move_not_recorded_and_retried(tmp_path, monkeypatch):
+    """Finding 1, blacklist arm: a pre-classifier BLACKLIST hit whose move FAILS
+    must NOT be recorded processed (and must not touch the sidecar) — it is
+    retried next tick. This arm short-circuits before the paid classifier."""
+    msg = _spam_msg("<blacklist-fail@evil.example>")
+    env = _make_env(tmp_path, monkeypatch, dry_run=False)
+    _set_message(monkeypatch, msg)
+    monkeypatch.setattr(spam_filter, "check_blacklist",
+                        lambda hdr, bl, account_name="": ("address",
+                                                          "spammer@evil.example"))
+
+    attempts = []
+
+    def _failing_action(conn, uid, account, logger):
+        attempts.append(uid)
+        return "[MOVE FAILED to Junk]"
+    monkeypatch.setattr(spam_filter, "execute_spam_action", _failing_action)
+
+    spam_filter.run_filter(force=True)          # tick 1: blacklist match, FAILS
+    assert env["classify_calls"] == 0, "blacklist short-circuits before classifier"
+    assert len(attempts) == 1
+    assert msg["message_id"] not in _processed_ids(env), (
+        "a failed blacklist move must NOT be recorded processed")
+    assert msg["message_id"] not in _sidecar_ids(env)
+
+    spam_filter.run_filter(force=True)          # tick 2: must RETRY
+    assert len(attempts) == 2, "stranded blacklisted spam must be retried"
+
+    assert _decision_records(tmp_path, "MOVED to Junk") == 0
+    assert _decision_records(tmp_path, "MOVE FAILED") >= 1
+
+
+def test_successful_blacklist_move_is_recorded(tmp_path, monkeypatch):
+    """Control for the blacklist arm: a SUCCESSFUL blacklist move IS recorded
+    processed and is never re-attempted."""
+    msg = _spam_msg("<blacklist-ok@evil.example>")
+    env = _make_env(tmp_path, monkeypatch, dry_run=False)   # _action -> "MOVED"
+    _set_message(monkeypatch, msg)
+    monkeypatch.setattr(spam_filter, "check_blacklist",
+                        lambda hdr, bl, account_name="": ("address",
+                                                          "spammer@evil.example"))
+
+    spam_filter.run_filter(force=True)
+    assert env["classify_calls"] == 0
+    assert env["spam_actions"] == [b"1"]
+    assert msg["message_id"] in _processed_ids(env)
+
+    spam_filter.run_filter(force=True)          # tick 2: pure processed skip
+    assert env["spam_actions"] == [b"1"], (
+        "a recorded blacklist move must never be re-attempted")

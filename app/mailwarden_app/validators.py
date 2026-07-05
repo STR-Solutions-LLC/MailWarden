@@ -10,7 +10,30 @@ window stays responsive.
 import imaplib
 import re
 import smtplib
+import ssl
 from typing import Any
+
+
+def make_tls_context() -> ssl.SSLContext:
+    """Return an SSL context that VERIFIES the server certificate and hostname.
+
+    imaplib.IMAP4_SSL / smtplib.SMTP_SSL / SMTP.starttls default to an
+    UNVERIFIED context (PEP 476 excluded these stdlib modules), accepting any
+    certificate and exposing credentials to an active MITM.
+    ssl.create_default_context() enables CERT_REQUIRED + check_hostname. The
+    bundled python.org build ships no system CA store, so when the default
+    context loads zero CAs we fall back to certifi's bundle (shipped as an
+    anthropic dependency; the launcher also exports SSL_CERT_FILE=certifi.where()
+    for the whole GUI process). Mirrors utils.make_tls_context in the engine
+    tree."""
+    ctx = ssl.create_default_context()
+    try:
+        if ctx.cert_store_stats().get("x509_ca", 0) == 0:
+            import certifi
+            ctx.load_verify_locations(cafile=certifi.where())
+    except Exception:
+        pass
+    return ctx
 
 
 def validate_api_key(api_key: str) -> tuple[bool, str]:
@@ -57,7 +80,8 @@ def test_imap(host: str, port: int, username: str, password: str,
                 "or fill it in manually.",
                 "folders": [], "separator": "."}
     try:
-        conn = imaplib.IMAP4_SSL(host, port, timeout=timeout)
+        conn = imaplib.IMAP4_SSL(host, port, timeout=timeout,
+                                 ssl_context=make_tls_context())
     except TimeoutError:
         return {"ok": False,
                 "error": f"Timed out connecting to {host}:{port}. "
@@ -160,8 +184,9 @@ def safe_smtp_connect(host: str, port: int, username: str, password: str,
     happily transmits the username and password in the clear over an
     unencrypted socket, and we do not want to do that silently.
     """
+    tls_context = make_tls_context()
     if port == 465:
-        server = smtplib.SMTP_SSL(host, port, timeout=timeout)
+        server = smtplib.SMTP_SSL(host, port, timeout=timeout, context=tls_context)
         server.ehlo()
     else:
         if not use_starttls:
@@ -171,7 +196,7 @@ def safe_smtp_connect(host: str, port: int, username: str, password: str,
             )
         server = smtplib.SMTP(host, port, timeout=timeout)
         server.ehlo()
-        server.starttls()
+        server.starttls(context=tls_context)
         server.ehlo()
     server.login(username, password)
     return server

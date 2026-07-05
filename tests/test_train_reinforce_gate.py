@@ -236,7 +236,15 @@ def test_benign_reinforce_still_works(redirected):
     assert any(e["event"] == "reinforced" for e in events)
 
     assert len(redirected["sent"]) == 1
-    assert "guessed" in redirected["sent"][0]["body"].lower()
+    body = redirected["sent"][0]["body"]
+    assert "guessed" in body.lower()
+    # Finding 6: the FYI must point the owner at the action that WORKS
+    # (Dashboard -> Signal History -> Delete), not the dead "reply 'not a
+    # match'" instruction (that reply carries no SFID/MWR token, so it is
+    # unroutable).
+    assert "not a match" not in body.lower()
+    assert "Signal History" in body
+    assert "Delete" in body
 
 
 # ===========================================================================

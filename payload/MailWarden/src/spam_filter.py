@@ -35,6 +35,7 @@ from utils import (
     summarize_authentication, host_spam_verdict,
     random_token, select_trusted_auth_results,
     clear_dnsbl_cache, verify_dkim_locally,
+    make_tls_context,
 )
 from learn_signals import save_signals
 
@@ -3349,6 +3350,23 @@ def _mint_refinement_id(signals: dict) -> str:
             return rid
 
 
+def _fp_refinement_id(conv: dict, signals: dict) -> str:
+    """Deterministic R- id for an FP-narrowing approval (finding 3).
+
+    Both approval channels (Dashboard Approve + email YES) run the same conv
+    through this, so they mint the SAME id for one proposal — the apply-time
+    dedup (existing-id check in apply_ai_refinement / the config_io twin) then
+    turns a second apply into a no-op (already_active) instead of a duplicate
+    rule. The SFID is 'SFID-YYYYMMDD-<token>' and unique per proposal, so
+    'R-YYYYMMDD-<token>' (its tail re-prefixed) is unique too and keeps the same
+    format _mint_refinement_id produces. Falls back to a random unique id only
+    when no SFID is present (migrate_fp_narrowings passes conv={})."""
+    sfid = (conv.get("id") or "").strip()
+    if sfid.startswith("SFID-") and len(sfid) > len("SFID-"):
+        return "R-" + sfid[len("SFID-"):]
+    return _mint_refinement_id(signals)
+
+
 def _fp_narrowing_to_refinement(proposed_changes: dict, conv: dict,
                                 signals: dict, *, source: str) -> dict:
     """Build a LEGITIMATE ai_refinement record from an approved FP narrowing.
@@ -3357,11 +3375,18 @@ def _fp_narrowing_to_refinement(proposed_changes: dict, conv: dict,
     exclusion (fixes the mislabel); scope 'all' so it keeps the global reach the
     legacy soft_signals narrowing had (effect preserved); a real R- id so it is
     visible/deletable in the Dashboard and eligible for item-(b) attribution.
-    PURE (no IO). ``signals`` is used only to keep the minted id unique."""
+    PURE (no IO).
+
+    Finding 3: the id is DETERMINISTIC — derived from the proposal's SFID — so
+    the Dashboard-Approve and email-YES channels mint the SAME R- id for one
+    proposal. A second apply then dedupes to the existing rule (already_active)
+    instead of creating a duplicate. ``signals`` is used only for the fallback
+    random id when no SFID is present (the migrate_fp_narrowings path passes
+    conv={} and relies on _mint_refinement_id staying collision-free)."""
     now = datetime.now().isoformat()
     subject = (conv.get("original_subject") or "").strip()
     return {
-        "id": _mint_refinement_id(signals),
+        "id": _fp_refinement_id(conv, signals),
         "kind": "fp_narrowing",
         "verdict": "legitimate",
         "rule_class": None,
@@ -5638,7 +5663,8 @@ def classify_eml_offline(raw_email: bytes, signals: dict, *,
 
 def connect_imap(account: dict, logger: logging.Logger) -> imaplib.IMAP4_SSL:
     """Connect to IMAP server and authenticate."""
-    conn = imaplib.IMAP4_SSL(account["imap_host"], account["imap_port"], timeout=15.0)
+    conn = imaplib.IMAP4_SSL(account["imap_host"], account["imap_port"],
+                             timeout=15.0, ssl_context=make_tls_context())
     conn.login(account["username"], account["password"])
     return conn
 
@@ -8240,11 +8266,15 @@ Conversation ID: {sfid}
                                         refinement, logger,
                                         source="email", sfid=sfid)
                                     if ref_status == "retired":
-                                        # Finding #8 (defensive): a freshly minted
-                                        # FP-narrowing id cannot collide with a
-                                        # retired rule, but keep the ack honest
-                                        # and consistent with the spam-example
-                                        # path if it ever does.
+                                        # Finding #8 + finding 3: with the now
+                                        # DETERMINISTIC SFID-derived id this is a
+                                        # REAL reachable case — Dashboard Approve
+                                        # writes the rule, the owner retires it,
+                                        # then this email YES resolves to the same
+                                        # id and finds it retired. Keep the ack
+                                        # honest (never "now active") and offer
+                                        # RESTORE, consistent with the spam-example
+                                        # path.
                                         conv["conversation_history"].append({
                                             "role": "system_email",
                                             "timestamp": datetime.now().isoformat(),
@@ -8793,8 +8823,13 @@ USER'S FOLLOW-UP:
                             if "FAILED" in action or "DELETE FAILED" in action:
                                 total_errors += 1
                         log_decision(account_name, msg_data, bl_result, action)
-                        _record_processed(processed, account_key,
-                                          account_processed, msg_id)
+                        # Finding 1: only mark processed if the move actually
+                        # succeeded (dry-run action carries no "FAILED"). A
+                        # failed move is left unrecorded so it is retried next
+                        # tick rather than stranded in the inbox forever.
+                        if "FAILED" not in action:
+                            _record_processed(processed, account_key,
+                                              account_processed, msg_id)
                         total_evaluated += 1
                         continue
 
@@ -8833,8 +8868,14 @@ USER'S FOLLOW-UP:
                                 action = action + " (subject-keyword)"
                         log_decision(account_name, msg_data, kw_result, action)
                         record_pre_classifier_skip(token_usage, delta=token_delta)
-                        _record_processed(processed, account_key,
-                                          account_processed, msg_id)
+                        # Finding 1: only mark processed if the move actually
+                        # succeeded (or this is a dry run, where action carries
+                        # no "FAILED"). A failed move must NOT be recorded, so
+                        # the message is retried next tick instead of being
+                        # stranded in the inbox forever.
+                        if "FAILED" not in action:
+                            _record_processed(processed, account_key,
+                                              account_processed, msg_id)
                         total_evaluated += 1
                         continue
 
@@ -8901,8 +8942,13 @@ USER'S FOLLOW-UP:
                             action = action + " (pre-classifier)"
                         log_decision(account_name, msg_data, pre_decision, action)
                         record_pre_classifier_skip(token_usage, delta=token_delta)
-                        _record_processed(processed, account_key,
-                                          account_processed, msg_id)
+                        # Finding 1: only mark processed if the move actually
+                        # succeeded (dry-run action carries no "FAILED"). A
+                        # failed move is left unrecorded so it is retried next
+                        # tick rather than stranded in the inbox forever.
+                        if "FAILED" not in action:
+                            _record_processed(processed, account_key,
+                                              account_processed, msg_id)
                         total_evaluated += 1
                         continue
 
@@ -8961,6 +9007,11 @@ USER'S FOLLOW-UP:
                     decision = result.get("decision", "NOT_SPAM")
                     confidence = clamp_confidence(result.get("confidence", 0))
 
+                    # Finding 1: a failed spam move must NOT be recorded as
+                    # processed, so the message is retried next tick instead of
+                    # being stranded (unmoved) in the inbox forever.
+                    spam_move_failed = False
+
                     if decision == "SPAM" and confidence >= threshold:
                         total_spam += 1
                         if dry_run:
@@ -8974,6 +9025,7 @@ USER'S FOLLOW-UP:
                             if "FAILED" in action or "DELETE FAILED" in action:
                                 logger.error(f"  Spam action failed: {action}")
                                 total_errors += 1
+                                spam_move_failed = True
                             else:
                                 logger.info(
                                     f"  SPAM (confidence: {confidence:.2f}) "
@@ -9013,7 +9065,12 @@ USER'S FOLLOW-UP:
                     #     the message one fresh classification and a real
                     #     action.
                     verdict = (result or {}).get("decision", "").lower()
-                    cache_this = (not dry_run) or (verdict != "spam")
+                    # Finding 1: a failed spam move stays out of processed_ids
+                    # (AND not spam_move_failed) so it is retried next tick. It
+                    # also isn't a dry-run verdict, so it lands in neither
+                    # ledger — exactly the "retry" state.
+                    cache_this = (((not dry_run) or (verdict != "spam"))
+                                  and not spam_move_failed)
                     # Guard against a double-append: an auth-rejected command
                     # (or a whitelisted/pass-through path) already recorded this
                     # msg_id before falling through to classification. Keep the

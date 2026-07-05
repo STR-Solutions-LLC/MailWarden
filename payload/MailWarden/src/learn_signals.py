@@ -1381,8 +1381,8 @@ def handle_duplicate(classification: dict, example: dict,
         f"Refinement ID: {rid}\n"
         f"Examples matched so far: {target['match_count']}\n\n"
         f"This was a guess, not something you approved — please glance at "
-        f"it. If it's wrong, reply \"not a match\" or remove the rule in "
-        f"Dashboard -> Signal History.\n"
+        f"it. If it's wrong, open Dashboard -> Signal History and click "
+        f"Delete on this rule's card to remove it.\n"
     )
     _send(config, to_addr, subject, body, logger, smtp_conn)
     return True

@@ -565,6 +565,7 @@ class Dashboard(tk.Tk):
                         account["imap_host"],
                         int(account.get("imap_port", 993)),
                         timeout=10,
+                        ssl_context=validators.make_tls_context(),
                     )
                     try:
                         conn.login(account["username"], account["password"])
@@ -674,7 +675,8 @@ class Dashboard(tk.Tk):
             try:
                 conn = imaplib.IMAP4_SSL(account["imap_host"],
                                           int(account.get("imap_port", 993)),
-                                          timeout=10)
+                                          timeout=10,
+                                          ssl_context=validators.make_tls_context())
                 try:
                     conn.login(account["username"], account["password"])
                     # Use the wildcard helper so we find the folder whether
@@ -760,7 +762,8 @@ class Dashboard(tk.Tk):
             try:
                 conn = imaplib.IMAP4_SSL(a["imap_host"],
                                           int(a.get("imap_port", 993)),
-                                          timeout=10)
+                                          timeout=10,
+                                          ssl_context=validators.make_tls_context())
                 try:
                     conn.login(a["username"], a["password"])
                     # Quote the mailbox name. Python's imaplib does NOT

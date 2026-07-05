@@ -1087,7 +1087,8 @@ class AccountFormDialog(tk.Toplevel):
             ok = False
             msg = ""
             try:
-                conn = imaplib.IMAP4_SSL(host, port, timeout=10)
+                conn = imaplib.IMAP4_SSL(host, port, timeout=10,
+                                         ssl_context=validators.make_tls_context())
                 try:
                     conn.login(user, pw)
                     ok, msg = _ensure_train_folder(conn)
