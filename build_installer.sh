@@ -93,9 +93,21 @@ done
 # ----------------------------------------------------------------------------
 log "Preparing build venv..."
 rm -rf "$APP_DIR/build" "$APP_DIR/dist" "$BUILD_VENV"
-# Use a Python that ships with tkinter. /usr/bin/python3 is the stable default
-# on macOS; Homebrew Python on Apple Silicon often omits _tkinter.
-BUILD_PY="${BUILD_PY:-/usr/bin/python3}"
+# Use the tested python.org universal2 Python 3.12 as the build runtime — it
+# ships tkinter and matches the notarized bundle layout. BUILD_PY may be set
+# explicitly to override (must be a Python that includes tkinter).
+# The build must use the tested python.org universal2 Python 3.12 runtime.
+# A bare fallback to /usr/bin/python3 (Xcode 3.9) silently shipped the wrong
+# runtime and broke notarization on 2026-07-05, so refuse it: require 3.12
+# unless BUILD_PY is set explicitly (an intentional override).
+PYORG_312="/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12"
+if [ -z "${BUILD_PY:-}" ]; then
+    if [ -x "$PYORG_312" ]; then
+        BUILD_PY="$PYORG_312"
+    else
+        die "Tested build runtime not found: python.org universal2 Python 3.12 at $PYORG_312. Install it from python.org, or export BUILD_PY explicitly to override. Refusing to silently fall back to Xcode's system Python (that mismatch broke notarization on 2026-07-05)."
+    fi
+fi
 if ! "$BUILD_PY" -c "import tkinter" 2>/dev/null; then
     die "Build Python lacks tkinter. Set BUILD_PY=/path/to/python3 and retry."
 fi
@@ -159,8 +171,9 @@ fi
 # site_packages=True.
 # ----------------------------------------------------------------------------
 log "Copying missing packages into the bundle..."
-BUNDLE_SITE="$BUILT_APP/Contents/Resources/lib/python3.12"
-VENV_SITE="$BUILD_VENV/lib/python3.12/site-packages"
+PYVER="$("$BUILD_VENV/bin/python3" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+BUNDLE_SITE="$BUILT_APP/Contents/Resources/lib/python$PYVER"
+VENV_SITE="$BUILD_VENV/lib/python$PYVER/site-packages"
 for item in typing_extensions.py PyObjCTools docstring_parser; do
     src="$VENV_SITE/$item"
     if [ -e "$src" ]; then
@@ -285,46 +298,18 @@ if /usr/bin/security find-identity -v -p codesigning \
     # to be signed with --options runtime AND --timestamp. --deep alone does
     # not add timestamps to nested signatures, so we walk the bundle and sign
     # each binary explicitly (innermost first), then sign the outer .app.
-    log "  Signing inner Mach-O binaries (.so/.dylib) with hardened runtime + timestamp..."
-    find "$BUILT_APP" -type f \( -name "*.so" -o -name "*.dylib" \) -print0 \
-        | while IFS= read -r -d '' bin; do
-            /usr/bin/codesign --force \
-                --options runtime \
-                --timestamp \
-                --sign "$DEVID_CERT" \
-                "$bin" >/dev/null 2>&1 || log "    WARNING: failed to sign $bin"
-          done
-    # Sign the embedded Python binary explicitly
-    if [ -f "$BUILT_APP/Contents/MacOS/python" ]; then
-        /usr/bin/codesign --force \
-            --options runtime \
-            --timestamp \
-            --sign "$DEVID_CERT" \
-            "$BUILT_APP/Contents/MacOS/python" 2>&1 | grep -v "replacing existing signature" || true
-    fi
-    # Sign the Python framework's main dylib. This binary has no extension
-    # (just named "Python") and no executable bit set, so the .so/.dylib
-    # find loop above misses it entirely. Apple's notary REQUIRES every
-    # Mach-O inside the bundle to carry Developer ID + timestamp; leaving
-    # this one ad-hoc-signed (py2app's default) causes notary to reject
-    # the entire .pkg with "binary is not signed with a valid Developer ID
-    # certificate" — see notary log for fa0aff53-64de-4336-a5ce-b7fea6047a19.
-    FRAMEWORK_PY="$BUILT_APP/Contents/Frameworks/Python.framework/Versions/3.12/Python"
-    if [ -f "$FRAMEWORK_PY" ]; then
-        /usr/bin/codesign --force \
-            --options runtime \
-            --timestamp \
-            --sign "$DEVID_CERT" \
-            "$FRAMEWORK_PY" 2>&1 | grep -v "replacing existing signature" || true
-    fi
-    # Sign the main wrapper executable
-    if [ -f "$BUILT_APP/Contents/MacOS/MailWarden" ]; then
-        /usr/bin/codesign --force \
-            --options runtime \
-            --timestamp \
-            --sign "$DEVID_CERT" \
-            "$BUILT_APP/Contents/MacOS/MailWarden" 2>&1 | grep -v "replacing existing signature" || true
-    fi
+    log "  Signing every nested Mach-O (inside-out) with Developer ID + hardened runtime + timestamp..."
+    find "$BUILT_APP" -type f -print0 \
+        | xargs -0 file \
+        | grep -F 'Mach-O' \
+        | grep -vF '(for architecture' \
+        | cut -d: -f1 \
+        | awk -F/ '{print NF"\t"$0}' | sort -rn | cut -f2- \
+        | while IFS= read -r bin; do
+            /usr/bin/codesign --force --options runtime --timestamp \
+                --sign "$DEVID_CERT" "$bin" >/dev/null 2>&1 \
+                || die "Failed to Developer-ID-sign nested Mach-O: $bin"
+        done
     # Finally, sign the .app bundle itself with entitlements
     # Second strip IMMEDIATELY before the outer seal: this repo lives in an
     # iCloud-synced folder (~/Documents), and FileProvider re-stamps
@@ -352,6 +337,16 @@ if /usr/bin/security find-identity -v -p codesigning \
     if ! /usr/bin/codesign --verify --deep --strict "$BUILT_APP"; then
         die "codesign verification FAILED — notarization would reject this bundle. Do not ship."
     fi
+    # --verify --deep --strict does NOT reject ad-hoc nested signatures (it only
+    # checks seals are intact) — that's how the 3.9 framework slipped through to
+    # the notary. Assert no nested Mach-O remains ad-hoc before we ship.
+    log "  Asserting no nested binary is still ad-hoc-signed..."
+    find "$BUILT_APP" -type f -print0 | xargs -0 file | grep -F 'Mach-O' | grep -vF '(for architecture' | cut -d: -f1 | sort -u \
+        | while IFS= read -r bin; do
+            if /usr/bin/codesign -dvv "$bin" 2>&1 | grep -q 'flags=0x2(adhoc)'; then
+                die "Nested binary still ad-hoc after signing (would fail notarization): $bin"
+            fi
+        done
     log "  Developer ID codesign complete"
 else
     log "Developer ID cert NOT found — falling back to ad-hoc sign."
