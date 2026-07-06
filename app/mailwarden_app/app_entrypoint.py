@@ -11,6 +11,8 @@ This module also discovers the bundled defaults directory inside the .app,
 so other modules can copy skip_names.txt, signals.json, EULAs, etc. without
 hardcoding macOS bundle paths.
 """
+from __future__ import annotations
+
 import os
 import sys
 from pathlib import Path
@@ -50,11 +52,11 @@ def _cli_status() -> int:
     print(f"  dry_run:            {filt.get('dry_run', True)}")
     print(f"  max_emails_per_run: {filt.get('max_emails_per_run', 100)}")
     print(f"  model:              {cfg.get('anthropic', {}).get('model', '(unset)')}")
-    print(f"  threshold:          {cfg.get('anthropic', {}).get('confidence_threshold', 0.85)}")
+    print(f"  threshold:          {cfg.get('filter', {}).get('confidence_threshold', 0.85)}")
     print(f"  accounts ({len(accounts)}):")
     for a in accounts:
         print(f"    - name={a.get('name','?')} user={a.get('username','?')} "
-              f"junk={a.get('junk_folder','?')} enabled={a.get('enabled', False)}")
+              f"junk={a.get('junk_folder','?')} enabled={a.get('enabled', True)}")
     print(f"  config at: {paths.CONFIG_PATH}")
     return 0
 
@@ -63,9 +65,11 @@ def _cli_set_dry_run(value: str) -> int:
     """Toggle dry_run from the command line. Value is 'true'/'false'/'on'/'off'."""
     from . import config_io
     truthy = value.strip().lower() in ("true", "1", "on", "yes", "y")
-    cfg = config_io.load_config()
-    cfg.setdefault("filter", {})["dry_run"] = truthy
-    config_io.save_config(cfg)
+    # C7: fresh read + write under the lock so a peer's concurrent config change
+    # isn't reverted; we touch ONLY filter.dry_run.
+    def _set(cfg):
+        cfg.setdefault("filter", {})["dry_run"] = truthy
+    config_io.update_config(_set)
     print(f"dry_run is now {truthy}")
     return 0
 
@@ -124,6 +128,10 @@ def _run_diagnose() -> int:
         "certifi", "distro", "idna", "jiter", "sniffio",
         "typing_extensions", "docstring_parser",
         "et_xmlfile", "annotated_types",
+        # local DKIM verification (audit a-2) + DNS backend. If either is
+        # missing from the bundle, local DKIM verification / DNSBL silently
+        # no-op; this gate hard-fails the build instead.
+        "dkim", "dns.resolver",
         # stdlib the filter scripts import — py2app modulegraph
         # can drop these if the main app code does not use them.
         "email", "email.mime", "email.mime.text", "email.mime.multipart",
@@ -184,41 +192,32 @@ def _run_diagnose() -> int:
     return 0
 
 
-_FILTER_LOCK_MAX_AGE_SEC = 600  # 10 minutes
+_FILTER_LOCK_FD: int | None = None
 
 
 def _acquire_filter_lock() -> bool:
     """Return True if we obtained the filter lock, False if another process
-    is already inside the 10-minute window. Prevents launchd's 15-minute
-    tick and a Dashboard Run Now click from running the filter twice in
-    parallel (which otherwise doubles every log line and races on
-    decisions.log writes)."""
-    import time as _time
-    lock = paths.FILTER_LOCK
-    try:
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        if lock.exists():
-            age = _time.time() - lock.stat().st_mtime
-            if age < _FILTER_LOCK_MAX_AGE_SEC:
-                return False
-            # Stale lock — claim it.
-            try:
-                lock.unlink()
-            except OSError:
-                pass
-        lock.write_text(str(os.getpid()))
-    except OSError:
-        # If we can't write the lock file, proceed anyway rather than
-        # block the filter on a filesystem glitch.
-        return True
-    return True
+    already holds it. Prevents launchd's 15-minute tick and a Dashboard Run Now
+    click from running the filter twice in parallel (which otherwise doubles
+    every log line and races on decisions.log writes).
+
+    This is a real fcntl.flock held by THIS process for the whole run, not an
+    mtime check: a run longer than 10 minutes can no longer have a second run
+    started concurrently, a dead holder is detected immediately by the OS (no
+    staleness window, no liveness guessing), and we fail CLOSED — if the lock
+    can't be created we skip the run rather than run unguarded."""
+    from . import file_lock
+    global _FILTER_LOCK_FD
+    _FILTER_LOCK_FD = file_lock.try_acquire(paths.FILTER_LOCK)
+    return _FILTER_LOCK_FD is not None
 
 
 def _release_filter_lock() -> None:
-    try:
-        paths.FILTER_LOCK.unlink()
-    except (FileNotFoundError, OSError):
-        pass
+    from . import file_lock
+    global _FILTER_LOCK_FD
+    if _FILTER_LOCK_FD is not None:
+        file_lock.release(_FILTER_LOCK_FD)
+        _FILTER_LOCK_FD = None
 
 
 def _run_user_script(script_name: str) -> int:
@@ -279,9 +278,10 @@ def _run_user_script(script_name: str) -> int:
                                  if a not in our_flags and not a.startswith("--set-dry-run=")]
 
     # Filter + report share the same IMAP account list and decisions.log, so
-    # gate them behind a single lock. Scheduled runs and manual Run Now
-    # clicks that fire within 10 minutes of each other would otherwise
-    # both execute, doubling log lines and racing on processed_ids.
+    # gate them behind a single lock. A scheduled run and a manual Run Now
+    # click that overlap would otherwise both execute, doubling log lines and
+    # racing on processed_ids. The lock is a real flock held for the whole
+    # run, so overlap is impossible no matter how long the run takes.
     if script_name in ("spam_filter.py", "daily_report.py"):
         if not _acquire_filter_lock():
             sys.stderr.write(
@@ -380,6 +380,9 @@ def _run_classify_eml() -> int:
             if c and c.is_file():
                 with c.open(encoding="utf-8") as f:
                     signals = _json.load(f)
+                # fix (a-1): strip retired shipped-default signals in-memory
+                # (reuses the shared helper; this raw path bypasses load_signals).
+                signals = spam_filter.scrub_retired_signals(signals)
                 signals_src = str(c)
                 break
         except Exception as e:
@@ -395,7 +398,17 @@ def _run_classify_eml() -> int:
         cfg = {}
     anthro = cfg.get("anthropic", {}) if isinstance(cfg, dict) else {}
     api_key = os.environ.get("ANTHROPIC_API_KEY", "") or anthro.get("api_key", "") or ""
-    model = model_override or anthro.get("model") or "claude-haiku-4-5-20251001"
+    # Follow the configured classification mode (same as the live filter).
+    # An explicit --model override forces a single-model run on that model.
+    classify_mode = anthro.get("classify_mode", "cascade")
+    confirm_model = anthro.get("confirm_model", "claude-sonnet-4-6")
+    if model_override:
+        model = model_override
+        classify_mode = "single"
+    elif classify_mode == "cascade":
+        model = anthro.get("screen_model") or "claude-haiku-4-5-20251001"
+    else:
+        model = anthro.get("model") or "claude-haiku-4-5-20251001"
     threshold = 0.85
     if threshold_override is not None:
         try:
@@ -418,6 +431,7 @@ def _run_classify_eml() -> int:
     res = spam_filter.classify_eml_offline(
         raw, signals,
         api_key=api_key, model=model, max_tokens=500,
+        classify_mode=classify_mode, confirm_model=confirm_model,
         threshold=threshold, account_name=account,
         run_dnsbl=run_dnsbl, logger=log,
     )
@@ -454,6 +468,20 @@ def _run_classify_eml() -> int:
     if usage:
         print(f"  tokens:     in={usage['input_tokens']} out={usage['output_tokens']} "
               f"model={usage['model']}")
+    cascade = res.get("cascade")
+    if cascade:
+        if cascade.get("confirm_called"):
+            stage2 = ("rescued (delivered)" if cascade.get("rescued")
+                      else "confirmed junk")
+            print(f"  cascade:    {cascade.get('screen_model')} junked -> "
+                  f"{cascade.get('confirm_model')} {stage2}")
+        else:
+            print(f"  cascade:    screen ({cascade.get('screen_model')}) "
+                  "passed it — confirm stage not needed")
+        usage2 = res.get("usage_confirm")
+        if usage2:
+            print(f"  tokens(2):  in={usage2['input_tokens']} "
+                  f"out={usage2['output_tokens']} model={usage2['model']}")
     print("-" * 64)
     final = res.get("final_decision")
     label = {"JUNK": "WOULD JUNK", "PASS": "WOULD PASS",

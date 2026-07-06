@@ -428,6 +428,7 @@ The code was recently fixed (commit b76c9ac) to handle single-level `> ` quote-p
 - **What breaks:** If a user forward spam like this (the outer mail), `parse_forwarded_email` finds the INNER fake block and extracts `admin@yourbank.com` as the original sender — not the actual spam sender. The actual spam sender's address is in the outer `From:` header (extracted separately by `extract_email_data`), so blacklisting uses the correct outer address via `fwd_data` vs `msg_data` depending on command flow.
 - **Risk:** Depends on which address the blacklist commands use. If they use `original_from` from the parsed forward, the fake address gets blacklisted instead of the real spammer. If they use the outer envelope `From:`, this is safe.
 - **Recommendation:** Audit the blacklist command handlers to confirm they use `msg_data["from_email"]` (outer envelope) not just `original_from` when the `original_from` originates from a body-embedded fake block.
+- **RESOLVED 2026-06-12:** The command/approval path is now authentication-gated. A command is honored only when the From-line matches an owner identity AND `_command_auth_ok` passes (layered SPF/DKIM/DMARC alignment OR own-server authenticated submission), per audit finding C1. A forged email cannot reach the command handlers in the first place, which closes the spoofing avenue this note was concerned about. See AUDIT-2026-06-11-bug-report.md → PART 5 → Session 2. (The original recommendation to also cross-check `original_from` against the outer envelope is tracked separately under audit C2 / Session 3.)
 - **Test fixture:** F-22
 
 ---
@@ -769,6 +770,7 @@ Your account needs verification.
 ```
 Expected behavior: Parser extracts `admin@yourbank.com` as `original_from`. Verify downstream blacklist uses outer envelope address, not this extracted address.
 Currently: Parser extracts the fake block sender. Security audit needed on command handlers.
+RESOLVED 2026-06-12: The command/approval path is now authentication-gated (layered SPF/DKIM/DMARC alignment OR own-server authenticated submission) per audit C1, so a forged email never reaches the command handlers. See AUDIT-2026-06-11-bug-report.md → PART 5 → Session 2.
 
 ---
 
@@ -1034,3 +1036,5 @@ This is optional — the email address (which is all that matters for blacklisti
 ---
 
 *Document compiled 2026-04-19. All findings verified against live code and reference EMLs. Items marked CRITICAL and HIGH should be resolved before the next release.*
+
+*Update 2026-06-12: The command/approval path is now authentication-gated (layered SPF/DKIM/DMARC alignment OR own-server authenticated submission) per audit finding C1, so the command-handler security concerns raised throughout this document — a forged or spoofed sender reaching the blacklist/whitelist/approval handlers — no longer apply: a command is honored only when its sender is authenticated. See AUDIT-2026-06-11-bug-report.md → PART 5 → Session 2. The forward-parsing correctness items (fake-block / inline-attribution extraction, command anchoring, date-fragment pollution) are tracked under audit C2 + M5/M6/M7 / Session 3 and are not affected by this note.*

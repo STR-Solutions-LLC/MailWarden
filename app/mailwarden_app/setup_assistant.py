@@ -21,6 +21,7 @@ from typing import Any, Callable
 
 from . import app_entrypoint
 from . import config_io
+from . import file_lock
 from . import help_content
 from . import paths
 from . import smappservice_install
@@ -37,6 +38,80 @@ STEPS = [
 ]
 
 
+def _validate_port(raw: str, default: int) -> tuple[int | None, str | None]:
+    """Validate a port string. Returns (port_int, None) or (None, error_message)."""
+    val = raw.strip() or str(default)
+    try:
+        port = int(val)
+    except ValueError:
+        return None, f"✗ Port must be a number (got {val!r})."
+    if port < 1 or port > 65535:
+        return None, f"✗ Port {port} is out of range. Use 1–65535."
+    return port, None
+
+
+def _merge_finalized_config(
+    cfg: dict,
+    accounts: list[dict],
+    is_fresh_install: bool,
+    api_key: str,
+    recipient: str,
+    time_str: str,
+    menu_bar_enabled: bool,
+) -> dict:
+    """Pure seed+merge step for Setup finalize (audit B2).
+
+    Takes ``cfg`` (already seeded from config_io.load_config — so existing
+    eula.sent_to_accounts, filter.dry_run, intervals, model, accounts are
+    present) plus the wizard's plain inputs, and returns ``cfg`` with the
+    wizard's choices merged IN PLACE without dropping the user's existing
+    settings. Mutates ``cfg`` and ``accounts`` (strips the _smtp_seed sentinel)
+    and returns ``cfg`` for convenience.
+
+    Extracted from SetupAssistant._finalize_config so the B2 preservation
+    behaviour is unit-testable without a Tk display. The Tk wizard calls this
+    with the live StringVar/BooleanVar values; behaviour is identical to the
+    previous inline body.
+    """
+    cfg["anthropic"]["api_key"] = api_key
+
+    # Pull the SMTP seed off the first account into the global smtp block,
+    # then strip the sentinel key from every account before saving.
+    if accounts:
+        seed = accounts[0].get("_smtp_seed")
+        if seed:
+            cfg["smtp"] = dict(seed)
+    for a in accounts:
+        a.pop("_smtp_seed", None)
+    # B2: merge wizard accounts into existing — don't drop accounts not re-added.
+    # Key by username (email address); wizard version wins on duplicates.
+    existing_by_email = {a["username"]: a for a in cfg.get("accounts", [])}
+    for a in accounts:
+        existing_by_email[a["username"]] = a
+    cfg["accounts"] = list(existing_by_email.values())
+
+    cfg["summary"]["recipient"] = recipient
+
+    time_str = time_str or "08:00"
+    hour, _, minute = time_str.partition(":")
+    try:
+        cfg["summary"]["hour"] = int(hour)
+        cfg["summary"]["minute"] = int(minute) if minute else 0
+    except ValueError:
+        cfg["summary"]["hour"] = 8
+        cfg["summary"]["minute"] = 0
+
+    cfg["ui"]["menu_bar_enabled"] = bool(menu_bar_enabled)
+    # §0.11: dry run ON for new installs only; existing installs keep their setting.
+    if is_fresh_install:
+        cfg["filter"]["dry_run"] = True
+
+    if accounts and not cfg.get("smtp", {}).get("from_address"):
+        cfg.setdefault("smtp", {})["from_address"] = accounts[0].get("username", "")
+
+    return cfg
+
+
 class SetupAssistant(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -46,7 +121,8 @@ class SetupAssistant(tk.Tk):
         theme.apply_theme(self)
 
         self.current_step = 0
-        self.config_draft: dict = copy.deepcopy(config_io.DEFAULT_CONFIG)
+        self._is_fresh_install: bool = not paths.CONFIG_PATH.exists()
+        self.config_draft: dict = config_io.load_config()
         self.api_key_validated = False
         self.install_succeeded = False
 
@@ -407,38 +483,21 @@ class SetupAssistant(tk.Tk):
         self.destroy()  # run() returns to app_entrypoint, which launches Dashboard
 
     def _finalize_config(self):
-        cfg = self.config_draft
-        cfg["anthropic"]["api_key"] = self._api_key_var.get().strip()
+        cfg = _merge_finalized_config(
+            self.config_draft,
+            self._accounts,
+            self._is_fresh_install,
+            self._api_key_var.get().strip(),
+            self._summary_recipient_var.get().strip(),
+            self._summary_time_var.get().strip(),
+            self._menu_bar_var.get(),
+        )
 
-        # Pull the SMTP seed off the first account into the global smtp block,
-        # then strip the sentinel key from every account before saving.
-        if self._accounts:
-            seed = self._accounts[0].get("_smtp_seed")
-            if seed:
-                cfg["smtp"] = dict(seed)
-        for a in self._accounts:
-            a.pop("_smtp_seed", None)
-        cfg["accounts"] = self._accounts
-
-        recipient = self._summary_recipient_var.get().strip()
-        cfg["summary"]["recipient"] = recipient
-
-        time_str = self._summary_time_var.get().strip() or "08:00"
-        hour, _, minute = time_str.partition(":")
-        try:
-            cfg["summary"]["hour"] = int(hour)
-            cfg["summary"]["minute"] = int(minute) if minute else 0
-        except ValueError:
-            cfg["summary"]["hour"] = 8
-            cfg["summary"]["minute"] = 0
-
-        cfg["ui"]["menu_bar_enabled"] = bool(self._menu_bar_var.get())
-        cfg["filter"]["dry_run"] = True  # §0.11: dry run ON by default
-
-        if self._accounts and not cfg.get("smtp", {}).get("from_address"):
-            cfg.setdefault("smtp", {})["from_address"] = self._accounts[0].get("username", "")
-
-        config_io.save_config(cfg)
+        # C7: LOCK ONLY (no load-and-merge — the wizard's wholesale overwrite is
+        # audit B2, owned by another session). The lock serializes this blind
+        # save against other writers' read-modify-write windows on config.json.
+        with file_lock.locked(paths.CONFIG_PATH):
+            config_io.save_config(cfg)
 
         state = config_io.load_installer_state()
         if not state.get("installed_at"):
@@ -458,6 +517,7 @@ class SetupAssistant(tk.Tk):
             ("processed_ids.json", paths.PROCESSED_IDS_PATH),
             ("token_usage.json", paths.TOKEN_USAGE_PATH),
             ("pending_signals.json", paths.PENDING_SIGNALS_PATH),
+            ("approved_senders.json", paths.MEMORY_DIR / "approved_senders.json"),
         ]
         paths.MEMORY_DIR.mkdir(parents=True, exist_ok=True)
         for src_name, dst_path in memory_defaults:
@@ -505,7 +565,10 @@ class SetupAssistant(tk.Tk):
             # User declined — mark as unapproved so Dashboard shows a banner.
             cfg = self.config_draft
             cfg.setdefault("ui", {})["smappservice_approved"] = False
-            config_io.save_config(cfg)
+            # C7: LOCK ONLY (wizard wholesale overwrite is audit B2; not merged
+            # here). Serializes against other writers' RMW windows.
+            with file_lock.locked(paths.CONFIG_PATH):
+                config_io.save_config(cfg)
             return
 
         smappservice_install.register_all(install_menubar=install_menubar)
@@ -543,11 +606,15 @@ class SetupAssistant(tk.Tk):
             # Still not approved — save flag for Dashboard warning banner.
             cfg = self.config_draft
             cfg.setdefault("ui", {})["smappservice_approved"] = False
-            config_io.save_config(cfg)
+            # C7: LOCK ONLY (audit B2 overwrite not merged here).
+            with file_lock.locked(paths.CONFIG_PATH):
+                config_io.save_config(cfg)
         else:
             cfg = self.config_draft
             cfg.setdefault("ui", {})["smappservice_approved"] = True
-            config_io.save_config(cfg)
+            # C7: LOCK ONLY (audit B2 overwrite not merged here).
+            with file_lock.locked(paths.CONFIG_PATH):
+                config_io.save_config(cfg)
 
     def _send_welcome_email(self):
         """Non-fatal — if sending fails, log it but don't block install."""
@@ -572,8 +639,15 @@ class SetupAssistant(tk.Tk):
             # Route through validators.safe_smtp_connect so the welcome email
             # follows the same port-465 / STARTTLS / refuse-plaintext rules as
             # every other SMTP send in the app.
+            _port, _port_err = _validate_port(str(smtp.get("port", "")), 587)
+            if _port_err:
+                (paths.LOGS_DIR / "setup.log").write_text(
+                    f"[{datetime.now().isoformat()}] welcome email skipped: {_port_err}\n",
+                    encoding="utf-8",
+                )
+                return
             server = validators.safe_smtp_connect(
-                smtp["host"], int(smtp["port"]),
+                smtp["host"], _port,
                 smtp["username"], smtp["password"],
                 use_starttls=smtp.get("use_starttls", True),
             )
@@ -857,18 +931,9 @@ class AccountFormDialog(tk.Toplevel):
 
     def _on_test_imap(self):
         host = self._imap_host.get().strip()
-        port_raw = self._imap_port.get().strip() or "993"
-        try:
-            port = int(port_raw)
-        except ValueError:
-            self._status.set(
-                f"✗ Port must be a number (got {port_raw!r}). "
-                f"Common values: 993 for IMAPS, 143 for IMAP.")
-            return
-        if port < 1 or port > 65535:
-            self._status.set(
-                f"✗ Port {port} is out of range. Use 1–65535 "
-                f"(typically 993 for IMAPS).")
+        port, port_err = _validate_port(self._imap_port.get(), 993)
+        if port_err:
+            self._status.set(port_err)
             return
         user = self._imap_user.get().strip()
         pw = self._imap_pass.get()
@@ -911,13 +976,18 @@ class AccountFormDialog(tk.Toplevel):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_test_smtp(self):
+        port, port_err = _validate_port(self._smtp_port.get(), 587)
+        if port_err:
+            self._status.set(port_err)
+            return
+
         self._status.set("Testing SMTP…")
         self.update_idletasks()
 
         def worker():
             ok, msg = validators.test_smtp(
                 self._smtp_host.get().strip() or self._imap_host.get().strip(),
-                int(self._smtp_port.get() or "587"),
+                port,
                 self._smtp_user.get().strip() or self._imap_user.get().strip(),
                 self._smtp_pass.get() or self._imap_pass.get(),
             )
@@ -930,6 +1000,11 @@ class AccountFormDialog(tk.Toplevel):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_send_test_email(self):
+        port, port_err = _validate_port(self._smtp_port.get(), 587)
+        if port_err:
+            self._status.set(port_err)
+            return
+
         self._status.set("Sending test email…")
         self.update_idletasks()
 
@@ -937,7 +1012,7 @@ class AccountFormDialog(tk.Toplevel):
             user = self._imap_user.get().strip()
             ok, msg = validators.send_test_email(
                 self._smtp_host.get().strip() or self._imap_host.get().strip(),
-                int(self._smtp_port.get() or "587"),
+                port,
                 self._smtp_user.get().strip() or user,
                 self._smtp_pass.get() or self._imap_pass.get(),
                 from_addr=user,
@@ -964,10 +1039,19 @@ class AccountFormDialog(tk.Toplevel):
                                     "Run Test IMAP Connection and pick your junk folder.")
             return
 
+        imap_port, imap_err = _validate_port(self._imap_port.get(), 993)
+        if imap_err:
+            self._status.set(imap_err)
+            return
+        smtp_port, smtp_err = _validate_port(self._smtp_port.get(), 587)
+        if smtp_err:
+            self._status.set(smtp_err)
+            return
+
         account = config_io.new_account_entry(
             name=self._name.get().strip(),
             imap_host=self._imap_host.get().strip(),
-            imap_port=int(self._imap_port.get() or "993"),
+            imap_port=imap_port,
             imap_username=self._imap_user.get().strip(),
             imap_password=self._imap_pass.get(),
             junk_folder=self._junk_folder.get().strip(),
@@ -978,7 +1062,7 @@ class AccountFormDialog(tk.Toplevel):
         # Seed it under a sentinel key so SetupAssistant can pull it out on save.
         account["_smtp_seed"] = {
             "host": self._smtp_host.get().strip() or self._imap_host.get().strip(),
-            "port": int(self._smtp_port.get() or "587"),
+            "port": smtp_port,
             "username": self._smtp_user.get().strip() or self._imap_user.get().strip(),
             "password": self._smtp_pass.get() or self._imap_pass.get(),
             "from_address": self._imap_user.get().strip(),
@@ -992,7 +1076,7 @@ class AccountFormDialog(tk.Toplevel):
         # blocked. On completion the status label is updated; the dialog closes
         # regardless of whether the create succeeded.
         host = self._imap_host.get().strip()
-        port = int(self._imap_port.get() or "993")
+        port = imap_port
         user = self._imap_user.get().strip()
         pw = self._imap_pass.get()
         self._status.set("Saving — creating Train MailWarden folder…")
@@ -1003,7 +1087,8 @@ class AccountFormDialog(tk.Toplevel):
             ok = False
             msg = ""
             try:
-                conn = imaplib.IMAP4_SSL(host, port, timeout=10)
+                conn = imaplib.IMAP4_SSL(host, port, timeout=10,
+                                         ssl_context=validators.make_tls_context())
                 try:
                     conn.login(user, pw)
                     ok, msg = _ensure_train_folder(conn)

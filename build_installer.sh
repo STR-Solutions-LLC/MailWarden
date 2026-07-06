@@ -5,7 +5,7 @@
 #
 # Pipeline:
 #   1. Run the §0 pre-build audit. Halt on any finding.
-#   2. Regenerate scrubbed signals.json from ~/MailWarden/memory/signals.json.
+#   2. (removed 2026-07-03 — resources/defaults/signals.json ships as tracked)
 #   3. Regenerate eula.html from EULA.md.
 #   4. Build MailWarden.app via py2app in a clean venv.
 #   5. Re-run the audit against the built .app.
@@ -22,7 +22,7 @@ DIST_DIR="$INSTALLER_ROOT/dist"
 COMPONENT_PKG="$INSTALLER_ROOT/build/MailWarden-component.pkg"
 FINAL_PKG="$DIST_DIR/MailWarden.pkg"
 APP_BUNDLE_ID="com.strsolutions.mailwarden"
-APP_VERSION="1.6.0-beta.16.1"
+APP_VERSION="1.7.0"
 
 mkdir -p "$DIST_DIR" "$(dirname "$COMPONENT_PKG")"
 
@@ -30,21 +30,44 @@ log() { printf "\033[1;34m[build]\033[0m %s\n" "$*"; }
 die() { printf "\033[1;31m[build]\033[0m %s\n" "$*" >&2; exit 1; }
 
 # ----------------------------------------------------------------------------
-# Step 0 — pre-build audit. Hard gate.
+# Step 0 — REMOVED 2026-07-03. It refreshed resources/defaults/signals.json
+# from the build machine's live ~/MailWarden install. The tracked file is now
+# the curated source of truth (the a-1 signal cleanup was made there and
+# measured against the eval corpus); the live-install sync silently
+# resurrected the very signals a-1 removed. Ship exactly what the repo
+# reviews. To import learned signals from a runtime again, do it as a
+# reviewed commit, not a build step. (scripts/scrub_signals.py kept for
+# manual use.)
 # ----------------------------------------------------------------------------
-log "Running §0 pre-build audit..."
-if ! "$INSTALLER_ROOT/scripts/audit_payload.sh"; then
-    die "Audit failed. Fix findings before continuing."
+
+# ----------------------------------------------------------------------------
+# Step 0.5 — clean dev-runtime junk from the source payload tree before audit.
+# The audit scans payload/MailWarden/ for .lock sidecars, .claude-mpm dirs,
+# __pycache__/*.pyc, non-empty logs/, and false_positives/. These regenerate on
+# every local engine/test run; remove them so the audit validates a clean source.
+# Scope: ONLY these artifact categories — never src/*.py, blacklist/, EULA.md,
+# LICENSE, requirements.txt, or ~/MailWarden.
+# ----------------------------------------------------------------------------
+log "Cleaning dev-runtime artifacts from source payload tree..."
+PAYLOAD_SRC="$INSTALLER_ROOT/payload/MailWarden"
+find "$PAYLOAD_SRC" -name "*.lock" -delete 2>/dev/null || true
+find "$PAYLOAD_SRC" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+find "$PAYLOAD_SRC" -name ".claude-mpm" -type d -exec rm -rf {} + 2>/dev/null || true
+if [ -d "$PAYLOAD_SRC/logs" ]; then
+    for f in "$PAYLOAD_SRC/logs"/*; do
+        [ -f "$f" ] && : > "$f"
+    done
+fi
+if [ -d "$PAYLOAD_SRC/false_positives" ]; then
+    find "$PAYLOAD_SRC/false_positives" -maxdepth 1 -type f -delete
 fi
 
 # ----------------------------------------------------------------------------
-# Step 1 — refresh scrubbed signals.json from live install.
+# Step 1 — pre-build audit. Hard gate. Audits the tracked signals.json as-is.
 # ----------------------------------------------------------------------------
-log "Refreshing scrubbed signals.json..."
-if [ -f "$HOME/MailWarden/memory/signals.json" ]; then
-    python3 "$INSTALLER_ROOT/scripts/scrub_signals.py"
-else
-    log "  (no live signals.json found — keeping whatever is already in resources/defaults/)"
+log "Running §1 pre-build audit..."
+if ! "$INSTALLER_ROOT/scripts/audit_payload.sh"; then
+    die "Audit failed. Fix findings before continuing."
 fi
 
 # ----------------------------------------------------------------------------
@@ -70,25 +93,38 @@ done
 # ----------------------------------------------------------------------------
 log "Preparing build venv..."
 rm -rf "$APP_DIR/build" "$APP_DIR/dist" "$BUILD_VENV"
-# Use a Python that ships with tkinter. /usr/bin/python3 is the stable default
-# on macOS; Homebrew Python on Apple Silicon often omits _tkinter.
-BUILD_PY="${BUILD_PY:-/usr/bin/python3}"
+# Use the tested python.org universal2 Python 3.12 as the build runtime — it
+# ships tkinter and matches the notarized bundle layout. BUILD_PY may be set
+# explicitly to override (must be a Python that includes tkinter).
+# The build must use the tested python.org universal2 Python 3.12 runtime.
+# A bare fallback to /usr/bin/python3 (Xcode 3.9) silently shipped the wrong
+# runtime and broke notarization on 2026-07-05, so refuse it: require 3.12
+# unless BUILD_PY is set explicitly (an intentional override).
+PYORG_312="/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12"
+if [ -z "${BUILD_PY:-}" ]; then
+    if [ -x "$PYORG_312" ]; then
+        BUILD_PY="$PYORG_312"
+    else
+        die "Tested build runtime not found: python.org universal2 Python 3.12 at $PYORG_312. Install it from python.org, or export BUILD_PY explicitly to override. Refusing to silently fall back to Xcode's system Python (that mismatch broke notarization on 2026-07-05)."
+    fi
+fi
 if ! "$BUILD_PY" -c "import tkinter" 2>/dev/null; then
     die "Build Python lacks tkinter. Set BUILD_PY=/path/to/python3 and retry."
 fi
-# Require a universal2 Python so the resulting bundle actually loads on both
-# Intel and Apple Silicon. A single-arch build_py still passes the dual-arch
-# runtime gate IF every native wheel happened to fuse correctly, but we want
-# to fail fast and obvious if the interpreter itself is wrong.
+# Require an ARM64-capable Python so py2app can extract an arm64 slice into
+# the bundle (the shipped app is arm64-only — see OPTIONS["arch"] in
+# setup_app.py). We don't require an x86_64 slice too — Intel is no longer a
+# build target — but we still fail fast and obvious if the interpreter has no
+# arm64 slice at all, rather than let py2app produce a broken bundle.
 BUILD_PY_REAL="$(readlink -f "$BUILD_PY" 2>/dev/null || echo "$BUILD_PY")"
 BUILD_PY_ARCHS="$(/usr/bin/file "$BUILD_PY_REAL" | grep -oE 'arm64|x86_64' \
                     | sort -u | tr '\n' ' ')"
 case "$BUILD_PY_ARCHS" in
-    "arm64 x86_64 "|"x86_64 arm64 ")
-        log "BUILD_PY is universal2 ($BUILD_PY_REAL)"
+    *arm64*)
+        log "BUILD_PY has an arm64 slice ($BUILD_PY_REAL: $BUILD_PY_ARCHS)"
         ;;
     *)
-        die "BUILD_PY=$BUILD_PY is not universal2 (archs: '$BUILD_PY_ARCHS'). "\
+        die "BUILD_PY=$BUILD_PY has no arm64 slice (archs: '$BUILD_PY_ARCHS'). "\
 "Use python.org's universal2 Python 3.12 at "\
 "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12"
         ;;
@@ -96,14 +132,25 @@ esac
 "$BUILD_PY" -m venv "$BUILD_VENV"
 # shellcheck disable=SC1091
 source "$BUILD_VENV/bin/activate"
-pip install --quiet --upgrade pip setuptools wheel
-pip install --quiet py2app rumps anthropic openpyxl
+# setuptools pinned <81: py2app's build imports pkg_resources, which
+# setuptools removed in 81+ (hit 2026-07-03 when unpinned upgrade pulled it).
+pip install --quiet --upgrade pip "setuptools<81" wheel
+# dnspython + dkimpy are runtime deps of the filter (local DKIM verification,
+# audit a-2). Both pure-Python (no native wheels → no universal2 fusion). They
+# are NOT transitive deps of anything above, so name them explicitly or the
+# bundle ships without them and local DKIM verification / DNSBL silently no-op.
+pip install --quiet py2app rumps anthropic openpyxl dnspython dkimpy
 # pyobjc-framework-ServiceManagement is REQUIRED at runtime by
 # smappservice_install.py (v1.6.0 SMAppService migration). It is NOT a
 # transitive dep of rumps or any other package above, so it must be named
-# explicitly. Pin to the same major as pyobjc-core (12.x ships with rumps)
-# so the framework wrapper matches the installed pyobjc-core ABI.
-pip install --quiet "pyobjc-framework-ServiceManagement>=12.0,<13"
+# explicitly. The framework wrapper must match the installed pyobjc-core
+# ABI, so derive the pin from whatever major rumps actually resolved —
+# a hardcoded major breaks when PyPI moves (2026-07-03: pyobjc 12.0 was
+# yanked and 12.1+ requires Python >=3.10, while this build's universal2
+# /usr/bin/python3 is 3.9 and resolves pyobjc-core 11.x).
+PYOBJC_CORE_MAJOR=$(pip show pyobjc-core | awk '/^Version:/{split($2,v,"."); print v[1]}')
+[ -n "$PYOBJC_CORE_MAJOR" ] || die "pyobjc-core not installed — rumps install failed?"
+pip install --quiet "pyobjc-framework-ServiceManagement>=${PYOBJC_CORE_MAJOR}.0,<$((PYOBJC_CORE_MAJOR+1))"
 
 log "Building MailWarden.app with py2app..."
 cd "$APP_DIR"
@@ -124,8 +171,9 @@ fi
 # site_packages=True.
 # ----------------------------------------------------------------------------
 log "Copying missing packages into the bundle..."
-BUNDLE_SITE="$BUILT_APP/Contents/Resources/lib/python3.12"
-VENV_SITE="$BUILD_VENV/lib/python3.12/site-packages"
+PYVER="$("$BUILD_VENV/bin/python3" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+BUNDLE_SITE="$BUILT_APP/Contents/Resources/lib/python$PYVER"
+VENV_SITE="$BUILD_VENV/lib/python$PYVER/site-packages"
 for item in typing_extensions.py PyObjCTools docstring_parser; do
     src="$VENV_SITE/$item"
     if [ -e "$src" ]; then
@@ -137,22 +185,10 @@ for item in typing_extensions.py PyObjCTools docstring_parser; do
 done
 
 # ----------------------------------------------------------------------------
-# Universal2 fat-binary fusion. pip installs native wheels matching the
-# BUILD machine's architecture only (arm64 wheels on Apple Silicon). Without
-# this step the .app loads on the build arch but crashes on the other.
-# ----------------------------------------------------------------------------
-log "Fusing single-arch .so files to universal2..."
-"$BUILD_VENV/bin/pip" install --quiet delocate 2>/dev/null || true
-# shellcheck disable=SC1091
-source "$BUILD_VENV/bin/activate"
-bash "$INSTALLER_ROOT/scripts/make_universal_sos.sh" "$BUILT_APP"
-deactivate
-
-# ----------------------------------------------------------------------------
-# Step 3.75 — runtime import gate. Invoke the REAL app binary with --diagnose
-# under BOTH architectures. Single-arch wheels that slip through pip land
-# here; we do not ship a bundle that works on one arch but crashes on the
-# other.
+# Step 3.75 — runtime import gate. Invoke the REAL app binary with --diagnose.
+# The build is arm64-only, so there is no other-arch slice to fuse or verify —
+# single-arch wheels are exactly what we want here. Missing dependencies still
+# surface as import failures, so this gate is unchanged in purpose.
 # ----------------------------------------------------------------------------
 log "Runtime import gate (--diagnose) — native arch..."
 if ! "$BUILT_APP/Contents/MacOS/MailWarden" --diagnose >/dev/null; then
@@ -160,13 +196,6 @@ if ! "$BUILT_APP/Contents/MacOS/MailWarden" --diagnose >/dev/null; then
     die "Runtime import gate failed on native arch. The bundle is missing a dependency — do not ship."
 fi
 log "  native arch: all imports OK"
-
-log "Runtime import gate (--diagnose) — x86_64 via Rosetta..."
-if ! /usr/bin/arch -x86_64 "$BUILT_APP/Contents/MacOS/MailWarden" --diagnose >/dev/null; then
-    /usr/bin/arch -x86_64 "$BUILT_APP/Contents/MacOS/MailWarden" --diagnose || true
-    die "Runtime import gate failed on x86_64. Intel Macs will not run this bundle — do not ship."
-fi
-log "  x86_64: all imports OK"
 
 log "Runtime import gate (--diagnose) — arm64 explicit..."
 if ! /usr/bin/arch -arm64 "$BUILT_APP/Contents/MacOS/MailWarden" --diagnose >/dev/null 2>&1; then
@@ -181,10 +210,6 @@ fi
 log "Runtime HTTPS gate (--test-validate) — native arch..."
 if ! "$BUILT_APP/Contents/MacOS/MailWarden" --test-validate; then
     die "HTTPS gate failed on native arch. The app will hang or error on Validate."
-fi
-log "Runtime HTTPS gate (--test-validate) — x86_64 via Rosetta..."
-if ! /usr/bin/arch -x86_64 "$BUILT_APP/Contents/MacOS/MailWarden" --test-validate; then
-    die "HTTPS gate failed on x86_64. Intel Macs would hang on Validate."
 fi
 
 # ----------------------------------------------------------------------------
@@ -236,6 +261,22 @@ else
 fi
 
 # ----------------------------------------------------------------------------
+# Step 4.4 — stage the built .app OUTSIDE the repo tree before signing.
+# The repo lives in an iCloud-synced folder (~/Documents): FileProvider
+# re-stamps com.apple.FinderInfo/fpfs xattrs on bundle items continuously,
+# racing the (minutes-long) signing pass. Any such attr at seal time =
+# codesign "detritus not allowed" = an ad-hoc app = notary rejection
+# (lost this race twice on 2026-07-03 despite pre-sign xattr strips).
+# /private/tmp is never synced; ditto --noextattr --noqtn strips every
+# attribute in transit. All signing + packaging below uses the staged copy.
+# ----------------------------------------------------------------------------
+SIGN_STAGE="$(mktemp -d /private/tmp/mailwarden-sign-XXXXXX)"
+log "Staging .app outside the synced tree for signing ($SIGN_STAGE)..."
+/usr/bin/ditto --noextattr --noqtn "$BUILT_APP" "$SIGN_STAGE/MailWarden.app" \
+    || die "ditto staging failed"
+BUILT_APP="$SIGN_STAGE/MailWarden.app"
+
+# ----------------------------------------------------------------------------
 # Step 4.5 — codesign the .app.
 # If a Developer ID Application cert is available in the keychain, sign with
 # it now (required for SMAppService registration). Fall back to ad-hoc if not.
@@ -246,51 +287,42 @@ DEVID_CERT="Developer ID Application: STR Solutions, LLC (6BXSAHWH29)"
 if /usr/bin/security find-identity -v -p codesigning \
         | grep -qF "$DEVID_CERT"; then
     log "Developer ID cert found — signing .app with Developer ID Application..."
+    # Strip Finder info / resource forks / provenance xattrs BEFORE signing.
+    # Detritus on any bundle file breaks the code seal and the notary
+    # service rejects the whole .pkg (hit 2026-07-03: freshly-downloaded
+    # wheels carried provenance attrs; verification failed but was only a
+    # warning, so an effectively ad-hoc app shipped to notarization).
+    log "  Stripping extended attributes from the bundle..."
+    /usr/bin/xattr -cr "$BUILT_APP" 2>/dev/null || true
     # Apple's notary service requires every Mach-O binary inside the bundle
     # to be signed with --options runtime AND --timestamp. --deep alone does
     # not add timestamps to nested signatures, so we walk the bundle and sign
     # each binary explicitly (innermost first), then sign the outer .app.
-    log "  Signing inner Mach-O binaries (.so/.dylib) with hardened runtime + timestamp..."
-    find "$BUILT_APP" -type f \( -name "*.so" -o -name "*.dylib" \) -print0 \
-        | while IFS= read -r -d '' bin; do
-            /usr/bin/codesign --force \
-                --options runtime \
-                --timestamp \
-                --sign "$DEVID_CERT" \
-                "$bin" >/dev/null 2>&1 || log "    WARNING: failed to sign $bin"
-          done
-    # Sign the embedded Python binary explicitly
-    if [ -f "$BUILT_APP/Contents/MacOS/python" ]; then
-        /usr/bin/codesign --force \
-            --options runtime \
-            --timestamp \
-            --sign "$DEVID_CERT" \
-            "$BUILT_APP/Contents/MacOS/python" 2>&1 | grep -v "replacing existing signature" || true
-    fi
-    # Sign the Python framework's main dylib. This binary has no extension
-    # (just named "Python") and no executable bit set, so the .so/.dylib
-    # find loop above misses it entirely. Apple's notary REQUIRES every
-    # Mach-O inside the bundle to carry Developer ID + timestamp; leaving
-    # this one ad-hoc-signed (py2app's default) causes notary to reject
-    # the entire .pkg with "binary is not signed with a valid Developer ID
-    # certificate" — see notary log for fa0aff53-64de-4336-a5ce-b7fea6047a19.
-    FRAMEWORK_PY="$BUILT_APP/Contents/Frameworks/Python.framework/Versions/3.12/Python"
-    if [ -f "$FRAMEWORK_PY" ]; then
-        /usr/bin/codesign --force \
-            --options runtime \
-            --timestamp \
-            --sign "$DEVID_CERT" \
-            "$FRAMEWORK_PY" 2>&1 | grep -v "replacing existing signature" || true
-    fi
-    # Sign the main wrapper executable
-    if [ -f "$BUILT_APP/Contents/MacOS/MailWarden" ]; then
-        /usr/bin/codesign --force \
-            --options runtime \
-            --timestamp \
-            --sign "$DEVID_CERT" \
-            "$BUILT_APP/Contents/MacOS/MailWarden" 2>&1 | grep -v "replacing existing signature" || true
-    fi
+    log "  Signing every nested Mach-O (inside-out) with Developer ID + hardened runtime + timestamp..."
+    find "$BUILT_APP" -type f -print0 \
+        | xargs -0 file \
+        | grep -F 'Mach-O' \
+        | grep -vF '(for architecture' \
+        | cut -d: -f1 \
+        | awk -F/ '{print NF"\t"$0}' | sort -rn | cut -f2- \
+        | while IFS= read -r bin; do
+            /usr/bin/codesign --force --options runtime --timestamp \
+                --sign "$DEVID_CERT" "$bin" >/dev/null 2>&1 \
+                || die "Failed to Developer-ID-sign nested Mach-O: $bin"
+        done
     # Finally, sign the .app bundle itself with entitlements
+    # Second strip IMMEDIATELY before the outer seal: this repo lives in an
+    # iCloud-synced folder (~/Documents), and FileProvider re-stamps
+    # com.apple.FinderInfo / com.apple.fileprovider.fpfs on bundle items
+    # WHILE the (minutes-long) inner signing loop runs. Any such attr at
+    # seal time = "detritus not allowed" = ad-hoc app = notary rejection.
+    # -d targets the two offenders explicitly (-c alone has been observed
+    # to leave them); provenance attrs are SIP-managed, unremovable, and
+    # tolerated by codesign.
+    log "  Stripping extended attributes again (iCloud FileProvider re-tags mid-build)..."
+    /usr/bin/xattr -rd com.apple.FinderInfo "$BUILT_APP" 2>/dev/null || true
+    /usr/bin/xattr -rd com.apple.fileprovider.fpfs "$BUILT_APP" 2>/dev/null || true
+    /usr/bin/xattr -cr "$BUILT_APP" 2>/dev/null || true
     log "  Signing outer .app bundle with entitlements + hardened runtime + timestamp..."
     /usr/bin/codesign --force \
         --options runtime \
@@ -298,8 +330,23 @@ if /usr/bin/security find-identity -v -p codesigning \
         --entitlements "$INSTALLER_ROOT/app/MailWarden.entitlements" \
         --sign "$DEVID_CERT" \
         "$BUILT_APP" 2>&1 | grep -v "replacing existing signature" || true
-    /usr/bin/codesign --verify --deep --strict "$BUILT_APP" 2>&1 \
-        | head -5 || log "  (verification warning; build continues)"
+    # Verification is a HARD GATE on the Developer ID path: a broken seal
+    # here is exactly what the notary rejects, so failing loudly now saves
+    # a wasted 10-minute notarization round-trip (and can never ship an
+    # ad-hoc-signed app as if it were signed).
+    if ! /usr/bin/codesign --verify --deep --strict "$BUILT_APP"; then
+        die "codesign verification FAILED — notarization would reject this bundle. Do not ship."
+    fi
+    # --verify --deep --strict does NOT reject ad-hoc nested signatures (it only
+    # checks seals are intact) — that's how the 3.9 framework slipped through to
+    # the notary. Assert no nested Mach-O remains ad-hoc before we ship.
+    log "  Asserting no nested binary is still ad-hoc-signed..."
+    find "$BUILT_APP" -type f -print0 | xargs -0 file | grep -F 'Mach-O' | grep -vF '(for architecture' | cut -d: -f1 | sort -u \
+        | while IFS= read -r bin; do
+            if /usr/bin/codesign -dvv "$bin" 2>&1 | grep -q 'flags=0x2(adhoc)'; then
+                die "Nested binary still ad-hoc after signing (would fail notarization): $bin"
+            fi
+        done
     log "  Developer ID codesign complete"
 else
     log "Developer ID cert NOT found — falling back to ad-hoc sign."
@@ -315,10 +362,13 @@ fi
 # Step 5 — stage the .app into a component .pkg.
 # ----------------------------------------------------------------------------
 log "Staging component .pkg..."
-STAGE="$INSTALLER_ROOT/build/pkg-root"
+# pkg-root also lives OUTSIDE the synced tree (same FileProvider re-tagging
+# hazard as Step 4.4 — detritus stamped between cp and pkgbuild would embed
+# broken-seal files in the payload). ditto preserves the signed app exactly.
+STAGE="$SIGN_STAGE/pkg-root"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/Applications"
-cp -R "$BUILT_APP" "$STAGE/Applications/MailWarden.app"
+/usr/bin/ditto "$BUILT_APP" "$STAGE/Applications/MailWarden.app"
 
 pkgbuild \
     --root "$STAGE" \

@@ -1,0 +1,29 @@
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+ d=harborviewdental.com; i=@harborviewdental.com; q=dns/txt;
+ s=eval2026; t=1782864000; h=from : to : subject : date : message-id;
+ bh=V2bByY4MVNxdApxK5aoW0rherIbMx6noLFSqtraGZ9Q=;
+ b=FraeBbALTsX3GK36+hH73gx18Yqj5asTqjObMAvglpEhaBNjwH4643/hEPogX9WxQSDcf
+ Sx+EeUX224vGJastwQtZDLLcOoIear99PLwEKBRCF1F4L2sZmAqLZBamfp5gU1kE2GKJB4D
+ MPaoLzD7FR4zYXxQtiCrigle7db0Cy/QhsH9mpLHBgqoPPeYf4cSJXqZ/cjUTS5zwmazksh
+ UVDEZoN38h5Bj9NtoDq/EqTCWQ1dcT0qHLWINmLdu0/VScIjS7yH76SgXpUDD/PaDdQkuqO
+ CDP9WWv0QOsFvjSR/A8AkKqTaG23ONBFcAc4USAh1AEFPYdV9yJ6V4IwTKVg==
+Return-Path: <receipts@harborviewdental.com>
+Received: from server82.sharedwebhost.com (server82.sharedwebhost.com [70.40.220.51])
+	by mx4.baycrestmail.com with ESMTPS id A72822;
+	Tue, 30 Jun 2026 15:22:37 -0400
+From: Harborview Dental <receipts@harborviewdental.com>
+To: mrosen@baycrestmail.com
+Subject: Appointment confirmed for Tuesday, July 7 at 10:30 AM
+Date: Tue, 30 Jun 2026 15:22:35 -0400
+Message-ID: <apt-20260707-1030@harborviewdental.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Hi,
+
+This confirms your cleaning appointment at Harborview Dental on
+Tuesday, July 7 at 10:30 AM with Dr. Okafor.
+
+Need to reschedule? Call us at (555) 014-2200 or reply to this email.
+
+Harborview Dental, 210 Marina Way

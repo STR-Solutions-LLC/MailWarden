@@ -23,8 +23,12 @@ resources/eula.rtf
 # --- Payload exclusions: dev data must never enter the payload ---
 payload/MailWarden/config/config.json
 payload/MailWarden/memory/*.json
+payload/MailWarden/memory/*.lock
+payload/MailWarden/.claude-mpm/
 payload/MailWarden/memory/decisions.log
 payload/MailWarden/memory/eula_sent.json
+# Parse-failure debug capture (raw email content) — never commit
+payload/MailWarden/memory/
 
 # Append-only refinement-event log (~/MailWarden/memory/signal_refinements.log).
 # Runtime/dev artifact — never commit. Bare name matches it in any directory.
@@ -83,6 +87,10 @@ tests/_out/
 # Local-only test fixtures and agent tooling — never commit (contains real personal email/PII)
 tests/fixtures/
 *.eml
+# EXCEPTION: hand-built synthetic eval fixtures carry NO real mail/PII (ground
+# truth by construction) and are committed so the phish set is reproducible.
+!tools/eval_synthetic/
+!tools/eval_synthetic/*.eml
 .claude/
 .claude-mpm/
 # Local MCP server config and trusty tooling — never commit

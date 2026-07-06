@@ -1,0 +1,24 @@
+Return-Path: <alerts@amazon-account-security.com>
+Received: from mailer.amazon-account-security.com (mailer.amazon-account-security.com [23.94.180.77])
+	by mx4.baycrestmail.com with ESMTPS id A63826;
+	Sun, 21 Jun 2026 08:33:55 -0400
+Authentication-Results: mx4.baycrestmail.com;
+	spf=pass (sender IP is 23.94.180.77) smtp.mailfrom=amazon-account-security.com;
+	dkim=none;
+	dmarc=none
+Received-SPF: pass (domain of amazon-account-security.com designates 23.94.180.77 as permitted sender)
+From: Amazon <alerts@amazon-account-security.com>
+To: mrosen@baycrestmail.com
+Subject: Your order could not be shipped - payment declined
+Date: Sun, 21 Jun 2026 08:33:52 -0400
+Message-ID: <order-alert-71building@amazon-account-security.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Your recent order #114-2278119 could not be shipped because your
+payment method was declined.
+
+Update your payment information:
+http://amazon-account-security.com/gp/update-payment
+
+Amazon Customer Service

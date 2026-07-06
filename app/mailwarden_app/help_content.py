@@ -8,7 +8,7 @@ across surfaces and a single edit updates every spot.
 # ---------------------------------------------------------------------------
 # Version and repo
 # ---------------------------------------------------------------------------
-VERSION = "1.6.0-beta.16.1"
+VERSION = "1.7.0"
 GITHUB_URL = "https://github.com/STR-Solutions-LLC/MailWarden"
 FEEDBACK_EMAIL = "info@rentalist.pro"
 ANTHROPIC_CONSOLE_URL = "https://console.anthropic.com"
@@ -50,6 +50,31 @@ WELCOME_PARAGRAPH = (
 
 
 # ---------------------------------------------------------------------------
+# Teach MailWarden — quick reference (top of Help tab + welcome email)
+# Actions up front, so nobody has to scroll through prose to find them.
+# ---------------------------------------------------------------------------
+TEACH_QUICK_REFERENCE = (
+    "Drag spam it missed into the \"Train MailWarden\" folder (created for you,\n"
+    "one per account) — the main way to teach it. No typing; works in every\n"
+    "mail app.\n\n"
+    "Or forward the message to yourself and set the subject:\n"
+    "  Fwd: Whitelist — trust this sender    Fwd: Whitelist Domain — trust their company\n"
+    "  Fwd: Blacklist All — block this sender\n"
+    "  Fwd: False Positive (or NOT SPAM) — a real email got junked; correct it\n"
+    "  Fwd: SPAM Example — spam got through; teach it\n\n"
+    "Reply to any MailWarden email to answer it:\n"
+    "  APPROVE n — rescue a sender wrongly junked in your daily report (if one\n"
+    "    of your own rules blocked it, the reply explains how to change the rule)\n"
+    "  DROP n / KEEP n — retire or keep a self-taught rule that's up for review\n"
+    "  RESTORE n — turn a dropped rule back on (the undo for DROP; works on a\n"
+    "    recent report, or anytime from the Dashboard's Dropped rules)\n"
+    "  YES / NO — accept or reject a proposed refinement\n\n"
+    "Always send from your own account, the normal way — MailWarden ignores any\n"
+    "command it can't confirm came from you."
+)
+
+
+# ---------------------------------------------------------------------------
 # Email command cheat sheet (§5) — reused in welcome email and Help tab
 # ---------------------------------------------------------------------------
 EMAIL_COMMAND_CHEAT_SHEET = (
@@ -71,7 +96,7 @@ EMAIL_COMMAND_CHEAT_SHEET = (
     "────────────────────────────────────────────\n"
     "FOR DIRECT MANUAL ENTRY — send yourself an email with a subject of\n"
     "\"Whitelist\" or \"Blacklist\"\n\n"
-    "When you just want to add addresses or domains manually — no forwarding,\n"
+    "When you want to add addresses or domains manually — no forwarding,\n"
     "no spam example — send yourself a new email with the subject exactly:\n\n"
     "    Whitelist\n"
     "    or\n"
@@ -104,7 +129,14 @@ EMAIL_COMMAND_CHEAT_SHEET = (
     "  does), use the Train folder instead.\n\n"
     "You can write anything above the forwarded message — notes, context, an\n"
     "explanation. MailWarden reads the subject line, acts on it, and replies\n"
-    "on its next run (every 15 minutes by default) confirming what it did."
+    "on its next run (every 15 minutes by default) confirming what it did.\n\n"
+    "One thing that matters for every command: send it from your own email\n"
+    "account, the normal way — compose or forward and hit send like any other\n"
+    "message. MailWarden checks that a command really came from you before it\n"
+    "acts. If a command reaches your inbox another way — bounced through an\n"
+    "auto-forwarding service, a mailing list, or a \"send as\" relay that strips\n"
+    "your account's identity — MailWarden can't confirm it's you, so it won't\n"
+    "act on it and will send you a short \"command not verified\" note instead."
 )
 
 
@@ -143,6 +175,12 @@ EMAIL_COMMAND_EXAMPLES = [
      "When MailWarden let something obvious through. Forward the spam with "
      "this subject. MailWarden saves it as a training example and re-analyzes "
      "its signals to catch similar messages next time."),
+    ("A note on all commands",
+     "Whichever command you use, send it from your own email account the "
+     "normal way. MailWarden confirms a command really came from you before "
+     "acting. If it can't — usually because the message was auto-forwarded "
+     "through another service that strips your account's identity — it won't "
+     "act, and sends you a short 'command not verified' note instead."),
 ]
 
 
@@ -184,11 +222,11 @@ WHY_MAILWARDEN_IS_DIFFERENT = (
 
 HOW_IT_DECIDES = (
     "On a schedule you control — every 15 minutes by default, adjustable from 5 to 360 minutes under Dashboard → Settings — MailWarden pulls new mail and runs each message through five plain steps.\n\n"
-    "Step 1 — Your lists (instant, no Claude call needed). If the sender's exact address is on your whitelist, the email is trusted and left alone. If it's on your blacklist, or the display name matches a blacklisted name, the email is moved to Junk immediately. Your lists always win. You grow them by forwarding emails to yourself with subjects like 'Fwd: Whitelist' or 'Fwd: Blacklist All', or from Dashboard → Whitelist/Blacklist.\n\n"
+    "Step 1 — Your lists (instant, no Claude call needed). If the sender's exact address is on your whitelist, the email is trusted and left alone. If it's on your blacklist, or the display name matches a blacklisted name, the email is moved to Junk immediately. Your lists always win. You grow them by forwarding emails to yourself with subjects like 'Fwd: Whitelist' or 'Fwd: Blacklist All', or from Dashboard → Whitelist/Blacklist. When you grow your lists by email, MailWarden first confirms the command really came from you — send it from your own account the normal way; a command it can't verify is ignored (and you get a brief \"command not verified\" note).\n\n"
     "Step 2 — Domain allow list (instant, no Claude). If the sender's domain (for example, everyone at your-accountant.com) is on your whitelist, the email is trusted. Add to it via 'Fwd: Whitelist Domain'.\n\n"
-    "Step 3 — Unambiguous instant blocks (instant, no Claude). A small set of clear-cut technical checks — a forged sender, a known-bad sending server, or a blatant hidden-AI-prompt attack inside the message — move mail to Junk on their own. These only fire when the tell is unmistakable, so on their own they won't cause false positives.\n\n"
-    "Step 4 — Claude reads it. Everything that isn't handled above goes to Claude. Claude reads the headers and the full message body and reasons about what the email is actually trying to do — not just whether it matches a pattern. It sees when a 'shipping notification' isn't really from UPS, when 'your account is suspended' is a phish, when a friendly note is a prelude to a scam paragraph buried further down. You get back a verdict, a confidence score between 0 and 1, and a short sentence explaining why. This is the step your provider's filter can't match. It pattern-matches. Claude actually reads.\n\n"
-    "Typical cost is a fraction of a cent per message, and each email is classified only once, so checking more often doesn't cost more. As one illustrative example, monitoring 4 busy accounts that get a lot of spam ran about $0.50 in Anthropic API tokens over 24 hours; your cost depends on how many accounts you run and how much mail you receive. MailWarden ships with Claude Haiku as the default model — Anthropic's cheapest, and accurate enough for this. For more nuance on borderline mail, switch to Claude Sonnet under Dashboard → Settings (roughly six times the cost per classification, a slightly sharper read).\n\n"
+    "Step 3 — Unambiguous instant blocks (instant, no Claude). A small set of clear-cut technical checks — a forged sender, a known-bad sending server, or a blatant hidden-AI-prompt attack inside the message — move mail to Junk on their own. These only fire when the tell is unmistakable, so on their own they won't cause false positives. Because these blocks skip the AI read entirely, any mail they catch is flagged in your daily report as \"Junked by a built-in tripwire — no AI review,\" with the tripwire named, so a rare mistake stands out and you can reply APPROVE and its number to rescue the sender.\n\n"
+    "Step 4 — Claude reads it, with a built-in double-check. Everything that isn't handled above goes to Claude, which reads the headers and the full message body and reasons about what the email is actually trying to do — not just whether it matches a pattern. It reads the message the way you see it on screen — the formatted (HTML) version, not the hidden plain-text copy — so a decoy can't bury the real pitch where you'd never look. It sees when a 'shipping notification' isn't really from UPS, when 'your account is suspended' is a phish, when a friendly note is a prelude to a scam paragraph buried further down. By default MailWarden runs this in two passes: a fast first model (Haiku) screens every message, and anything it wants to move to Junk is re-read by a more capable second model (Sonnet). A message is junked only when both models agree it's spam; if they disagree, it stays in your inbox. The second model is never asked about mail the first one cleared — it can only rescue a message, never junk one on its own. You get back a verdict, a confidence score between 0 and 1, and a short sentence explaining why. (You can switch to a single-model mode under Dashboard → Settings, but the two-model double-check is the recommended default.) This is the step your provider's filter can't match. It pattern-matches. Claude actually reads.\n\n"
+    "Typical cost is a fraction of a cent per message. The first-pass model (Haiku) is Anthropic's cheapest; the more capable second model (Sonnet) is only ever called for messages the first pass wants to junk — a small share of ordinary mail — so you pay for the sharper read only where it matters. Each email is classified only once and the result is cached, so checking more often doesn't add cost. What you spend depends on how many accounts you run and how much mail — especially how much likely-spam — you receive. To see exactly what you're spending, check your usage and charges in the Anthropic console (console.anthropic.com).\n\n"
     "Step 5 — Your confidence threshold and your handling choice. You set a confidence threshold in Settings (default 0.85). If Claude is more confident than that and calls the message spam, MailWarden acts on it the way you've configured that account: moves it to Junk (default), moves it to Trash (auto-emptied after a buffer), or deletes it permanently. You pick this per account and can change it any time from Dashboard → Accounts. If Claude is unsure or thinks it's real, the email stays put. MailWarden is biased toward leaving borderline mail in the inbox — better a suspicious email you can see than a real message lost."
 )
 
@@ -198,7 +236,7 @@ SPAM_HANDLING_CHOICE = (
     "Move to Junk folder (the default). Spam goes into your Junk / Spam folder. Your email provider eventually empties Junk on its own schedule (usually 30 days). This is the safest choice: if MailWarden ever mis-flags a real email, you can find it in Junk and forward it back with the subject \"Fwd: False Positive\" (or just \"NOT SPAM\") to recover it and teach MailWarden it was wrong.\n\n"
     "Move to Trash (30-day buffer). Spam goes into your Trash folder instead. Functionally similar to Junk on most providers — Trash is also emptied on a delay — but useful if you check Junk regularly and don't want spam mixed in with mail you've actually deleted yourself. Same false-positive recovery path: forward it back from Trash before it auto-empties.\n\n"
     "Delete permanently (no recovery). Spam is removed from the server immediately. There is no Junk folder, no Trash folder, no recovery. If MailWarden ever mis-flags an important email, that email is gone for good. Use this only if you fully trust the filter and accept the trade-off. MailWarden will warn you and ask you to confirm when you pick this option.\n\n"
-    "Most people should leave this on the default (Junk). The Delete option exists for the rare account where you genuinely want spam to disappear without leaving a trail — for example, a public-facing address that gets hundreds of obvious phishing attempts a day."
+    "Most people should leave this on the default (Junk). The Delete option exists for the rare account where you want spam to disappear without leaving a trail — for example, a public-facing address that gets hundreds of obvious phishing attempts a day."
 )
 
 
@@ -209,8 +247,9 @@ TRAIN_YOUR_FILTER = (
     "2. Wait for the next run (up to 15 minutes by default). If the filter catches it, it'll disappear into Junk on its own.\n\n"
     "3. If it's still there after a run has gone by, it slipped past both the pre-classifier and the AI. That's a real learning opportunity.\n\n"
     "4. Drag the spam email into the \"Train MailWarden\" folder in that account. MailWarden creates this folder for you automatically the first time you save an account, so it should already be visible in your mail client's folder list. (If you don't see it, restart your mail client — IMAP folder refresh is on the client, not on MailWarden.) Dragging works in every mail client with IMAP — AOL webmail, Apple Mail, iOS Mail, Gmail web, Outlook. No typing, no forwarding, no outbound SMTP. It doesn't matter whether you've already opened or read the message — MailWarden processes every message you put in this folder, read or unread, because dropping it here is a deliberate training signal. The email is deleted from the Train folder as soon as MailWarden has analyzed it — the folder stays clean automatically.\n\n"
-    "5. On the filter's next run (within 15 minutes by default) MailWarden will analyze the example and email you a refinement proposal: a one-sentence description of the pattern it learned, a short rationale, and what the pattern doesn't cover. Reply YES to apply, NO to reject, or use CONTEXT: / NARROW: to steer Claude's analysis with your own reasoning (e.g., \"CONTEXT: the 'reserved until 11:59 PM' pressure gave it away\"). The email walks you through all the reply options.\n\n"
+    "5. On the filter's next run (within 15 minutes by default) MailWarden will analyze the example and email you a refinement proposal: a one-sentence description of the pattern it learned, a short rationale, and what the pattern doesn't cover. Reply YES to apply, NO to reject, or use CONTEXT: / NARROW: to steer Claude's analysis with your own reasoning (e.g., \"CONTEXT: the 'reserved until 11:59 PM' pressure gave it away\"). The email walks you through all the reply options. Reply to MailWarden's email normally — your YES or NO needs to come from your own account so MailWarden can confirm the answer is really from you; if it can't verify the reply, it won't apply the change and will let you know.\n\n"
     "6. You can also approve, reject, or withdraw any pending proposal from Dashboard → Signal History if MailWarden is open. Email and Dashboard are kept in sync.\n\n"
+    "Dropped a rule and changed your mind? It's not gone — every dropped rule sits in Signal History → \"Dropped rules,\" where one click restores it anytime, with no time window and no report-number limit. Or, when the rule is on a recent daily report, reply RESTORE and its number (example: RESTORE 1).\n\n"
     "Catch spam the same way? Drag more examples to Train MailWarden. MailWarden will stop seeing it as ambiguous and start catching it on the pre-classifier (which is free) instead of the AI.\n\n"
     "False positives — when the filter overreaches. If a real email ends up in Junk by mistake, forward it back with the subject 'Fwd: False Positive' (or just 'NOT SPAM'). MailWarden analyzes why it mis-classified, proposes a refinement to its signals, and shows the proposed change on the Signal History tab. You approve or reject the change. Same run-based loop, same conversation.\n\n"
     "Every example makes your filter smarter. That's the whole idea. You don't have a spam filter — you have an AI trained on exactly the garbage that shows up in your mailbox."
@@ -280,6 +319,38 @@ TWO_JOBS_PROTECT_CURATE = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Unwanted Categories editor (Dashboard tab + Help section)
+# ---------------------------------------------------------------------------
+UNWANTED_CATEGORIES_HELP = (
+    "The Unwanted Categories tab lets you write your own curate rules by hand — "
+    "no example email needed. Use it when you already know a kind of mail you "
+    "don't want, even though it's perfectly legitimate: political fundraising "
+    "from a particular party, webinar invitations, \"we miss you\" win-back "
+    "emails, and the like.\n\n"
+    "To add one: open the Unwanted Categories tab, describe the category in "
+    "your own words (for example, \"political fundraising from Republican "
+    "campaigns\"), choose which account(s) it applies to, and click \"Add "
+    "category rule\". From then on, MailWarden moves mail that clearly matches "
+    "into your junk folder.\n\n"
+    "Two things to know. First, a category rule only affects mail that arrives "
+    "AFTER you add it — it does not reach back through mail you've already "
+    "received. Second, keep the description specific. A vague rule like "
+    "\"newsletters\" could hide mail you actually want. If there are senders "
+    "you always want to hear from, add them to your Whitelist — a category rule "
+    "never junks a whitelisted sender.\n\n"
+    "MailWarden gives broad rules a quick heads-up. When you add a rule, it "
+    "checks whether the wording is broad enough to catch mail you might want. "
+    "If it looks broad, it tells you why and suggests a tighter version — but "
+    "the choice is yours: add it anyway, or revise it. If it can't check right "
+    "then (no internet, for example), it just adds the rule.\n\n"
+    "You stay in control. Every rule you add is listed on the tab with a Turn "
+    "off button (stop using it without deleting it), a Turn on button (start "
+    "using it again), and a Delete button (remove it for good). Turning a rule "
+    "off or deleting it takes effect on the next check."
+)
+
+
 # Kept for backwards compatibility with anything that still imports the
 # old single constant. New code uses the split sections above.
 DECISION_PIPELINE_EXPLANATION = "\n\n".join([
@@ -320,7 +391,15 @@ Your spam filter is now running. By default it checks your inbox every 15
 minutes (you can set this anywhere from 5 to 360 minutes in the Dashboard),
 uses AI to identify spam, and moves flagged mail into your junk folder.
 Once a day (at 8:00 AM by default), you'll get a report summarizing what
-was filtered.
+was filtered. Every junked sender in that report is numbered — if MailWarden
+ever junks someone you want to hear from, reply APPROVE and the number (for
+example, APPROVE 3) to rescue them. If the block came from a rule you set
+yourself, MailWarden replies with how to change that rule instead.
+
+----------------------------------------------------------------------
+TEACH MAILWARDEN — QUICK REFERENCE
+
+{TEACH_QUICK_REFERENCE}
 
 ----------------------------------------------------------------------
 USAGE MODEL — IMPORTANT
@@ -345,9 +424,10 @@ Click the MailWarden icon in your menu bar, or open
   - See how many emails were classified (and how many were handled by the
     instant-block checks before Claude was called)
   - Manage your whitelist and blacklist (now including domain blacklisting)
-  - Pause filtering, adjust the confidence threshold, switch the model
-    (Haiku is the default — cheap and accurate; Sonnet is sharper but
-    about six times the cost)
+  - Pause filtering, adjust the confidence threshold, or switch classification
+    mode (the default is the two-model double-check — Haiku screens all mail,
+    Sonnet re-checks anything flagged junk, and mail is junked only when both
+    agree; single-model modes are available too)
   - Choose how each account handles flagged spam (Junk, Trash, or Delete)
   - Review and undo the filter's learned refinements
   - Uninstall MailWarden completely, with no Terminal required
@@ -385,7 +465,7 @@ UNREAD_CACHING_BEHAVIOR = (
     "around. Without this cache, every tick would re-classify every unread "
     "message, and your Anthropic bill would be enormous. With the cache, your "
     "first run after installing evaluates everything that's new to MailWarden "
-    "— then every run after that only looks at genuinely fresh arrivals.\n\n"
+    "— then every run after that only looks at fresh arrivals.\n\n"
     "The cache lives at ~/MailWarden/memory/processed_ids.json and is pruned "
     "to the last 30 days on every filter run. If you ever want to force "
     "MailWarden to re-evaluate your inbox — say, after changing the model or "
@@ -482,7 +562,7 @@ CHECK_AND_TEACH_HELP = (
     "narrow it.\n"
     "- Protect — this is a threat. A scam, phish, or impersonation. Claude turns "
     "your example into a general rule, and it applies to all your accounts.\n"
-    "- Curate — legit, I just don't want it. An honest sender you're simply done "
+    "- Curate — legit, I just don't want it. An honest sender you're done "
     "with. Applies to the account you're using by default. You can curate two "
     "ways:\n"
     "    • Block this sender — stop all mail from this specific sender. Instant, "
@@ -500,14 +580,25 @@ CHECK_AND_TEACH_HELP = (
     "or delete it there at any time.\n\n"
     "HOW MAILWARDEN DECIDES\n"
     "- Mail whose sender identity is cryptographically verified AND matches the "
-    "brand it claims is trusted as legitimate.\n"
+    "brand it claims is trusted as legitimate. When your mail provider stamps no "
+    "authentication verdict of its own, MailWarden verifies the sender's "
+    "cryptographic signature itself, so this protection still works on hosts that "
+    "leave mail unverified.\n"
+    "- MailWarden also learns which senders you reliably receive; a sender with an "
+    "established track record in your own inbox is treated as more likely "
+    "legitimate, never as more suspicious.\n"
     "- Your allow/block lists and a small set of unambiguous instant-block checks "
     "decide a few cases with no Claude call; everything else goes to Claude for a "
     "real decision rather than being junked automatically — MailWarden would "
     "rather ask than wrongly junk a legitimate message.\n"
     "- Learned rules are strong guidance to Claude; your allow/block lists are "
     "absolute. You can limit any learned rule to specific accounts in Signal "
-    "History."
+    "History.\n"
+    "- The same \"is this really who it says\" check guards your commands: "
+    "MailWarden only acts on an email command or a YES/NO approval reply when "
+    "it can confirm the message came from your account. Send commands "
+    "from your own email the normal way; one it can't verify is ignored, with a "
+    "short \"command not verified\" note back to you."
 )
 
 
@@ -523,11 +614,15 @@ HELP_TAB_INTRO = (
 )
 
 HELP_TAB_SECTIONS = [
+    # Actions first — the quick reference sits at the very top so the teach
+    # vocabulary and reply commands never require scrolling through prose.
+    ("Teach MailWarden — quick reference", TEACH_QUICK_REFERENCE),
     ("Opening the Dashboard", OPENING_THE_DASHBOARD),
     # AI / decision-making comes first — this is what's special about the app.
     ("Why MailWarden is different", WHY_MAILWARDEN_IS_DIFFERENT),
     ("How it decides, in the moment", HOW_IT_DECIDES),
     ("Two things MailWarden does — Protect and Curate", TWO_JOBS_PROTECT_CURATE),
+    ("Unwanted Categories — write your own rules by hand", UNWANTED_CATEGORIES_HELP),
     ("How spam gets handled — Junk, Trash, or Delete", SPAM_HANDLING_CHOICE),
     ("Why your API bill stays small (even with a big inbox)", UNREAD_CACHING_BEHAVIOR),
     ("Train your own filter — the coolest part", TRAIN_YOUR_FILTER),

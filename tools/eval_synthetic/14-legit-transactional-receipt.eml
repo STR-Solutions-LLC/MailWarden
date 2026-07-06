@@ -1,0 +1,23 @@
+Return-Path: <receipts@stripemarket.com>
+Received: from mail-out.stripemarket.com (mail-out.stripemarket.com [54.240.27.180])
+	by mx4.baycrestmail.com with ESMTPS id A79103;
+	Sun, 28 Jun 2026 12:40:03 -0400
+Authentication-Results: mx4.baycrestmail.com;
+	spf=pass (sender IP is 54.240.27.180) smtp.mailfrom=stripemarket.com;
+	dkim=pass header.d=stripemarket.com;
+	dmarc=pass action=none header.from=stripemarket.com
+From: StripeMarket Receipts <receipts@stripemarket.com>
+To: mrosen@baycrestmail.com
+Subject: Your receipt from Harborview Dental - $184.00
+Date: Sun, 28 Jun 2026 12:40:01 -0400
+Message-ID: <rcpt_1PZk2026a@stripemarket.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Receipt from Harborview Dental
+
+Amount paid: $184.00
+Date: June 28, 2026
+Payment method: Visa ending 4242
+
+Questions? Contact Harborview Dental at (555) 014-2200.

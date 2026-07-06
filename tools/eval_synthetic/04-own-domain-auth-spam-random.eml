@@ -1,0 +1,28 @@
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=bkzvqrelay.com;
+ i=@bkzvqrelay.com; q=dns/txt; s=eval2026; t=1782864000; h=from : to :
+ subject : date : message-id;
+ bh=Rx0m/98xAT9Q06avf+RxNpj0LlTKveA1Jfe6kNtLpnc=;
+ b=qYro3z14B/yr4jQnY9uTsA54oGgaUMbAfHEmoNwNsL9ev0Kj6g8B/IXdC+qv9A00bVfpm
+ T5Drd3xVb83lXlAvCR7GbwjwYpMm/lAPLHbz79fs4LIm+uj8OpUDYWw6QN/jhQvMG4P++sK
+ v5dUV4Bc6J3En5LBPNbiGnA+T7bEkwVO50QXxURUG5fPYNgamLycBX3C22DI6b9aSsSS5Xt
+ H3W0/qbbIPeilRW9LuEHyI6sjVb46FTn/qWlIVvxSPY11SHgdB2mDIlw8aH3dofG4O6DQt5
+ BvuRSnYfQYB09maYnyMN3LHw3YazqjRzD5Ope6WS3kMD0rTUSb03gOnakDOg==
+Return-Path: <offers@bkzvqrelay.com>
+Received: from smtp1.bkzvqrelay.com (smtp1.bkzvqrelay.com [104.168.94.212])
+	by mx4.baycrestmail.com with ESMTPS id A52475;
+	Thu, 18 Jun 2026 06:12:33 -0400
+From: Exclusive Savings <offers@bkzvqrelay.com>
+To: mrosen@baycrestmail.com
+Subject: Final notice: your $100 fuel rewards card is waiting
+Date: Thu, 18 Jun 2026 06:12:31 -0400
+Message-ID: <bulk.20260618.44172@bkzvqrelay.com>
+List-Unsubscribe: <http://bkzvqrelay.com/u/44172>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Congratulations! You have been selected to receive a $100 fuel
+rewards card. This offer expires TONIGHT.
+
+Claim yours: http://bkzvqrelay.com/claim?id=44172
+
+No purchase necessary. Unsubscribe: http://bkzvqrelay.com/u/44172

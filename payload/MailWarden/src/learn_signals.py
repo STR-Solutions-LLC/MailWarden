@@ -21,6 +21,7 @@ The Claude prompt enforces a ≤ 12-word plain-English headline, no
 rhetorical flourishes, and a "what this doesn't cover" line so users
 can second-guess the generalization before approving.
 """
+from __future__ import annotations
 
 import email
 import email.header
@@ -42,6 +43,8 @@ import time
 
 import anthropic
 
+import file_lock
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
 SIGNALS_PATH = PROJECT_ROOT / "memory" / "signals.json"
@@ -58,6 +61,12 @@ LOG_PATH = PROJECT_ROOT / "logs" / "learner.log"
 # pending_signals.json. Whoever holds this exclusive lock runs; others exit.
 LOCK_PATH = PROJECT_ROOT / "logs" / ".learner.lock"
 TOKEN_USAGE_PATH = PROJECT_ROOT / "memory" / "token_usage.json"
+# The learner's own scan watermark. Kept in its OWN small file (not config.json)
+# so updating it can never revert a concurrent Dashboard config save (audit L3).
+# Migration: read_learner_scan_timestamp falls back ONCE to the legacy
+# config['signal_learner']['last_scan_timestamp'] when this file is absent, so
+# existing installs never re-scan (and re-bill) every old .eml.
+LEARNER_STATE_PATH = PROJECT_ROOT / "memory" / "learner_state.json"
 
 
 # ---------------------------------------------------------------------------
@@ -84,22 +93,71 @@ def load_config() -> dict:
         return json.load(f)
 
 
-def save_config(config: dict) -> None:
-    fd, tmp = tempfile.mkstemp(dir=CONFIG_PATH.parent, suffix=".tmp")
+def read_learner_scan_timestamp(config: dict) -> str | None:
+    """Return the learner's last scan watermark (audit L3).
+
+    Reads memory/learner_state.json if present. When that file does NOT exist
+    yet (a pre-this-change install), fall back ONCE to the legacy
+    config['signal_learner']['last_scan_timestamp'] so existing installs do not
+    re-scan and re-bill every old .eml. If neither exists, return None
+    (preserving today's "scan everything" first-run behavior).
+    """
     try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(config, f, indent=2)
-        os.replace(tmp, CONFIG_PATH)
-    except Exception:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-        raise
+        with open(LEARNER_STATE_PATH, "r") as f:
+            ts = json.load(f).get("last_scan_timestamp")
+            if ts:
+                return ts
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return (config.get("signal_learner", {}) or {}).get("last_scan_timestamp")
+
+
+def save_learner_scan_timestamp(when_iso: str) -> None:
+    """Persist the learner's scan watermark to memory/learner_state.json under
+    lock (audit L3). Atomic mkstemp+os.replace, matching the module's save
+    style. NEVER writes config.json, so a concurrent Dashboard save survives."""
+    LEARNER_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock.locked(LEARNER_STATE_PATH):
+        fd, tmp = tempfile.mkstemp(dir=LEARNER_STATE_PATH.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump({"last_scan_timestamp": when_iso}, f, indent=2)
+            os.replace(tmp, LEARNER_STATE_PATH)
+        except Exception:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+
+
+# Retired shipped-default signals (fix a-1). Stripped in-memory on every load so
+# existing installs whose memory/signals.json inherited them stop surfacing them
+# without a forced disk rewrite. EXACT-match only — never substring — so a
+# genuine user-taught signal is never collateral. Keep in sync across the 4 copies.
+_RETIRED_DEFAULT_SIGNALS = frozenset({
+    "Benign conversational text block (meeting scheduling, personal reflection) prepended before promotional/scam content - used as filter evasion",
+    "CSS class names using random nature/object word combinations (e.g., 'nebula-quartz', 'pebble-orbit', 'aurora-cinder', 'thistle-comet') in HTML emails",
+    "Mismatch between casual/personal opening paragraphs and promotional closing content",
+    "Points/rewards expiration urgency with specific dollar amounts ($100)",
+})
+
+
+def scrub_retired_signals(data: dict) -> dict:
+    """Strip retired shipped-default signals in-memory. Returns the same dict."""
+    if not isinstance(data, dict):
+        return data
+    sig = data.get("signals")
+    if isinstance(sig, dict):
+        for key in ("hard_signals", "soft_signals"):
+            vals = sig.get(key)
+            if isinstance(vals, list):
+                sig[key] = [s for s in vals if s not in _RETIRED_DEFAULT_SIGNALS]
+    return data
 
 
 def load_signals() -> dict:
     try:
         with open(SIGNALS_PATH, "r") as f:
-            return json.load(f)
+            return scrub_retired_signals(json.load(f))
     except (FileNotFoundError, json.JSONDecodeError):
         return {
             "version": "1.0",
@@ -126,6 +184,50 @@ def save_signals(data: dict) -> None:
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
+
+
+def merge_save_signals_delta(reinforced_delta: dict,
+                             derived_increment: int = 0) -> None:
+    """Persist ONLY the learner's own reinforcement delta onto a FRESH copy of
+    signals.json, under lock (audit L1).
+
+    The learner loads a snapshot at run start and a long run follows; blind-
+    saving that snapshot erases anything the user changed via the Dashboard in
+    the meantime (e.g. an approved refinement, or a deleted one). Instead we
+    re-read the file under lock and apply only what THIS run changed:
+
+      * reinforced_delta maps refinement-id -> {"increment": n,
+        "last_reinforced": iso, "new_evidence": [filenames...]}. For each id
+        that STILL EXISTS in the fresh file we bump its match_count by the
+        increment, set last_reinforced, and prepend the new evidence (deduped,
+        capped at 10 — identical to handle_duplicate's own cap).
+      * derived_increment is added to derived_from_examples.
+
+    We NEVER add an id that is absent from fresh (no resurrecting a refinement
+    the user deleted mid-run) and never overwrite a fresh entry's other fields
+    with stale snapshot values.
+    """
+    with file_lock.locked(SIGNALS_PATH):
+        fresh = load_signals()
+        by_id = {r.get("id"): r for r in fresh.get("ai_refinements", [])}
+        for rid, change in (reinforced_delta or {}).items():
+            target = by_id.get(rid)
+            if target is None:
+                # Deleted on disk mid-run — do not resurrect it.
+                continue
+            target["match_count"] = (int(target.get("match_count", 1))
+                                     + int(change.get("increment", 0)))
+            if change.get("last_reinforced"):
+                target["last_reinforced"] = change["last_reinforced"]
+            evidence = target.setdefault("evidence", [])
+            for fname in reversed(change.get("new_evidence", []) or []):
+                if fname not in evidence:
+                    evidence.insert(0, fname)
+            target["evidence"] = evidence[:10]
+        if derived_increment:
+            fresh["derived_from_examples"] = (
+                int(fresh.get("derived_from_examples", 0)) + int(derived_increment))
+        save_signals(fresh)
 
 
 def load_pending_signals() -> dict:
@@ -155,24 +257,39 @@ def append_refinement_log(event: dict) -> None:
 
 
 def next_sfid(pending: dict) -> str:
+    """Generate an unguessable SFID-YYYYMMDD-<hextoken> conversation ID.
+
+    Byte-identical format to spam_filter.generate_sfid so one resolver regex
+    matches both. Random (not sequential) so IDs cannot collide or be forged;
+    regenerates on the unlikely chance of colliding with an existing id.
+    """
+    from utils import random_token
     today = datetime.now().strftime("%Y%m%d")
-    prefix = f"SFID-{today}-"
-    existing = [c["id"] for c in pending.get("conversations", [])
-                if c.get("id", "").startswith(prefix)]
-    return f"{prefix}{len(existing) + 1:03d}"
+    existing = {c.get("id", "") for c in pending.get("conversations", [])}
+    while True:
+        sfid = f"SFID-{today}-{random_token()}"
+        if sfid not in existing:
+            return sfid
 
 
 def next_refinement_id(signals_data: dict) -> str:
+    """Generate an unguessable R-YYYYMMDD-<hextoken> refinement ID.
+
+    Random (not sequential) so IDs cannot collide; uniqueness-checked against
+    existing ai_refinements ids plus any pending proposed_refinement ids.
+    """
+    from utils import random_token
     today = datetime.now().strftime("%Y%m%d")
-    prefix = f"R-{today}-"
-    existing = [r["id"] for r in signals_data.get("ai_refinements", [])
-                if r.get("id", "").startswith(prefix)]
+    existing = {r.get("id", "") for r in signals_data.get("ai_refinements", [])}
     pend = load_pending_signals()
     for c in pend.get("conversations", []):
         rid = (c.get("proposed_refinement") or {}).get("id", "")
-        if rid.startswith(prefix):
-            existing.append(rid)
-    return f"{prefix}{len(set(existing)) + 1:03d}"
+        if rid:
+            existing.add(rid)
+    while True:
+        rid = f"R-{today}-{random_token()}"
+        if rid not in existing:
+            return rid
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +455,7 @@ def build_learner_prompt(new_examples: list[dict],
         if ex.get("received_headers"):
             lines.append("Received headers (first 3):")
             for h in ex["received_headers"]:
-                lines.append(f"  {h[:300]}")
+                lines.append(f"  {_sanitize_learner_delimiter(str(h))[:300]}")
         lines.append("Body excerpt:")
         lines.append(_sanitize_learner_delimiter(ex.get("plain_text_body", "")[:800]))
         lines.append("</untrusted_email>")
@@ -507,7 +624,7 @@ def build_teach_prompt(example: dict, direction: str,
     if example.get("received_headers"):
         lines.append("Received headers (first 3):")
         for h in example["received_headers"][:3]:
-            lines.append(f"  {str(h)[:300]}")
+            lines.append(f"  {_sanitize_learner_delimiter(str(h))[:300]}")
     lines.append("Body excerpt:")
     lines.append(_sanitize_learner_delimiter(
         (example.get("plain_text_body", "") or "")[:800]))
@@ -785,30 +902,33 @@ def propose_from_teaching(eml_bytes: bytes, *, direction: str,
         if entry is None:
             return {"status": "declined",
                     "reason": "no sender address could be read from that email"}
-        pending = load_pending_signals()
-        sfid = next_sfid(pending)
-        now = datetime.now().isoformat()
-        expires = (datetime.now() + timedelta(days=7)).isoformat()
-        conv = {
-            "id": sfid,
-            "kind": "block_sender_proposal",
-            "status": "awaiting_reply",
-            "created": now,
-            "expires": expires,
-            "original_message_id": "",
-            "original_from": str(msg.get("From", "") or ""),
-            "original_subject": _decode(msg.get("Subject", "") or ""),
-            "forwarder": (str(originating_account).strip()
-                          if originating_account else ""),
-            "blocklist_entry": entry,
-            "resolution": None,
-            "conversation_history": [
-                {"role": "system", "timestamp": now,
-                 "content": "Block-this-sender proposed from the Check an Email "
-                            "screen"}],
-        }
-        pending.setdefault("conversations", []).append(conv)
-        save_pending_signals(pending)
+        # Allocate the SFID and append the proposal in ONE lock hold so a
+        # concurrent learner cannot erase this proposal or duplicate its ID (T5).
+        with file_lock.locked(PENDING_SIGNALS_PATH):
+            pending = load_pending_signals()
+            sfid = next_sfid(pending)
+            now = datetime.now().isoformat()
+            expires = (datetime.now() + timedelta(days=7)).isoformat()
+            conv = {
+                "id": sfid,
+                "kind": "block_sender_proposal",
+                "status": "awaiting_reply",
+                "created": now,
+                "expires": expires,
+                "original_message_id": "",
+                "original_from": str(msg.get("From", "") or ""),
+                "original_subject": _decode(msg.get("Subject", "") or ""),
+                "forwarder": (str(originating_account).strip()
+                              if originating_account else ""),
+                "blocklist_entry": entry,
+                "resolution": None,
+                "conversation_history": [
+                    {"role": "system", "timestamp": now,
+                     "content": "Block-this-sender proposed from the Check an Email "
+                                "screen"}],
+            }
+            pending.setdefault("conversations", []).append(conv)
+            save_pending_signals(pending)
         append_refinement_log({
             "ts": now, "event": "proposed", "id": sfid, "sfid": sfid,
             "headline": f"Block sender {entry['kind']}: {entry['value']}",
@@ -879,36 +999,40 @@ def propose_from_teaching(eml_bytes: bytes, *, direction: str,
                                "account was given to apply it to")}
         scope = resolved
 
-    refinement_id = next_refinement_id(signals_data)
-    refinement = teaching_refinement_from_classification(
-        cls, verdict=direction, scope=scope,
-        refinement_id=refinement_id, evidence_name="checked-email")
-    if refinement is None:
-        return {"status": "declined",
-                "reason": "no reliable, general rule could be derived"}
+    # Allocate the refinement ID + SFID and append the proposal in ONE lock
+    # hold so the IDs are unique against a concurrent learner and the proposal
+    # cannot be erased before it is recorded (T5).
+    with file_lock.locked(PENDING_SIGNALS_PATH):
+        refinement_id = next_refinement_id(signals_data)
+        refinement = teaching_refinement_from_classification(
+            cls, verdict=direction, scope=scope,
+            refinement_id=refinement_id, evidence_name="checked-email")
+        if refinement is None:
+            return {"status": "declined",
+                    "reason": "no reliable, general rule could be derived"}
 
-    pending = load_pending_signals()
-    sfid = next_sfid(pending)
-    now = datetime.now().isoformat()
-    expires = (datetime.now() + timedelta(days=7)).isoformat()
-    conv = {
-        "id": sfid,
-        "kind": "spam_example_proposal",
-        "status": "awaiting_reply",
-        "created": now,
-        "expires": expires,
-        "original_message_id": "",
-        "original_from": example["from"],
-        "original_subject": example["subject"],
-        "forwarder": "",
-        "proposed_refinement": refinement,
-        "resolution": None,
-        "conversation_history": [
-            {"role": "system", "timestamp": now,
-             "content": f"Proposed from the Check an Email screen ({direction})"}],
-    }
-    pending.setdefault("conversations", []).append(conv)
-    save_pending_signals(pending)
+        pending = load_pending_signals()
+        sfid = next_sfid(pending)
+        now = datetime.now().isoformat()
+        expires = (datetime.now() + timedelta(days=7)).isoformat()
+        conv = {
+            "id": sfid,
+            "kind": "spam_example_proposal",
+            "status": "awaiting_reply",
+            "created": now,
+            "expires": expires,
+            "original_message_id": "",
+            "original_from": example["from"],
+            "original_subject": example["subject"],
+            "forwarder": "",
+            "proposed_refinement": refinement,
+            "resolution": None,
+            "conversation_history": [
+                {"role": "system", "timestamp": now,
+                 "content": f"Proposed from the Check an Email screen ({direction})"}],
+        }
+        pending.setdefault("conversations", []).append(conv)
+        save_pending_signals(pending)
     append_refinement_log({
         "ts": now, "event": "proposed", "id": refinement_id, "sfid": sfid,
         "headline": refinement["headline"],
@@ -929,70 +1053,56 @@ def _record_learner_tokens(input_tokens: int, output_tokens: int,
     the two processes may write concurrently so we need the same atomic
     rename pattern here.
     """
-    # Minimal pricing table — keep in sync with spam_filter.MODEL_PRICING
-    _PRICING = {
-        "claude-opus-4-5":           (5.00, 25.00),
-        "claude-opus-4-6":           (5.00, 25.00),
-        "claude-opus-4-7":           (5.00, 25.00),
-        "claude-sonnet-4-20250514":  (3.00, 15.00),
-        "claude-sonnet-4-5":         (3.00, 15.00),
-        "claude-sonnet-4-6":         (3.00, 15.00),
-        "claude-haiku-4":            (1.00,  5.00),
-        "claude-haiku-4-5":          (1.00,  5.00),
-        "claude-haiku-4-5-20251001": (1.00,  5.00),
-    }
-    in_rate, out_rate = _PRICING.get(model, (3.00, 15.00))
-    cost = (input_tokens / 1_000_000) * in_rate + (output_tokens / 1_000_000) * out_rate
     today = datetime.now().strftime("%Y-%m-%d")
 
     try:
-        try:
-            with open(TOKEN_USAGE_PATH, "r") as f:
-                usage_data = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            usage_data = {
-                "version": "1.0", "last_updated": "",
-                "lifetime_input_tokens": 0, "lifetime_output_tokens": 0,
-                "lifetime_api_calls": 0, "daily_records": [],
-            }
+        # Hold the token-usage lock across the whole re-read + add + save so the
+        # filter and daily report cannot lose this learner spend (L5). The
+        # re-read INSIDE the lock makes this a correct locked merge as-is.
+        with file_lock.locked(TOKEN_USAGE_PATH):
+            try:
+                with open(TOKEN_USAGE_PATH, "r") as f:
+                    usage_data = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                usage_data = {
+                    "version": "1.0", "last_updated": "",
+                    "lifetime_input_tokens": 0, "lifetime_output_tokens": 0,
+                    "lifetime_api_calls": 0, "daily_records": [],
+                }
 
-        usage_data["lifetime_input_tokens"] += input_tokens
-        usage_data["lifetime_output_tokens"] += output_tokens
-        usage_data["lifetime_api_calls"] += 1
+            usage_data["lifetime_input_tokens"] += input_tokens
+            usage_data["lifetime_output_tokens"] += output_tokens
+            usage_data["lifetime_api_calls"] += 1
 
-        daily = usage_data.get("daily_records", [])
-        today_record = None
-        for rec in daily:
-            if rec.get("date") == today:
-                today_record = rec
-                break
-        if today_record is None:
-            today_record = {
-                "date": today, "input_tokens": 0, "output_tokens": 0,
-                "api_calls": 0, "api_calls_skipped_by_pre_classifier": 0,
-                "estimated_cost_usd": 0.0,
-            }
-            daily.append(today_record)
+            daily = usage_data.get("daily_records", [])
+            today_record = None
+            for rec in daily:
+                if rec.get("date") == today:
+                    today_record = rec
+                    break
+            if today_record is None:
+                today_record = {
+                    "date": today, "input_tokens": 0, "output_tokens": 0,
+                    "api_calls": 0, "api_calls_skipped_by_pre_classifier": 0,
+                }
+                daily.append(today_record)
 
-        today_record["input_tokens"] += input_tokens
-        today_record["output_tokens"] += output_tokens
-        today_record["api_calls"] += 1
-        today_record["estimated_cost_usd"] = round(
-            today_record["estimated_cost_usd"] + cost, 6
-        )
-        today_record.setdefault("api_calls_skipped_by_pre_classifier", 0)
-        usage_data["daily_records"] = daily
-        usage_data["last_updated"] = datetime.now().isoformat()
+            today_record["input_tokens"] += input_tokens
+            today_record["output_tokens"] += output_tokens
+            today_record["api_calls"] += 1
+            today_record.setdefault("api_calls_skipped_by_pre_classifier", 0)
+            usage_data["daily_records"] = daily
+            usage_data["last_updated"] = datetime.now().isoformat()
 
-        fd, tmp_path = tempfile.mkstemp(dir=TOKEN_USAGE_PATH.parent, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(usage_data, f, indent=2)
-            os.replace(tmp_path, TOKEN_USAGE_PATH)
-        except Exception:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-            raise
+            fd, tmp_path = tempfile.mkstemp(dir=TOKEN_USAGE_PATH.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(usage_data, f, indent=2)
+                os.replace(tmp_path, TOKEN_USAGE_PATH)
+            except Exception:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+                raise
     except Exception as e:
         logger.warning(f"Failed to record learner token usage: {e}")
 
@@ -1008,25 +1118,53 @@ def call_claude(prompt: str, api_config: dict,
             resp = client.messages.create(
                 model=model,
                 max_tokens=4000,
+                temperature=0,
                 system=system,
                 messages=[{"role": "user", "content": prompt}],
             )
             if hasattr(resp, "usage") and resp.usage is not None:
                 _record_learner_tokens(resp.usage.input_tokens,
                                        resp.usage.output_tokens, model, logger)
-            text = resp.content[0].text.strip()
+            # W8: do NOT assume content[0] is text — a thinking or tool_use block
+            # can come first. Find the first text block; if there is none, fail
+            # this call cleanly instead of raising AttributeError (which would be
+            # swallowed by the generic handler and kill the whole batch).
+            text = next((b.text for b in (resp.content or [])
+                         if getattr(b, "type", None) == "text"), None)
+            if text is None:
+                # Tolerate SDK/mock blocks that expose .text without a typed kind.
+                text = next((b.text for b in (resp.content or [])
+                             if isinstance(getattr(b, "text", None), str)), None)
+            if text is None:
+                logger.error("Learner API response had no text content block")
+                return None
+            text = text.strip()
             if text.startswith("```"):
                 text = re.sub(r"^```\w*\n?", "", text)
                 text = re.sub(r"\n?```$", "", text).strip()
-            return json.loads(text)
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError as e:
+                # W9: salvage JSON wrapped in prose — pull the outermost {...}
+                # span and parse that, mirroring classify_email's prose salvage.
+                # Without this a single chatty response fails the whole learner
+                # batch and re-bills every tick (the watermark never advances).
+                salvage = re.search(r"\{.*\}", text, re.DOTALL)
+                if salvage:
+                    try:
+                        parsed = json.loads(salvage.group())
+                        logger.warning(
+                            f"Learner JSON salvaged from prose (original error: {e})")
+                        return parsed
+                    except json.JSONDecodeError:
+                        pass
+                logger.error(f"Failed to parse learner API response: {e}")
+                return None
         except anthropic.RateLimitError:
             import time as _time
             wait = (2 ** attempt) * 5
             logger.warning(f"Rate limited, waiting {wait}s (attempt {attempt + 1}/3)")
             _time.sleep(wait)
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse learner API response: {e}")
-            return None
         except Exception as e:
             logger.error(f"Claude API call failed: {e}")
             return None
@@ -1066,6 +1204,11 @@ def _send(config: dict, to_addr: str, subject: str, body: str,
         m["From"] = smtp_config.get("from_address",
                                      smtp_config.get("username", ""))
         m["To"] = to_addr
+        m["X-MailWarden-System"] = "1"
+        if to_addr:
+            # Ensure the owner's reply returns to the same mailbox this email
+            # was sent to (which is polled), not back to the SMTP From address.
+            m["Reply-To"] = to_addr
         return m
 
     def _get_server():
@@ -1127,26 +1270,94 @@ def _pick_recipient(example: dict, config: dict) -> str:
 def handle_duplicate(classification: dict, example: dict,
                      signals_data: dict, config: dict,
                      logger: logging.Logger,
-                     smtp_conn: list | None = None) -> bool:
+                     smtp_conn: list | None = None,
+                     delta: dict | None = None) -> bool:
     """Update an existing active refinement with the new example evidence
-    and email a short 'another example of ...' acknowledgment."""
+    and email a short 'another example of ...' acknowledgment.
+
+    The in-memory ``signals_data`` snapshot is still mutated (so the email/log
+    below report the right counts), but the persistent change is recorded into
+    ``delta`` and applied to a FRESH file at save time via
+    merge_save_signals_delta — see audit L1. ``delta`` maps refinement-id ->
+    {"increment": n, "last_reinforced": iso, "new_evidence": [filenames]}.
+
+    CONTRADICTION GUARD (Feature 4, Option B): when the matched rule is one the
+    owner explicitly taught as verdict=="legitimate" (via the dashboard's Check
+    an Email flow), reinforcing it would strengthen a rule AGAINST the owner's
+    own correction. In that case NOTHING is written — no match_count bump, no
+    evidence, no delta — and this function returns False, mirroring the
+    "rule not found" fallback below so the caller's accounting (signals_needs_save
+    / derived_count in _run) treats this example as yielding no signal. The
+    watermark still advances because _run persists it unconditionally — the
+    example WAS processed, it just wasn't reinforced.
+    """
     rid = classification.get("refinement_id", "")
     target = None
     for r in signals_data.get("ai_refinements", []):
-        if r.get("id") == rid:
+        # Only an ACTIVE rule can be matched. A retired rule (dropped by the
+        # owner via retire_ai_refinement — id kept, status flipped, never
+        # deleted) must not be silently reinforced if a stale/hallucinated
+        # duplicate_of still names it; it falls through to the "not found"
+        # path below exactly like a truly-missing id.
+        if r.get("id") == rid and r.get("status", "active") == "active":
             target = r
             break
     if target is None:
         logger.warning(f"  [LEARNER] duplicate_of {rid} but not found; treating as new")
         return False
 
+    if (target.get("verdict") or "").strip().lower() == "legitimate":
+        # The owner taught this rule as "legitimate" — a Train drop that
+        # matches it contradicts that correction. Refuse to reinforce; do not
+        # touch match_count / evidence / last_reinforced / delta. Normalize the
+        # verdict the SAME way _build_learned_lines does (.strip().lower()) so a
+        # legacy/hand-edited "Legitimate" or " legitimate " — which the
+        # classifier already treats as legitimate — is blocked here too, closing
+        # the asymmetry where the classifier and the guard could disagree.
+        append_refinement_log({
+            "ts": datetime.now().isoformat(),
+            "event": "reinforce_blocked_contradiction",
+            "id": rid,
+            "example": example["filename"],
+            "note": classification.get("note", ""),
+        })
+        logger.info(f"  [LEARNER] Blocked reinforcement of {rid} (marked "
+                    f"legitimate) — Train drop {example['filename']} contradicts "
+                    f"it: {target.get('headline', '')[:60]}")
+        to_addr = _pick_recipient(example, config)
+        subject = ("MailWarden left a rule unchanged — your Train drop looked "
+                   "like a 'legitimate' rule")
+        body = (
+            f"MailWarden guessed that the email you dropped into Train "
+            f"matched a rule you taught it to treat as legitimate, so it "
+            f"left that rule unchanged.\n\n"
+            f"Rule:  {target.get('headline', '')}\n"
+            f"Refinement ID: {rid}\n\n"
+            f"If it really is spam, use Check an Email in the Dashboard, or "
+            f"drop it into Train again with a short note on why it's spam.\n"
+        )
+        _send(config, to_addr, subject, body, logger, smtp_conn)
+        return False
+
+    reinforced_at = datetime.now().isoformat()
     target["match_count"] = int(target.get("match_count", 1)) + 1
-    target["last_reinforced"] = datetime.now().isoformat()
+    target["last_reinforced"] = reinforced_at
     evidence = target.setdefault("evidence", [])
     if example["filename"] not in evidence:
         evidence.insert(0, example["filename"])
         # Cap visible evidence list at 10; older matches live in the log.
         target["evidence"] = evidence[:10]
+
+    # Record the persistent delta for the locked merge-save (L1). Multiple
+    # duplicates of the same rule in one run accumulate the increment and the
+    # evidence list; the latest reinforced timestamp wins.
+    if delta is not None:
+        d = delta.setdefault(rid, {"increment": 0, "last_reinforced": "",
+                                   "new_evidence": []})
+        d["increment"] += 1
+        d["last_reinforced"] = reinforced_at
+        if example["filename"] not in d["new_evidence"]:
+            d["new_evidence"].insert(0, example["filename"])
 
     append_refinement_log({
         "ts": datetime.now().isoformat(),
@@ -1160,18 +1371,18 @@ def handle_duplicate(classification: dict, example: dict,
                 f"{target.get('headline', '')[:60]}")
 
     to_addr = _pick_recipient(example, config)
-    subject = f"Another example of {target.get('headline', 'a known pattern')[:60]}"
+    subject = ("MailWarden strengthened a rule from your Train drop — please "
+               "double-check")
     body = (
-        f"MailWarden recognized your forwarded example as another instance of "
-        f"a pattern it has already learned.\n\n"
+        f"You dropped an email into Train. MailWarden guessed it's another "
+        f"example of a rule it already learned, and strengthened that rule "
+        f"automatically.\n\n"
         f"Pattern:  {target.get('headline', '')}\n"
         f"Refinement ID: {rid}\n"
         f"Examples matched so far: {target['match_count']}\n\n"
-        f"No action is required. The refinement remains active.\n\n"
-        f"If you disagree and think this example is NOT like the others, "
-        f"you can remove the refinement from Dashboard -> Signal History, "
-        f"or reply to this email with the words \"not a match\" and I'll "
-        f"flag it for review.\n"
+        f"This was a guess, not something you approved — please glance at "
+        f"it. If it's wrong, open Dashboard -> Signal History and click "
+        f"Delete on this rule's card to remove it.\n"
     )
     _send(config, to_addr, subject, body, logger, smtp_conn)
     return True
@@ -1192,71 +1403,77 @@ def handle_new_pattern(classification: dict, example: dict,
         logger.warning(f"  [LEARNER] new_pattern without headline — skipping")
         return False
 
-    refinement_id = next_refinement_id(signals_data)
-    refinement = {
-        "id": refinement_id,
-        "kind": kind,
-        "headline": headline,
-        "rationale": rationale,
-        "what_this_doesnt_cover": disclaimer,
-        "confidence": confidence,
-        "evidence": [example["filename"]],
-        "first_learned": datetime.now().isoformat(),
-        "last_reinforced": datetime.now().isoformat(),
-        "match_count": 1,
-        "status": "proposed",
-    }
-    # P1 scope capture: bind this learned rule to the inbox that taught it.
-    # The forwarder is the account username stamped on the example via the
-    # X-MailWarden-Forwarder header (both the training-folder drop and the
-    # forward-with-explanation paths set it). originating_account = forwarder.
-    #
-    # rule_class: the email-forward learner does not yet classify protect vs.
-    # curate, so a forwarded example normally carries no rule_class. In that
-    # case we PRESERVE the pre-existing P1 capture (scope to the forwarder, or
-    # "all" when there is none) and record the rule as "protect" (its effective,
-    # threat-style behavior). When a rule_class IS present we resolve scope via
-    # the shared _resolve_scope: a curate rule with no forwarder cannot be
-    # account-scoped, so per R2 it becomes "all" (migration-safe) and we log it.
-    forwarder = (example.get("forwarder", "") or "").strip().lower()
-    raw_rule_class = (classification.get("rule_class") or "").strip().lower()
-    if raw_rule_class in ("protect", "curate"):
-        resolved = _resolve_scope(raw_rule_class, classification.get("apply_scope"),
-                                  forwarder)
-        if resolved is _SCOPE_NEEDS_EXPLICIT:
-            logger.info("  [LEARNER] curate rule with no forwarder — scoping to "
-                        "'all' (migration-safe; owner can re-scope)")
-            resolved = "all"
-        refinement["scope"] = resolved
-        refinement["rule_class"] = raw_rule_class
-    else:
-        # Pre-existing behavior preserved verbatim for the un-classified forward
-        # path; record the effective threat class for downstream rendering.
-        refinement["scope"] = [forwarder] if forwarder else "all"
-        refinement["rule_class"] = "protect"
+    # Allocate the refinement ID + SFID and append the proposal in ONE lock
+    # hold so the IDs are unique against a concurrent learner/check-screen and
+    # the proposal can't be erased before it is recorded (T5). The scope
+    # resolution in between touches no shared file, so holding the lock across
+    # it is cheap and keeps ID allocation atomic with the append.
+    with file_lock.locked(PENDING_SIGNALS_PATH):
+        refinement_id = next_refinement_id(signals_data)
+        refinement = {
+            "id": refinement_id,
+            "kind": kind,
+            "headline": headline,
+            "rationale": rationale,
+            "what_this_doesnt_cover": disclaimer,
+            "confidence": confidence,
+            "evidence": [example["filename"]],
+            "first_learned": datetime.now().isoformat(),
+            "last_reinforced": datetime.now().isoformat(),
+            "match_count": 1,
+            "status": "proposed",
+        }
+        # P1 scope capture: bind this learned rule to the inbox that taught it.
+        # The forwarder is the account username stamped on the example via the
+        # X-MailWarden-Forwarder header (both the training-folder drop and the
+        # forward-with-explanation paths set it). originating_account = forwarder.
+        #
+        # rule_class: the email-forward learner does not yet classify protect vs.
+        # curate, so a forwarded example normally carries no rule_class. In that
+        # case we PRESERVE the pre-existing P1 capture (scope to the forwarder, or
+        # "all" when there is none) and record the rule as "protect" (its effective,
+        # threat-style behavior). When a rule_class IS present we resolve scope via
+        # the shared _resolve_scope: a curate rule with no forwarder cannot be
+        # account-scoped, so per R2 it becomes "all" (migration-safe) and we log it.
+        forwarder = (example.get("forwarder", "") or "").strip().lower()
+        raw_rule_class = (classification.get("rule_class") or "").strip().lower()
+        if raw_rule_class in ("protect", "curate"):
+            resolved = _resolve_scope(raw_rule_class, classification.get("apply_scope"),
+                                      forwarder)
+            if resolved is _SCOPE_NEEDS_EXPLICIT:
+                logger.info("  [LEARNER] curate rule with no forwarder — scoping to "
+                            "'all' (migration-safe; owner can re-scope)")
+                resolved = "all"
+            refinement["scope"] = resolved
+            refinement["rule_class"] = raw_rule_class
+        else:
+            # Pre-existing behavior preserved verbatim for the un-classified forward
+            # path; record the effective threat class for downstream rendering.
+            refinement["scope"] = [forwarder] if forwarder else "all"
+            refinement["rule_class"] = "protect"
 
-    pending = load_pending_signals()
-    sfid = next_sfid(pending)
-    expires = (datetime.now() + timedelta(days=7)).isoformat()
-    conv = {
-        "id": sfid,
-        "kind": "spam_example_proposal",
-        "status": "awaiting_reply",
-        "created": datetime.now().isoformat(),
-        "expires": expires,
-        "original_message_id": "",
-        "original_from": example.get("from", ""),
-        "original_subject": example.get("subject", ""),
-        "forwarder": example.get("forwarder", ""),
-        "proposed_refinement": refinement,
-        "resolution": None,
-        "conversation_history": [
-            {"role": "system", "timestamp": datetime.now().isoformat(),
-             "content": f"Proposal generated from {example['filename']}"}
-        ],
-    }
-    pending.setdefault("conversations", []).append(conv)
-    save_pending_signals(pending)
+        pending = load_pending_signals()
+        sfid = next_sfid(pending)
+        expires = (datetime.now() + timedelta(days=7)).isoformat()
+        conv = {
+            "id": sfid,
+            "kind": "spam_example_proposal",
+            "status": "awaiting_reply",
+            "created": datetime.now().isoformat(),
+            "expires": expires,
+            "original_message_id": "",
+            "original_from": example.get("from", ""),
+            "original_subject": example.get("subject", ""),
+            "forwarder": example.get("forwarder", ""),
+            "proposed_refinement": refinement,
+            "resolution": None,
+            "conversation_history": [
+                {"role": "system", "timestamp": datetime.now().isoformat(),
+                 "content": f"Proposal generated from {example['filename']}"}
+            ],
+        }
+        pending.setdefault("conversations", []).append(conv)
+        save_pending_signals(pending)
 
     append_refinement_log({
         "ts": datetime.now().isoformat(),
@@ -1316,6 +1533,23 @@ def handle_new_pattern(classification: dict, example: dict,
         f"  [LEARNER] Proposed {refinement_id} ({sfid}) to {to_addr} "
         f"({'sent' if sent else 'send FAILED'}): {headline[:60]}"
     )
+    if not sent:
+        # Finding #19: the proposal email did NOT reach the owner. Record it
+        # honestly and durably (mirrors spam_filter's "apply_failed" convention)
+        # instead of swallowing the failure. No retry / re-queue: _send already
+        # retried once, and the proposal is already saved to pending_signals.json
+        # so it still shows in the Dashboard's Pending proposals — re-sending
+        # would re-bill/re-classify each tick (the anti-pattern earlier findings
+        # removed). return True stays: a signal WAS derived from this example.
+        append_refinement_log({
+            "ts": datetime.now().isoformat(),
+            "event": "send_failed",
+            "id": refinement_id,
+            "sfid": sfid,
+            "headline": headline,
+            "reason": f"proposal email to {to_addr} failed to send",
+            "source": "learner",
+        })
     return True
 
 
@@ -1351,8 +1585,20 @@ def _run(logger: logging.Logger) -> int:
         logger.info(f"No examples folder at {folder} — nothing to learn")
         return 0
 
-    last_scan = learner_cfg.get("last_scan_timestamp")
+    # Read the scan watermark from learner_state.json (falling back ONCE to the
+    # legacy config value for existing installs — see read_learner_scan_timestamp).
+    last_scan = read_learner_scan_timestamp(config)
     last_scan_dt = datetime.fromisoformat(last_scan) if last_scan else None
+
+    # B8: capture the scan-start instant BEFORE listing files, and persist THIS
+    # as the new watermark at the end of the run. The old code stamped the
+    # watermark with datetime.now() at the END of the run, so an example dropped
+    # into the folder WHILE this run was processing (mtime after the listing but
+    # before the end stamp) fell behind the watermark and was never analyzed on
+    # any future run. Anchoring the watermark to scan_start guarantees any file
+    # modified after we listed is still strictly newer than the watermark and is
+    # picked up next run (at worst re-processed, never silently lost).
+    scan_start = datetime.now()
 
     new_files = _new_eml_files(folder, last_scan_dt)
     if not new_files:
@@ -1373,6 +1619,10 @@ def _run(logger: logging.Logger) -> int:
     signals_data = load_signals()
     active_refinements = [r for r in signals_data.get("ai_refinements", [])
                            if r.get("status", "active") == "active"]
+    # M11: bound the in-prompt dedup context to the 25 newest-active refinements,
+    # matching the classifier's cap (spam_filter: active = active[::-1][:25]).
+    # Unbounded, the learner prompt grows without limit after many approvals.
+    active_refinements = active_refinements[::-1][:25]
 
     prompt = build_learner_prompt(examples, active_refinements)
     result = call_claude(prompt, config.get("anthropic", {}), logger)
@@ -1392,25 +1642,43 @@ def _run(logger: logging.Logger) -> int:
     smtp_conn: list = [None]
 
     signals_needs_save = False
+    # Persistent reinforcement delta from this run's duplicates (audit L1).
+    reinforced_delta: dict = {}
+    # M13: count ONLY the examples that actually produced a derived signal (a new
+    # proposal or a reinforcement). derived_from_examples must not be inflated by
+    # no_rule/unknown examples, nor left unchanged when a run yields only new
+    # patterns — both were possible before.
+    derived_count = 0
     try:
         for i, cls in enumerate(classifications):
             if i > 0:
                 time.sleep(0.5)       # politeness throttle between sends
-            target_file = (cls.get("example") or "").strip()
-            ex = by_filename.get(target_file)
-            if ex is None:
-                logger.warning(f"Classification references unknown example: {target_file!r}")
+            # W9: isolate per-example failures. A single malformed classification
+            # or a handler error must not abort the whole batch — that would also
+            # skip the watermark advance and re-bill every example on the next tick.
+            try:
+                target_file = (cls.get("example") or "").strip()
+                ex = by_filename.get(target_file)
+                if ex is None:
+                    logger.warning(f"Classification references unknown example: {target_file!r}")
+                    continue
+                kind = (cls.get("kind") or "").lower()
+                if kind == "duplicate_of":
+                    if handle_duplicate(cls, ex, signals_data, config, logger,
+                                        smtp_conn, delta=reinforced_delta):
+                        signals_needs_save = True
+                        derived_count += 1
+                elif kind in ("new_pattern", "add_infrastructure"):
+                    if handle_new_pattern(cls, ex, signals_data, config, logger,
+                                          smtp_conn):
+                        derived_count += 1
+                else:
+                    logger.warning(f"Unknown classification kind {kind!r} for {target_file}")
+            except Exception as e:
+                ref = cls.get("example", "?") if isinstance(cls, dict) else "?"
+                logger.error(f"Failed to process classification {ref!r}: {e}",
+                             exc_info=True)
                 continue
-            kind = (cls.get("kind") or "").lower()
-            if kind == "duplicate_of":
-                if handle_duplicate(cls, ex, signals_data, config, logger,
-                                    smtp_conn):
-                    signals_needs_save = True
-            elif kind in ("new_pattern", "add_infrastructure"):
-                handle_new_pattern(cls, ex, signals_data, config, logger,
-                                   smtp_conn)
-            else:
-                logger.warning(f"Unknown classification kind {kind!r} for {target_file}")
     finally:
         # Always close the shared SMTP connection, even if something raised.
         if smtp_conn[0] is not None:
@@ -1420,15 +1688,22 @@ def _run(logger: logging.Logger) -> int:
                 pass
             smtp_conn[0] = None
 
-    if signals_needs_save:
-        signals_data["derived_from_examples"] = int(
-            signals_data.get("derived_from_examples", 0)) + len(examples)
-        save_signals(signals_data)
+    if signals_needs_save or derived_count:
+        # Apply ONLY this run's delta onto a fresh, under-lock copy of
+        # signals.json — never blind-save the stale run-start snapshot (L1).
+        # M13: derived_from_examples advances by derived_count — the number of
+        # examples that actually yielded a signal this run — NOT len(examples),
+        # which over-counted no_rule/unknown examples and (because only a
+        # duplicate set signals_needs_save) skipped runs that produced only new
+        # patterns. When only new patterns were proposed the delta is empty and
+        # this call just bumps the counter.
+        merge_save_signals_delta(reinforced_delta, derived_increment=derived_count)
 
-    # Update last_scan_timestamp so the next run only considers fresh .emls.
-    config.setdefault("signal_learner", {})["last_scan_timestamp"] = \
-        datetime.now().isoformat()
-    save_config(config)
+    # Update the learner's scan watermark in its OWN file (NOT config.json), so
+    # a concurrent Dashboard config save is never reverted (L3). The value is the
+    # scan-start instant captured BEFORE the file listing (B8), not the end of
+    # the run, so an example saved mid-run is never stranded behind the watermark.
+    save_learner_scan_timestamp(scan_start.isoformat())
 
     logger.info(f"Signal learner complete: processed {len(examples)} examples, "
                 f"{len(classifications)} classifications; "

@@ -118,3 +118,39 @@ if [ -f "$ICON_ICNS" ] && [ -f "$SET_ICON" ]; then
 fi
 
 log "Done. Signed + notarized + stapled: $SIGNED"
+
+# ----------------------------------------------------------------------------
+# Permanent project convention: every installer is also delivered as
+# "MailWarden-<version>.pkg" (version read from app/setup_app.py — the single
+# source of truth, never hardcoded here) next to the signed output, plus a
+# convenience copy on the Desktop. Purely additive: the "-signed.pkg" file
+# above is left in place untouched. Safe to re-run — existing files at either
+# destination are overwritten.
+REPO_ROOT="$(cd "$CODESIGN_DIR/.." && pwd)"
+SETUP_APP_PY="$REPO_ROOT/app/setup_app.py"
+APP_VERSION=""
+if [ -f "$SETUP_APP_PY" ]; then
+    # `|| true` so a no-match (grep exits 1) degrades to an empty string and
+    # reaches the warning path below, instead of tripping `set -euo pipefail`
+    # and aborting an already-successful sign+notarize+staple.
+    APP_VERSION="$(grep -m1 -E '^VERSION[[:space:]]*=[[:space:]]*"' "$SETUP_APP_PY" \
+        | sed -E 's/^VERSION[[:space:]]*=[[:space:]]*"([^"]*)".*$/\1/' || true)"
+fi
+
+if [ -z "$APP_VERSION" ]; then
+    log "WARNING: could not read VERSION from $SETUP_APP_PY — skipping versioned/Desktop copies. The notarized .pkg is still valid at $SIGNED"
+else
+    VERSIONED_PKG="$(dirname "$SIGNED")/MailWarden-${APP_VERSION}.pkg"
+    if cp -f "$SIGNED" "$VERSIONED_PKG"; then
+        log "Versioned copy: $VERSIONED_PKG"
+    else
+        log "WARNING: failed to create versioned copy at $VERSIONED_PKG"
+    fi
+
+    DESKTOP_PKG="$HOME/Desktop/MailWarden-${APP_VERSION}.pkg"
+    if cp -f "$SIGNED" "$DESKTOP_PKG" 2>/dev/null; then
+        log "Desktop copy: $DESKTOP_PKG"
+    else
+        log "WARNING: could not copy to Desktop ($DESKTOP_PKG) — permissions or disk full? The notarized .pkg is still valid at $SIGNED"
+    fi
+fi

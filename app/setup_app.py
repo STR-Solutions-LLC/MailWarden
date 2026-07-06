@@ -20,7 +20,7 @@ from setuptools import setup
 
 HERE = Path(__file__).parent.resolve()
 APP_NAME = "MailWarden"
-VERSION = "1.6.0-beta.16.1"
+VERSION = "1.7.0"
 
 # ----------------------------------------------------------------------------
 # Copy the shared bundled defaults and runtime payload into app/resources/
@@ -58,9 +58,37 @@ def _tree_to_data_files(root: Path, bundle_prefix: str) -> list[tuple[str, list[
     return sorted(groups.items())
 
 
+# Explicit allowlist mirrors bootstrap.py PAYLOAD_DIRS + PAYLOAD_FILES.
+# Default-deny: memory/, logs/, .claude-mpm/, .lock sidecars, and any
+# future junk at the payload root are excluded unless added here.
+_PAYLOAD_DIRS = ["src", "blacklist"]
+_PAYLOAD_FILES = ["EULA.md", "LICENSE", "requirements.txt"]
+
+
+def _payload_data_files(root: Path, bundle_prefix: str) -> list[tuple[str, list[str]]]:
+    """Walk only the allowlisted payload subdirs/files; everything else is excluded."""
+    groups: dict[str, list[str]] = {}
+    for subdir in _PAYLOAD_DIRS:
+        subdir_path = root / subdir
+        if not subdir_path.is_dir():
+            continue
+        for f in subdir_path.rglob("*"):
+            if "__pycache__" in f.parts or ".claude-mpm" in f.parts or f.suffix in (".pyc", ".pyo"):
+                continue
+            if f.is_file():
+                rel_dir = f.parent.relative_to(root).as_posix()
+                bundle_dir = f"{bundle_prefix}/{rel_dir}"
+                groups.setdefault(bundle_dir, []).append(str(f))
+    for fname in _PAYLOAD_FILES:
+        f = root / fname
+        if f.is_file():
+            groups.setdefault(bundle_prefix, []).append(str(f))
+    return sorted(groups.items())
+
+
 DATA_FILES: list[tuple[str, list[str]]] = []
 DATA_FILES += _tree_to_data_files(LOCAL_DEFAULTS, "defaults")
-DATA_FILES += _tree_to_data_files(LOCAL_PAYLOAD, "payload/MailWarden")
+DATA_FILES += _payload_data_files(LOCAL_PAYLOAD, "payload/MailWarden")
 
 
 # ----------------------------------------------------------------------------
@@ -95,7 +123,7 @@ PLIST = {
 
 OPTIONS = {
     "argv_emulation": False,
-    "arch": "universal2",
+    "arch": "arm64",
     # site_packages=True copies the entire build-venv site-packages into the
     # bundle. This is heavier than curating a packages= list, but it is the
     # only reliable way to ship single-module packages (typing_extensions)
@@ -122,6 +150,13 @@ OPTIONS = {
         "idna",
         "jiter",
         "docstring_parser",
+        # local DKIM verification (audit a-2) + its DNS backend. Both are
+        # lazily imported INSIDE functions (utils.verify_dkim_locally,
+        # _dkim_get_txt, check_ip_reputation) — exactly the pattern py2app's
+        # modulegraph drops. Without these, ModuleNotFoundError at runtime and
+        # local DKIM verification / DNSBL silently no-op in the shipped app.
+        "dkim",
+        "dns",
         # spreadsheet import/export (Dashboard Whitelist/Blacklist tab)
         "openpyxl",
         "et_xmlfile",

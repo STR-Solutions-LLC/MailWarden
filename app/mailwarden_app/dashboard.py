@@ -20,8 +20,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from . import breadth_advisor
 from . import config_io
 from . import explain_text
+from . import file_lock
 from . import help_content
 from . import paths
 from . import smappservice_install
@@ -30,11 +32,35 @@ from . import theme
 from . import validators
 
 
+# Classification-mode selector: (label, classify_mode, model_value).
+# model_value is the single-model id, or None for the cascade entry — the
+# cascade's per-stage models live in config (anthropic.screen_model /
+# anthropic.confirm_model, config-file-only by design; Matt, 2026-07-02).
+# Labels are Matt's approved final wording — do not edit without approval.
 MODEL_CHOICES = [
-    ("Claude Haiku — fastest & cheapest (recommended)", "claude-haiku-4-5-20251001"),
-    ("Claude Sonnet — more accurate, more expensive", "claude-sonnet-4-6"),
-    ("Claude Opus — most accurate, most expensive", "claude-opus-4-7"),
+    ("Two-model double-check (recommended)", "cascade", None),
+    ("Claude Haiku only — cheapest", "single", "claude-haiku-4-5-20251001"),
+    ("Claude Sonnet only — more accurate, costs more", "single", "claude-sonnet-4-6"),
+    ("Claude Opus only — most accurate, most expensive", "single", "claude-opus-4-7"),
 ]
+
+# Advisory shown under the mode dropdown. Matt's approved final wording.
+MODEL_ADVISORY_TEXT = (
+    "Double-check: Haiku screens all mail; Sonnet re-checks anything flagged "
+    "junk. Mail is junked only when both agree. Single-model modes skip the "
+    "second check."
+)
+
+
+def apply_model_choice(anthro: dict, mode: str, model_value):
+    """Write a MODEL_CHOICES selection onto the anthropic config block.
+
+    Sets classify_mode always; sets `model` only for a single-model choice
+    (the cascade entry leaves `model` untouched so switching back to a
+    single mode restores the user's previous single-model pick)."""
+    anthro["classify_mode"] = mode
+    if mode == "single" and model_value is not None:
+        anthro["model"] = model_value
 
 
 def scope_from_toggle_state(account_usernames, on_usernames):
@@ -114,6 +140,24 @@ def pending_proposal_label(refinement):
     return _PENDING_LABEL_DEFAULT
 
 
+def pending_retired_message():
+    """Owner-facing ack when a Dashboard approval names a rule the owner dropped.
+
+    Finding #8: approving a proposal does not un-drop a rule. The Dashboard CAN
+    now restore a dropped rule (Feature 2: Signal History -> Dropped rules), so
+    this points the owner there — and notes the email RESTORE reply (finding #10)
+    still works — instead of falsely claiming the rule is now active.
+    Pure (no tk, no IO) so the copy is unit-tested headlessly.
+    """
+    return (
+        "This proposal matches a learned rule you dropped earlier, so it was not "
+        "turned back on. Approving here does not un-drop a rule.\n\n"
+        "To turn it back on, open Signal History → Dropped rules and click "
+        "Restore next to it. (Replying RESTORE to the daily-report email still "
+        "works too.)"
+    )
+
+
 # =============================================================================
 # Main window
 # =============================================================================
@@ -171,6 +215,7 @@ class Dashboard(tk.Tk):
         self.accounts_tab = AccountsTab(self.notebook, self)
         self.lists_tab = ListsTab(self.notebook, self)
         self.signals_tab = SignalsTab(self.notebook, self)
+        self.unwanted_tab = UnwantedCategoriesTab(self.notebook, self)
         self.check_tab = CheckEmailTab(self.notebook, self)
         self.usage_tab = UsageTab(self.notebook, self)
         self.settings_tab = SettingsTab(self.notebook, self)
@@ -182,6 +227,7 @@ class Dashboard(tk.Tk):
             (self.accounts_tab, "Accounts"),
             (self.lists_tab, "Whitelist / Blacklist"),
             (self.signals_tab, "Signal History"),
+            (self.unwanted_tab, "Unwanted Categories"),
             (self.check_tab, "Check an Email"),
             (self.usage_tab, "API Usage"),
             (self.settings_tab, "Settings"),
@@ -472,6 +518,7 @@ class Dashboard(tk.Tk):
         self.accounts_tab.refresh()
         self.lists_tab.refresh()
         self.signals_tab.refresh()
+        self.unwanted_tab.refresh()
         self.usage_tab.refresh()
         self.settings_tab.refresh()
         self.diagnostics_tab.refresh()
@@ -522,6 +569,7 @@ class Dashboard(tk.Tk):
                         account["imap_host"],
                         int(account.get("imap_port", 993)),
                         timeout=10,
+                        ssl_context=validators.make_tls_context(),
                     )
                     try:
                         conn.login(account["username"], account["password"])
@@ -631,7 +679,8 @@ class Dashboard(tk.Tk):
             try:
                 conn = imaplib.IMAP4_SSL(account["imap_host"],
                                           int(account.get("imap_port", 993)),
-                                          timeout=10)
+                                          timeout=10,
+                                          ssl_context=validators.make_tls_context())
                 try:
                     conn.login(account["username"], account["password"])
                     # Use the wildcard helper so we find the folder whether
@@ -717,7 +766,8 @@ class Dashboard(tk.Tk):
             try:
                 conn = imaplib.IMAP4_SSL(a["imap_host"],
                                           int(a.get("imap_port", 993)),
-                                          timeout=10)
+                                          timeout=10,
+                                          ssl_context=validators.make_tls_context())
                 try:
                     conn.login(a["username"], a["password"])
                     # Quote the mailbox name. Python's imaplib does NOT
@@ -961,10 +1011,10 @@ class HomeTab(ttk.Frame):
         for a in config.get("accounts", []):
             row = ttk.Frame(self._accounts_frame)
             row.pack(fill=tk.X, pady=2)
-            badge = "●" if a.get("enabled") else "○"
+            badge = "●" if a.get("enabled", True) else "○"
             ttk.Label(row,
                       text=f"{badge}  {a.get('name','(unnamed)')}  —  {a.get('username','(no address)')}",
-                      foreground=("#1a7f37" if a.get("enabled") else "#666")).pack(side=tk.LEFT)
+                      foreground=("#1a7f37" if a.get("enabled", True) else "#666")).pack(side=tk.LEFT)
 
         # Stats from decisions.log
         today, week, life = _decision_counts()
@@ -1026,9 +1076,11 @@ class HomeTab(ttk.Frame):
             ):
                 self._dry_run_var.set(True)
                 return
-        config = config_io.load_config()
-        config.setdefault("filter", {})["dry_run"] = new_val
-        config_io.save_config(config)
+        # C7: fresh read + write under the lock so a peer's concurrent config
+        # change isn't reverted; we touch ONLY filter.dry_run.
+        def _set(c):
+            c.setdefault("filter", {})["dry_run"] = new_val
+        config_io.update_config(_set)
         self.refresh()
 
     def _on_run_now(self):
@@ -1082,11 +1134,19 @@ class HomeTab(ttk.Frame):
         # timestamp advances. The Dashboard's 60s _periodic_refresh remains the
         # backstop so the label is never permanently stale.
         baseline = _last_filter_run()
-        self._start_run_now_poll(baseline, deadline_ticks=15)
-        messagebox.showinfo("Running",
-                             "Filter started. Come back in a minute to see updated stats.")
 
-    def _start_run_now_poll(self, baseline, deadline_ticks: int):
+        def _on_run_complete(ran: bool) -> None:
+            if ran:
+                messagebox.showinfo("Filter Complete", "Filter ran — stats updated.")
+            else:
+                messagebox.showinfo(
+                    "Filter Busy",
+                    "Run requested, but the filter may have been skipped —\n"
+                    "another run may have been in progress. Stats unchanged.",
+                )
+        self._start_run_now_poll(baseline, deadline_ticks=15, on_done=_on_run_complete)
+
+    def _start_run_now_poll(self, baseline, deadline_ticks: int, on_done=None):
         """Poll _last_filter_run() every 2s up to deadline_ticks times, calling
         refresh() each tick, and stop early once the run timestamp advances past
         baseline. Guarded against teardown: any pending poll is cancelled on
@@ -1108,6 +1168,8 @@ class HomeTab(ttk.Frame):
             advanced = current is not None and (
                 baseline is None or current > baseline)
             if advanced or remaining <= 0:
+                if on_done is not None:
+                    on_done(advanced)
                 return
             try:
                 self._run_now_poll_after = self.after(
@@ -1283,7 +1345,7 @@ class AccountsTab(ttk.Frame):
                 a.get("name", ""),
                 a.get("username", ""),
                 a.get("junk_folder", "—"),
-                "Yes" if a.get("enabled") else "No",
+                "Yes" if a.get("enabled", True) else "No",
             ))
 
     def _selected_index(self) -> int | None:
@@ -1297,9 +1359,13 @@ class AccountsTab(ttk.Frame):
         dlg = setup_assistant.AccountFormDialog(self.app)
         self.app.wait_window(dlg)
         if dlg.saved_account is not None:
-            config = config_io.load_config()
-            config.setdefault("accounts", []).append(dlg.saved_account)
-            config_io.save_config(config)
+            # C7: the dialog ran (user interaction) BETWEEN the old load and
+            # save — a stale-snapshot window. Apply ONLY the accounts append on
+            # a FRESH read under the lock so a peer's concurrent config change
+            # isn't reverted.
+            def _append(config):
+                config.setdefault("accounts", []).append(dlg.saved_account)
+            config_io.update_config(_append)
             self.app.refresh_all()
 
     def _on_edit(self):
@@ -1307,35 +1373,41 @@ class AccountsTab(ttk.Frame):
         if idx is None:
             return
         from . import setup_assistant
-        config = config_io.load_config()
-        existing = config["accounts"][idx]
+        existing = config_io.load_config()["accounts"][idx]
         dlg = setup_assistant.AccountFormDialog(self.app, existing=existing)
         self.app.wait_window(dlg)
         if dlg.saved_account is not None:
-            config["accounts"][idx] = dlg.saved_account
-            config_io.save_config(config)
+            # C7: dialog interaction between read and write — replace ONLY the
+            # account at idx on a fresh read under the lock.
+            def _replace(config):
+                config["accounts"][idx] = dlg.saved_account
+            config_io.update_config(_replace)
             self.app.refresh_all()
 
     def _on_remove(self):
         idx = self._selected_index()
         if idx is None:
             return
-        config = config_io.load_config()
-        name = config["accounts"][idx]["name"]
+        name = config_io.load_config()["accounts"][idx]["name"]
         if not messagebox.askyesno("Remove account?",
                                     f"Remove account '{name}' from MailWarden?"):
             return
-        del config["accounts"][idx]
-        config_io.save_config(config)
+        # C7: askyesno interaction between read and write — delete ONLY the
+        # account at idx on a fresh read under the lock.
+        def _delete(config):
+            del config["accounts"][idx]
+        config_io.update_config(_delete)
         self.app.refresh_all()
 
     def _on_toggle(self):
         idx = self._selected_index()
         if idx is None:
             return
-        config = config_io.load_config()
-        config["accounts"][idx]["enabled"] = not config["accounts"][idx].get("enabled", True)
-        config_io.save_config(config)
+        # C7: flip ONLY accounts[idx].enabled on a fresh read under the lock.
+        def _flip(config):
+            config["accounts"][idx]["enabled"] = \
+                not config["accounts"][idx].get("enabled", True)
+        config_io.update_config(_flip)
         self.app.refresh_all()
 
 
@@ -1535,41 +1607,49 @@ class ListsTab(ttk.Frame):
                     if not proceed:
                         return
 
-                # --- Deduplication ---
-                data = config_io.load_blacklist()
-                if val in {d.lower() for d in data.get("domains", [])}:
-                    messagebox.showinfo("Already blocked",
-                                        f"'{val}' is already on the blacklist.",
-                                        parent=self.app)
-                    return
-                data.setdefault("domains", []).append(val)
-                config_io.save_blacklist(data)
+                # --- Deduplication + write (C7: dedup-load + append + save
+                # under one lock so a concurrent writer of blacklist.json isn't
+                # clobbered; the fresh read inside the lock is the dedup read). ---
+                with file_lock.locked(paths.BLACKLIST_PATH):
+                    data = config_io.load_blacklist()
+                    if val in {d.lower() for d in data.get("domains", [])}:
+                        messagebox.showinfo("Already blocked",
+                                            f"'{val}' is already on the blacklist.",
+                                            parent=self.app)
+                        return
+                    data.setdefault("domains", []).append(val)
+                    config_io.save_blacklist(data)
             else:
-                # Whitelist domain
-                data = config_io.load_whitelist()
-                if val in {d.lower() for d in data.get("domains", [])}:
-                    messagebox.showinfo("Already whitelisted",
-                                        f"'{val}' is already on the whitelist.",
-                                        parent=self.app)
-                    return
-                data.setdefault("domains", []).append(val)
-                config_io.save_whitelist(data)
+                # Whitelist domain (C7: dedup-load + append + save under lock).
+                with file_lock.locked(paths.WHITELIST_PATH):
+                    data = config_io.load_whitelist()
+                    if val in {d.lower() for d in data.get("domains", [])}:
+                        messagebox.showinfo("Already whitelisted",
+                                            f"'{val}' is already on the whitelist.",
+                                            parent=self.app)
+                        return
+                    data.setdefault("domains", []).append(val)
+                    config_io.save_whitelist(data)
         elif which == "whitelist":
             val = val.strip()
-            data = config_io.load_whitelist()
-            key = "addresses" if kind == "address" else "domains"
-            if val.lower() not in {x.lower() for x in data[key]}:
-                data[key].append(val)
-                config_io.save_whitelist(data)
+            # C7: dedup-load + append + save under one lock.
+            with file_lock.locked(paths.WHITELIST_PATH):
+                data = config_io.load_whitelist()
+                key = "addresses" if kind == "address" else "domains"
+                if val.lower() not in {x.lower() for x in data[key]}:
+                    data[key].append(val)
+                    config_io.save_whitelist(data)
         else:
             val = val.strip()
-            data = config_io.load_blacklist()
-            key = {"address": "addresses",
-                   "display_name": "display_names",
-                   "subject_keyword": "subject_keywords"}[kind]
-            if val.lower() not in {x.lower() for x in data.setdefault(key, [])}:
-                data[key].append(val)
-                config_io.save_blacklist(data)
+            # C7: dedup-load + append + save under one lock.
+            with file_lock.locked(paths.BLACKLIST_PATH):
+                data = config_io.load_blacklist()
+                key = {"address": "addresses",
+                       "display_name": "display_names",
+                       "subject_keyword": "subject_keywords"}[kind]
+                if val.lower() not in {x.lower() for x in data.setdefault(key, [])}:
+                    data[key].append(val)
+                    config_io.save_blacklist(data)
         self.refresh()
 
     def _remove_entry(self, which: str):
@@ -1579,22 +1659,26 @@ class ListsTab(ttk.Frame):
             return
         kind, value = tree.item(sel[0], "values")
         if which == "whitelist":
-            data = config_io.load_whitelist()
-            key = "addresses" if kind == "address" else "domains"
-            data[key] = [x for x in data[key] if x.lower() != value.lower()]
-            config_io.save_whitelist(data)
+            # C7: load + filter + save under one lock (fresh read under lock).
+            with file_lock.locked(paths.WHITELIST_PATH):
+                data = config_io.load_whitelist()
+                key = "addresses" if kind == "address" else "domains"
+                data[key] = [x for x in data[key] if x.lower() != value.lower()]
+                config_io.save_whitelist(data)
         else:
-            data = config_io.load_blacklist()
-            if kind == "address":
-                key = "addresses"
-            elif kind == "domain":
-                key = "domains"
-            elif kind == "subject_keyword":
-                key = "subject_keywords"
-            else:
-                key = "display_names"
-            data[key] = [x for x in data.get(key, []) if x.lower() != value.lower()]
-            config_io.save_blacklist(data)
+            # C7: load + filter + save under one lock (fresh read under lock).
+            with file_lock.locked(paths.BLACKLIST_PATH):
+                data = config_io.load_blacklist()
+                if kind == "address":
+                    key = "addresses"
+                elif kind == "domain":
+                    key = "domains"
+                elif kind == "subject_keyword":
+                    key = "subject_keywords"
+                else:
+                    key = "display_names"
+                data[key] = [x for x in data.get(key, []) if x.lower() != value.lower()]
+                config_io.save_blacklist(data)
         self.refresh()
 
     def _on_import_csv(self):
@@ -1950,12 +2034,21 @@ class CheckEmailTab(ttk.Frame):
             anthro = cfg.get("anthropic", {}) or {}
             api_key = os.environ.get("ANTHROPIC_API_KEY", "") \
                 or anthro.get("api_key", "") or ""
-            model = anthro.get("model") or "claude-haiku-4-5-20251001"
+            # Follow the configured classification mode so this screen's
+            # answer matches what the live filter actually does. In cascade
+            # mode the screen model is anthropic.screen_model, not .model.
+            classify_mode = anthro.get("classify_mode", "cascade")
+            confirm_model = anthro.get("confirm_model", "claude-sonnet-4-6")
+            if classify_mode == "cascade":
+                model = anthro.get("screen_model") or "claude-haiku-4-5-20251001"
+            else:
+                model = anthro.get("model") or "claude-haiku-4-5-20251001"
             threshold = (cfg.get("filter", {}) or {}).get(
                 "confidence_threshold", 0.85)
 
             res = spam_filter.classify_eml_offline(
                 raw_bytes, signals, api_key=api_key, model=model,
+                classify_mode=classify_mode, confirm_model=confirm_model,
                 threshold=threshold, account_name=None,
                 whitelist=whitelist, blacklist=blacklist)
             self.app.after(0, self._render_result, res, threshold)
@@ -2554,6 +2647,12 @@ class SignalsTab(ttk.Frame):
             self._f, text="Active AI refinements (in effect)", height=200)
         self._active_box.pack(fill=tk.X, pady=(0, 8))
 
+        self._dropped_box = _ScrollSection(
+            self._f,
+            text="Dropped rules (retired — click Restore to turn back on)",
+            height=160)
+        self._dropped_box.pack(fill=tk.X, pady=(0, 8))
+
         self._pending_box = _ScrollSection(
             self._f, text="Pending proposals (awaiting your reply)", height=180)
         self._pending_box.pack(fill=tk.X, pady=(0, 8))
@@ -2580,6 +2679,7 @@ class SignalsTab(ttk.Frame):
 
     def refresh(self):
         self._render_active()
+        self._render_dropped()
         self._render_pending()
         self._render_history()
         self._render_examples()
@@ -2587,9 +2687,9 @@ class SignalsTab(ttk.Frame):
         # Re-bind wheel handlers on every section after rendering. The old
         # bindings were destroyed along with the old child widgets, so
         # scrolling would go dead after the first refresh without this.
-        for section in (self._active_box, self._pending_box,
-                         self._history_box, self._examples_box,
-                         self._standard_box):
+        for section in (self._active_box, self._dropped_box,
+                         self._pending_box, self._history_box,
+                         self._examples_box, self._standard_box):
             section.bind_wheel_recursive()
 
     def _make_card(self, parent) -> ttk.Frame:
@@ -2622,8 +2722,13 @@ class SignalsTab(ttk.Frame):
     def _render_active(self):
         self._active_box.clear()
         body = self._active_box.body
+        # Owner-authored curate rules are managed in their own "Unwanted
+        # Categories" tab (add / enable-disable / delete there), so they are
+        # kept out of this learned-rules view to avoid a second, confusing
+        # management surface for the same rule.
         refinements = sorted(
-            config_io.list_active_refinements(),
+            (r for r in config_io.list_active_refinements()
+             if r.get("source") != config_io.AUTHORED_SOURCE),
             key=lambda r: r.get("last_reinforced", r.get("first_learned", "")),
             reverse=True)
         if not refinements:
@@ -2708,6 +2813,80 @@ class SignalsTab(ttk.Frame):
             return
         if config_io.delete_active_refinement(refinement_id, source="dashboard"):
             self.refresh()
+
+    # ---- Dropped (retired) rules ----
+
+    def _render_dropped(self):
+        """Feature 2: retired (email-dropped) rules, newest drop first, each with
+        a Restore button. Always shown (empty-state label, not hidden) so the
+        owner learns where dropped rules go. Only the email DROP corridor retires
+        a rule; the Delete button removes it outright, so deleted rules never
+        appear here."""
+        self._dropped_box.clear()
+        body = self._dropped_box.body
+        # A disabled owner-authored rule is also status "retired"; keep those
+        # out of this email-dropped-rules panel — they are enabled/disabled from
+        # the "Unwanted Categories" tab, not restored from here.
+        retired = sorted(
+            (r for r in config_io.list_retired_refinements()
+             if r.get("source") != config_io.AUTHORED_SOURCE),
+            key=lambda r: r.get("retired_at", ""),
+            reverse=True)
+        if not retired:
+            ttk.Label(
+                body, style="Muted.TLabel", wraplength=720,
+                text=("No dropped rules. When you reply DROP to a daily-report "
+                      "rule review, the rule lands here so you can restore it "
+                      "anytime.")
+            ).pack(anchor=tk.W)
+            return
+        for r in retired:
+            self._render_dropped_card(body, r)
+
+    def _render_dropped_card(self, body, r: dict):
+        card = self._make_card(body)
+        headline = r.get("headline") or "(no headline)"
+        self._card_label(card, headline, style="Subheading.TLabel")
+        meta = (f"{r.get('kind', 'new_pattern')}  ·  "
+                f"confidence {r.get('confidence', 'medium')}  ·  "
+                f"dropped {r.get('retired_at', '')[:16]}  ·  "
+                f"first learned {r.get('first_learned', '')[:16]}  ·  "
+                f"ID {r.get('id', '')}")
+        self._card_label(card, meta, style="Muted.TLabel")
+        if r.get("rationale"):
+            self._card_label(card, f"Why: {r['rationale']}", pady=(4, 0))
+        evidence = r.get("evidence") or []
+        if evidence:
+            shown = ", ".join(evidence[:5])
+            more = (f"  (+{len(evidence) - 5} more)"
+                    if len(evidence) > 5 else "")
+            self._card_label(card, f"Evidence: {shown}{more}",
+                              style="Muted.TLabel")
+        # No scope-toggle row: a retired rule isn't firing, so there is nothing
+        # to scope. Restore first; scope it from the Active section afterwards.
+        btns = ttk.Frame(card)
+        btns.pack(anchor=tk.W, pady=(6, 0))
+        rid = r.get("id", "")
+        ttk.Button(btns, text="Restore", style="Primary.TButton",
+                   command=lambda i=rid: self._on_restore_dropped(i)).pack(
+                       side=tk.LEFT)
+
+    def _on_restore_dropped(self, refinement_id: str):
+        if not refinement_id:
+            return
+        restored = config_io.restore_refinement(refinement_id, source="dashboard")
+        if restored is not None:
+            messagebox.showinfo(
+                "Restored",
+                f"Rule {restored.get('id', '')} is active again and will be "
+                f"used on the next check.")
+        else:
+            # #7/#8 honesty: NEVER claim a restore that didn't happen.
+            messagebox.showinfo(
+                "Nothing to restore",
+                "That rule is no longer in your dropped list — it may have "
+                "been restored or removed already. Refreshing.")
+        self.refresh()
 
     # ---- Pending proposals ----
 
@@ -2796,17 +2975,21 @@ class SignalsTab(ttk.Frame):
         btns = ttk.Frame(card)
         btns.pack(anchor=tk.W, pady=(8, 0))
         sfid = conv.get("id", "")
-        if kind in ("spam_example_proposal", "block_sender_proposal"):
+        # Every pending kind is now one-click approvable from the Dashboard:
+        # false_positive narrowings route through apply_fp_narrowing_from_pending
+        # (Feature 1), joining the spam-example and block-sender proposals that
+        # already offered Approve + Reject here. FP conversations carry no
+        # explicit "kind", so they arrive as the "false_positive" default set at
+        # the top of this method. An unknown/future kind gets Withdraw only — we
+        # never offer to Approve a proposal we don't recognize.
+        if kind in ("spam_example_proposal", "block_sender_proposal",
+                    "false_positive"):
             ttk.Button(btns, text="Approve", style="Primary.TButton",
                        command=lambda s=sfid: self._on_approve_pending(s)).pack(
                            side=tk.LEFT)
             ttk.Button(btns, text="Reject",
                        command=lambda s=sfid: self._on_reject_pending(s)).pack(
                            side=tk.LEFT, padx=(6, 0))
-        else:
-            ttk.Label(btns, style="Muted.TLabel",
-                      text="(False-positive narrowings: reply to the email "
-                            "to approve.)").pack(side=tk.LEFT)
         ttk.Button(btns, text="Withdraw",
                    command=lambda s=sfid: self._on_withdraw_pending(s)).pack(
                        side=tk.LEFT, padx=(6, 0))
@@ -2822,7 +3005,10 @@ class SignalsTab(ttk.Frame):
         pending = config_io.load_pending_signals()
         conv = next((c for c in pending.get("conversations", [])
                      if c.get("id") == sfid), None)
-        kind = (conv or {}).get("kind", "")
+        # FP conversations carry no explicit "kind"; default to "false_positive"
+        # so they route to the FP branch below (matches _render_pending_card and
+        # the engine's own conv.get("kind", "false_positive")).
+        kind = (conv or {}).get("kind", "false_positive")
 
         if kind == "block_sender_proposal":
             entry = config_io.apply_blocklist_proposal_from_pending(
@@ -2840,17 +3026,48 @@ class SignalsTab(ttk.Frame):
             self.refresh()
             return
 
+        if kind == "false_positive":
+            # Feature 1: approve a false-positive narrowing here instead of only
+            # by email reply. Honor the #7/#8 honesty rule — NEVER showinfo on a
+            # no-op/failure. All five outcomes are mapped explicitly.
+            result = config_io.apply_fp_narrowing_from_pending(
+                sfid, source="dashboard")
+            status = (result or {}).get("status")
+            if result is None:
+                messagebox.showerror(
+                    "Could not apply",
+                    f"SFID {sfid} not found or not approvable from the Dashboard.")
+            elif status == "applied":
+                messagebox.showinfo(
+                    "Applied",
+                    f"Refinement {result.get('id', '')} is now active.")
+            elif status == "already_active":
+                messagebox.showinfo(
+                    "Already active",
+                    "That refinement is already active — nothing changed.")
+            elif status == "retired":
+                messagebox.showwarning("Not reactivated", pending_retired_message())
+            elif status == "no_change":
+                messagebox.showerror(
+                    "Couldn't apply",
+                    "MailWarden couldn't read a proposed change in that "
+                    "proposal, so nothing was applied. It's still pending.")
+            self.refresh()
+            return
+
         # Content ai_refinement (spam_example_proposal).
-        applied = config_io.apply_refinement_from_pending(sfid, source="dashboard")
-        if applied:
-            messagebox.showinfo(
-                "Applied",
-                f"Refinement {applied.get('id', '')} is now active.")
-        else:
+        result = config_io.apply_refinement_from_pending(sfid, source="dashboard")
+        if result is None:
             messagebox.showerror(
                 "Could not apply",
-                f"SFID {sfid} not found or not approvable from the Dashboard "
-                f"(false-positive narrowings must be approved by email reply).")
+                f"SFID {sfid} not found or not approvable from the Dashboard.")
+        elif result.get("status") == "retired":
+            # Finding #8: the rule was dropped; approving here can't un-drop it.
+            messagebox.showwarning("Not reactivated", pending_retired_message())
+        else:
+            messagebox.showinfo(
+                "Applied",
+                f"Refinement {result.get('id', '')} is now active.")
         self.refresh()
 
     def _on_reject_pending(self, sfid: str):
@@ -3032,6 +3249,300 @@ class SignalsTab(ttk.Frame):
 
 
 # =============================================================================
+# UNWANTED CATEGORIES  (owner-authored curate rules — Batch C)
+# =============================================================================
+class UnwantedCategoriesTab(ttk.Frame):
+    """Author, list, turn on/off, and delete your own 'unwanted category' rules.
+
+    A rule here tells MailWarden about a kind of legitimate mail you've decided
+    you don't want (for example, political fundraising from a particular party).
+    You describe the category in plain words — no example email needed. Under
+    the hood these are the SAME curate rules MailWarden makes when you teach it
+    from an example; the only difference is you wrote this one yourself
+    (config_io.AUTHORED_SOURCE). They only affect mail that arrives AFTER you
+    add them, and never touch a sender on your Whitelist.
+    """
+
+    def __init__(self, parent, app: Dashboard):
+        super().__init__(parent)
+        self.app = app
+        self._scroll = _ScrollableTab(self)
+        self._scroll.pack(fill=tk.BOTH, expand=True)
+        self._f = ttk.Frame(self._scroll.body, padding=(12, 8))
+        self._f.pack(fill=tk.BOTH, expand=True)
+        self._desc_var = tk.StringVar()
+        self._scope_vars: "list[tuple[str, tk.BooleanVar]]" = []
+        self._busy = False
+        self._build()
+        self.refresh()
+
+    # ---- build ----
+
+    def _build(self):
+        ttk.Label(
+            self._f, style="Muted.TLabel", wraplength=760,
+            text=("Tell MailWarden about a kind of mail you've decided you "
+                  "don't want — even when it's perfectly legitimate. Describe "
+                  "the category in your own words (for example, \"political "
+                  "fundraising from Republican campaigns\" or \"webinar "
+                  "invitations from software companies\"). MailWarden will move "
+                  "mail that clearly matches into your junk folder from now on. "
+                  "This only affects mail that arrives after you add the rule — "
+                  "it never reaches back into mail you've already received.")
+        ).pack(anchor=tk.W, pady=(0, 6))
+
+        ttk.Label(
+            self._f, style="Muted.TLabel", wraplength=760,
+            text=("Keep the description specific. A vague rule like "
+                  "\"newsletters\" could hide mail you actually want. If there "
+                  "are senders you always want to hear from, add them to your "
+                  "Whitelist (Whitelist / Blacklist tab) — a category rule "
+                  "never junks a whitelisted sender.")
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        form = ttk.LabelFrame(self._f, text="Add an unwanted category",
+                              padding=(10, 8))
+        form.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(form, text="Describe the category you don't want:",
+                  style="Muted.TLabel").pack(anchor=tk.W)
+        entry = ttk.Entry(form, textvariable=self._desc_var, width=88)
+        entry.pack(anchor=tk.W, pady=(2, 6))
+        self._desc_entry = entry
+
+        # Per-account scope toggles (default: every account ON). No accounts
+        # configured -> the rule applies everywhere ("all"); the row is hidden.
+        self._scope_row_holder = ttk.Frame(form)
+        self._scope_row_holder.pack(anchor=tk.W, fill=tk.X)
+        self._build_scope_row()
+
+        actions = ttk.Frame(form)
+        actions.pack(anchor=tk.W, pady=(8, 0))
+        ttk.Button(actions, text="Add category rule", style="Primary.TButton",
+                   command=self._on_add).pack(side=tk.LEFT)
+        self._status = ttk.Label(actions, text="", style="Muted.TLabel")
+        self._status.pack(side=tk.LEFT, padx=(10, 0))
+
+        self._list_box = _ScrollSection(
+            self._f, text="Your unwanted-category rules", height=300)
+        self._list_box.pack(fill=tk.X, pady=(0, 8))
+
+    def _build_scope_row(self):
+        for w in self._scope_row_holder.winfo_children():
+            w.destroy()
+        self._scope_vars = []
+        usernames = self._account_usernames()
+        if not usernames:
+            return
+        ttk.Label(self._scope_row_holder, text="Applies to which account(s)?",
+                  style="Muted.TLabel").pack(anchor=tk.W, pady=(2, 0))
+        row = ttk.Frame(self._scope_row_holder)
+        row.pack(anchor=tk.W)
+        for u in usernames:
+            var = tk.BooleanVar(value=True)   # default: every account
+            ttk.Checkbutton(row, text=u, variable=var).pack(
+                side=tk.LEFT, padx=(0, 12))
+            self._scope_vars.append((u, var))
+
+    @staticmethod
+    def _account_usernames() -> list[str]:
+        accounts = config_io.load_config().get("accounts", []) or []
+        return [a.get("username", "") for a in accounts if a.get("username")]
+
+    def _picked_scope(self):
+        """Scope from the add-form toggles: "all" when no accounts are
+        configured or every one is ticked, the ticked subset otherwise, or None
+        when accounts exist but none are ticked (caller must prompt)."""
+        usernames = self._account_usernames()
+        if not usernames:
+            return "all"
+        on = [u for (u, v) in self._scope_vars if v.get()]
+        if not on:
+            return None
+        return scope_from_toggle_state(usernames, on)
+
+    # ---- refresh & render ----
+
+    def refresh(self):
+        # Rebuild the scope row so a newly added/removed account shows up.
+        self._build_scope_row()
+        self._render_list()
+        self._list_box.bind_wheel_recursive()
+
+    def _render_list(self):
+        self._list_box.clear()
+        body = self._list_box.body
+        rules = config_io.list_authored_refinements()
+        if not rules:
+            ttk.Label(
+                body, style="Muted.TLabel", wraplength=720,
+                text=("You haven't added any category rules yet. Describe a "
+                      "kind of mail you don't want above and click "
+                      "\"Add category rule\".")
+            ).pack(anchor=tk.W)
+            return
+        for r in rules:
+            self._render_card(body, r)
+
+    def _render_card(self, body, r: dict):
+        card = ttk.Frame(body, padding=(10, 8), relief="groove", borderwidth=1)
+        card.pack(fill=tk.X, pady=4)
+        on = r.get("status", "active") == "active"
+        headline = r.get("headline") or "(no description)"
+        ttk.Label(card, text=headline, style="Subheading.TLabel",
+                  wraplength=720).pack(anchor=tk.W)
+        state_word = "On — junking matching mail" if on else "Off — not in effect"
+        meta = (f"{state_word}  ·  applies to "
+                f"{SignalsTab._scope_text(r.get('scope', 'all'))}  ·  "
+                f"added {r.get('first_learned', '')[:16]}  ·  "
+                f"ID {r.get('id', '')}")
+        ttk.Label(card, text=meta, style="Muted.TLabel",
+                  wraplength=720).pack(anchor=tk.W)
+        btns = ttk.Frame(card)
+        btns.pack(anchor=tk.W, pady=(6, 0))
+        rid = r.get("id", "")
+        if on:
+            ttk.Button(btns, text="Turn off",
+                       command=lambda i=rid: self._on_disable(i)).pack(
+                           side=tk.LEFT)
+        else:
+            ttk.Button(btns, text="Turn on", style="Primary.TButton",
+                       command=lambda i=rid: self._on_enable(i)).pack(
+                           side=tk.LEFT)
+        ttk.Button(btns, text="Delete",
+                   command=lambda i=rid: self._on_delete(i)).pack(
+                       side=tk.LEFT, padx=(8, 0))
+
+    # ---- actions ----
+
+    def _on_add(self):
+        if self._busy:
+            return
+        desc = self._desc_var.get().strip()
+        if not desc:
+            self._status.config(text="Type a short description first.")
+            return
+        scope = self._picked_scope()
+        if scope is None:
+            self._status.config(text="Pick at least one account.")
+            return
+        # Resolve the SCREEN model + key from the app's existing Anthropic
+        # config (cascade -> screen_model), the same source the Check-an-Email
+        # screen uses. No new auth.
+        anthro = config_io.load_config().get("anthropic", {}) or {}
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "") \
+            or anthro.get("api_key", "") or ""
+        if anthro.get("classify_mode", "cascade") == "cascade":
+            model = anthro.get("screen_model") or "claude-haiku-4-5-20251001"
+        else:
+            model = anthro.get("model") or "claude-haiku-4-5-20251001"
+        # Advisory breadth check on a worker thread so the UI never freezes.
+        # FAIL OPEN: any problem -> add the rule anyway (handled downstream).
+        self._busy = True
+        self._status.config(text="Checking this rule…")
+        import threading
+        threading.Thread(target=self._do_breadth_check,
+                         args=(desc, scope, api_key, model), daemon=True).start()
+
+    def _do_breadth_check(self, desc, scope, api_key, model):
+        verdict = breadth_advisor.check_category_breadth(desc, api_key, model)
+        self.app.after(0, self._after_breadth_check, desc, scope, verdict)
+
+    def _after_breadth_check(self, desc, scope, verdict):
+        self._busy = False
+        if breadth_advisor.should_warn(verdict):
+            self._status.config(text="")
+            self._show_broad_warning(desc, scope, verdict)
+            return
+        # Not broad, or a fail-open outcome (no key / API error): add now. Show a
+        # soft "couldn't check" note only when a check was attempted and failed.
+        if verdict.get("reason") == "error":
+            note = ("Added. MailWarden couldn't check this rule just now, so it "
+                    "was added as-is. It takes effect on the next check.")
+        else:
+            note = "Added. It takes effect on the next check."
+        self._create_rule(desc, scope, status_note=note)
+
+    def _create_rule(self, desc, scope, status_note):
+        record = config_io.create_authored_refinement(desc, scope,
+                                                       source="dashboard")
+        if record is None:
+            self._status.config(text="Type a short description first.")
+            return
+        self._desc_var.set("")
+        self._status.config(text=status_note)
+        self.refresh()
+
+    def _show_broad_warning(self, desc, scope, verdict):
+        """Broad-rule heads-up: show the concern + a tighter suggestion and make
+        the owner choose. 'Add it anyway' is the affirmative-OK gate (a
+        determined owner still proceeds); 'Let me revise' returns to the form,
+        prefilled with the suggestion when there is one."""
+        dlg = tk.Toplevel(self.app)
+        dlg.title("This rule looks broad")
+        dlg.transient(self.app)
+        dlg.resizable(False, False)
+        frm = ttk.Frame(dlg, padding=(16, 14))
+        frm.pack(fill=tk.BOTH, expand=True)
+        concern = verdict.get("concern") or (
+            "it might catch mail you actually want.")
+        ttk.Label(frm, wraplength=460, justify="left",
+                  text=("This rule is pretty broad — " + concern)).pack(
+                      anchor=tk.W)
+        suggestion = verdict.get("suggestion") or ""
+        if suggestion:
+            ttk.Label(frm, wraplength=460, justify="left", style="Muted.TLabel",
+                      text=("A tighter version: " + suggestion)).pack(
+                          anchor=tk.W, pady=(8, 0))
+        btns = ttk.Frame(frm)
+        btns.pack(anchor=tk.E, pady=(14, 0))
+
+        def _add_anyway():
+            dlg.destroy()
+            self._create_rule(
+                desc, scope,
+                status_note="Added. It takes effect on the next check.")
+
+        def _revise():
+            dlg.destroy()
+            if suggestion:
+                self._desc_var.set(suggestion)
+            self._status.config(text="Revise your rule, then add it again.")
+            try:
+                self._desc_entry.focus_set()
+            except Exception:
+                pass
+
+        ttk.Button(btns, text="Let me revise", style="Primary.TButton",
+                   command=_revise).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Add it anyway",
+                   command=_add_anyway).pack(side=tk.LEFT, padx=(6, 0))
+        dlg.protocol("WM_DELETE_WINDOW", _revise)
+        dlg.grab_set()
+
+    def _on_disable(self, refinement_id: str):
+        if refinement_id and config_io.retire_refinement(
+                refinement_id, source="dashboard"):
+            self.refresh()
+
+    def _on_enable(self, refinement_id: str):
+        if refinement_id and config_io.restore_refinement(
+                refinement_id, source="dashboard") is not None:
+            self.refresh()
+
+    def _on_delete(self, refinement_id: str):
+        if not refinement_id:
+            return
+        if not messagebox.askyesno(
+                "Delete category rule",
+                "Delete this rule for good? Mail that matched it will no longer "
+                "be junked. This can't be undone (but you can add it again)."):
+            return
+        if config_io.delete_active_refinement(refinement_id, source="dashboard"):
+            self.refresh()
+
+
+# =============================================================================
 # API USAGE
 # =============================================================================
 class UsageTab(ttk.Frame):
@@ -3169,20 +3680,25 @@ class SettingsTab(ttk.Frame):
         self._model_saved_label.grid(row=0, column=2, sticky=tk.W, padx=(8, 0))
         self._model_saved_after = None
 
-        ttk.Label(ai_frame, text="Confidence threshold:").grid(row=1, column=0, sticky=tk.W, padx=(0, 8), pady=4)
+        # Cascade advisory (Matt's approved wording, defined at module level).
+        ttk.Label(ai_frame, text=MODEL_ADVISORY_TEXT, foreground="#555",
+                  wraplength=440, justify=tk.LEFT).grid(
+            row=1, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
+
+        ttk.Label(ai_frame, text="Confidence threshold:").grid(row=2, column=0, sticky=tk.W, padx=(0, 8), pady=4)
         self._threshold_var = tk.DoubleVar(value=0.85)
         scale = ttk.Scale(ai_frame, from_=0.70, to=0.99, orient=tk.HORIZONTAL,
                            variable=self._threshold_var, length=240,
                            command=lambda _v: self._threshold_label.config(
                                text=f"{self._threshold_var.get():.2f}"))
-        scale.grid(row=1, column=1, sticky=tk.W, pady=4)
+        scale.grid(row=2, column=1, sticky=tk.W, pady=4)
         self._threshold_label = ttk.Label(ai_frame, text="0.85")
-        self._threshold_label.grid(row=1, column=2, padx=(8, 0))
+        self._threshold_label.grid(row=2, column=2, padx=(8, 0))
 
-        ttk.Label(ai_frame, text="Max emails per run:").grid(row=2, column=0, sticky=tk.W, padx=(0, 8), pady=4)
+        ttk.Label(ai_frame, text="Max emails per run:").grid(row=3, column=0, sticky=tk.W, padx=(0, 8), pady=4)
         self._maxrun_var = tk.IntVar(value=100)
         ttk.Spinbox(ai_frame, from_=1, to=1000, textvariable=self._maxrun_var,
-                     width=10).grid(row=2, column=1, sticky=tk.W, pady=4)
+                     width=10).grid(row=3, column=1, sticky=tk.W, pady=4)
 
         # Menu bar + report + global pause
         misc = ttk.LabelFrame(self._f, text="Menu bar and schedule",
@@ -3273,18 +3789,26 @@ class SettingsTab(ttk.Frame):
         config = config_io.load_config()
         self._api_var.set(config.get("anthropic", {}).get("api_key", ""))
         default_model = "claude-haiku-4-5-20251001"
-        current_model = config.get("anthropic", {}).get("model", default_model)
-        for label, value in MODEL_CHOICES:
-            if value == current_model:
-                self._model_var.set(label)
-                break
-        else:
-            # Unmatched/missing model → fall back to the Haiku entry (the
-            # functional default), never Sonnet. Look it up by value so this
-            # stays correct even if MODEL_CHOICES order changes.
+        anthro = config.get("anthropic", {})
+        classify_mode = anthro.get("classify_mode", "cascade")
+        current_model = anthro.get("model", default_model)
+        if classify_mode == "cascade":
             self._model_var.set(
-                next(l for l, v in MODEL_CHOICES if v == default_model))
-        self._threshold_var.set(config.get("anthropic", {}).get("confidence_threshold", 0.85))
+                next(l for l, m, v in MODEL_CHOICES if m == "cascade"))
+        else:
+            for label, mode, value in MODEL_CHOICES:
+                if mode == "single" and value == current_model:
+                    self._model_var.set(label)
+                    break
+            else:
+                # Unmatched/missing model → fall back to the Haiku-only entry
+                # (the functional single-model default), never Sonnet. Look it
+                # up by value so this stays correct even if MODEL_CHOICES
+                # order changes.
+                self._model_var.set(
+                    next(l for l, m, v in MODEL_CHOICES
+                         if m == "single" and v == default_model))
+        self._threshold_var.set(config.get("filter", {}).get("confidence_threshold", 0.85))
         self._threshold_label.config(text=f"{self._threshold_var.get():.2f}")
         self._maxrun_var.set(config.get("filter", {}).get("max_emails_per_run", 100))
         self._menubar_var.set(config.get("ui", {}).get("menu_bar_enabled", True))
@@ -3299,38 +3823,48 @@ class SettingsTab(ttk.Frame):
         )
 
         paused = config.get("ui", {}).get("paused", False) or (
-            config.get("accounts") and not any(a.get("enabled") for a in config["accounts"]))
+            config.get("accounts") and not any(a.get("enabled", True) for a in config["accounts"]))
         self._pause_btn.config(text=("Resume all filtering" if paused else "Pause all filtering"))
 
     def _on_save_api(self):
-        config = config_io.load_config()
-        config.setdefault("anthropic", {})["api_key"] = self._api_var.get().strip()
-        # Also save model + threshold + max
-        for label, value in MODEL_CHOICES:
-            if label == self._model_var.get():
-                config["anthropic"]["model"] = value
-                break
-        config["anthropic"]["confidence_threshold"] = round(float(self._threshold_var.get()), 2)
-        config.setdefault("filter", {})["max_emails_per_run"] = int(self._maxrun_var.get())
-        config_io.save_config(config)
+        # Read the Tk vars once (this runs on the Tk thread), then apply ONLY
+        # these keys on a fresh read under the lock (C7).
+        api_key = self._api_var.get().strip()
+        model_label = self._model_var.get()
+        choice = next(((m, v) for label, m, v in MODEL_CHOICES
+                       if label == model_label), None)
+        threshold = round(float(self._threshold_var.get()), 2)
+        max_per_run = int(self._maxrun_var.get())
+
+        def _apply(config):
+            anthro = config.setdefault("anthropic", {})
+            anthro["api_key"] = api_key
+            if choice is not None:
+                apply_model_choice(anthro, choice[0], choice[1])
+            config.setdefault("filter", {})["confidence_threshold"] = threshold
+            config.setdefault("filter", {})["max_emails_per_run"] = max_per_run
+        config_io.update_config(_apply)
         self._api_status.config(text="Saved.")
 
     def _on_model_selected(self, _event=None):
-        """Persist the model immediately when the dropdown changes.
+        """Persist the classification mode immediately when the dropdown changes.
 
-        Maps the selected display label back to its model VALUE via
-        MODEL_CHOICES (never saves the human label), then reuses the same
-        config-save mechanism as the API-row Save button so the two paths
-        always agree on key and storage.
+        Maps the selected display label back to its (classify_mode, model)
+        pair via MODEL_CHOICES (never saves the human label), then reuses the
+        same config-save mechanism as the API-row Save button so the two
+        paths always agree on keys and storage.
         """
         selected = self._model_var.get()
-        model_value = next(
-            (v for label, v in MODEL_CHOICES if label == selected), None)
-        if model_value is None:
+        choice = next(
+            ((m, v) for label, m, v in MODEL_CHOICES if label == selected),
+            None)
+        if choice is None:
             return
-        config = config_io.load_config()
-        config.setdefault("anthropic", {})["model"] = model_value
-        config_io.save_config(config)
+        # C7: set ONLY the mode/model keys on a fresh read under the lock.
+        def _set(config):
+            apply_model_choice(config.setdefault("anthropic", {}),
+                               choice[0], choice[1])
+        config_io.update_config(_set)
         self._show_model_saved()
 
     def _show_model_saved(self):
@@ -3371,10 +3905,11 @@ class SettingsTab(ttk.Frame):
         # preference to config.json so the filter/report agents respect it,
         # and then register or unregister via SMAppService. No launchctl or
         # plist writing needed.
-        config = config_io.load_config()
         on = bool(self._menubar_var.get())
-        config.setdefault("ui", {})["menu_bar_enabled"] = on
-        config_io.save_config(config)
+        # C7: write ONLY ui.menu_bar_enabled on a fresh read under the lock.
+        def _set(config):
+            config.setdefault("ui", {})["menu_bar_enabled"] = on
+        config_io.update_config(_set)
         try:
             if on:
                 ok, err = smappservice_install.register_menubar()
@@ -3388,10 +3923,11 @@ class SettingsTab(ttk.Frame):
             messagebox.showerror("Menu bar", str(e))
 
     def _on_train_prompt_toggle(self):
-        config = config_io.load_config()
-        config.setdefault("ui", {})["prompt_missing_train_folder"] = \
-            bool(self._train_prompt_var.get())
-        config_io.save_config(config)
+        on = bool(self._train_prompt_var.get())
+        # C7: write ONLY ui.prompt_missing_train_folder fresh under the lock.
+        def _set(config):
+            config.setdefault("ui", {})["prompt_missing_train_folder"] = on
+        config_io.update_config(_set)
 
     def _on_check_train_folders_now(self):
         # Button bypasses the prompt-on-launch setting — user explicitly asked.
@@ -3409,10 +3945,11 @@ class SettingsTab(ttk.Frame):
         except ValueError:
             messagebox.showerror("Time format", "Use HH:MM in 24-hour format.")
             return
-        config = config_io.load_config()
-        config.setdefault("summary", {})["hour"] = h
-        config["summary"]["minute"] = m
-        config_io.save_config(config)
+        # C7: write ONLY summary.hour/minute fresh under the lock.
+        def _set(config):
+            config.setdefault("summary", {})["hour"] = h
+            config["summary"]["minute"] = m
+        config_io.update_config(_set)
         # v1.6.0: SMAppService plists are static inside the .app bundle.
         # Schedule changes are written to config.json; daily_report.py reads
         # config.json at runtime for its report hour/minute. No plist rewrite
@@ -3447,9 +3984,10 @@ class SettingsTab(ttk.Frame):
                 f"Continue?")
             if not proceed:
                 return
-        config = config_io.load_config()
-        config.setdefault("filter", {})["interval_minutes"] = minutes
-        config_io.save_config(config)
+        # C7: write ONLY filter.interval_minutes fresh under the lock.
+        def _set(config):
+            config.setdefault("filter", {})["interval_minutes"] = minutes
+        config_io.update_config(_set)
         # v1.6.0: SMAppService plists are static and signed read-only, so the
         # cadence can't be written into the plist. Instead the plist wakes the
         # filter every 5 minutes and spam_filter.run_filter() reads this value
@@ -3999,37 +4537,42 @@ class SettingsTab(ttk.Frame):
         self.after(150, lambda: _poll_worker(t))
 
     def _on_pause_toggle(self):
-        config = config_io.load_config()
-        accounts = config.get("accounts", [])
-        if not accounts:
-            return
-        ui = config.setdefault("ui", {})
-        currently_paused = not any(a.get("enabled") for a in accounts)
-        if currently_paused:
-            # Restore per-position. The old version keyed on account name,
-            # which collapsed duplicate/empty names into the same bucket
-            # and lost one account's enabled state on resume. Using index
-            # survives duplicates and un-named accounts.
-            pre_list = ui.get("_pre_pause_enabled_list")
-            if isinstance(pre_list, list) and len(pre_list) == len(accounts):
-                for a, was_enabled in zip(accounts, pre_list):
-                    a["enabled"] = bool(was_enabled)
+        # C7: run the whole load->flip-pause-keys->save FRESH under the lock
+        # (the same fix as menu_bar.toggle_pause). The mutator touches ONLY the
+        # pause keys; every other config key is read fresh and re-saved
+        # untouched, so a peer's concurrent change can't be reverted and the
+        # pause flag can't be erased by a peer's blind save.
+        def _flip_pause(config):
+            accounts = config.get("accounts", [])
+            if not accounts:
+                return
+            ui = config.setdefault("ui", {})
+            currently_paused = not any(a.get("enabled", True) for a in accounts)
+            if currently_paused:
+                # Restore per-position. The old version keyed on account name,
+                # which collapsed duplicate/empty names into the same bucket
+                # and lost one account's enabled state on resume. Using index
+                # survives duplicates and un-named accounts.
+                pre_list = ui.get("_pre_pause_enabled_list")
+                if isinstance(pre_list, list) and len(pre_list) == len(accounts):
+                    for a, was_enabled in zip(accounts, pre_list):
+                        a["enabled"] = bool(was_enabled)
+                else:
+                    # Fall back to the name-keyed legacy map (older configs) or
+                    # default everything to enabled if no snapshot exists.
+                    legacy = ui.get("_pre_pause_enabled", {})
+                    for a in accounts:
+                        a["enabled"] = bool(legacy.get(a.get("name", ""), True))
+                ui.pop("_pre_pause_enabled_list", None)
+                ui.pop("_pre_pause_enabled", None)
+                ui["paused"] = False
             else:
-                # Fall back to the name-keyed legacy map (older configs) or
-                # default everything to enabled if no snapshot exists.
-                legacy = ui.get("_pre_pause_enabled", {})
+                ui["_pre_pause_enabled_list"] = [bool(a.get("enabled", True)) for a in accounts]
+                ui.pop("_pre_pause_enabled", None)  # clear any legacy key
                 for a in accounts:
-                    a["enabled"] = bool(legacy.get(a.get("name", ""), True))
-            ui.pop("_pre_pause_enabled_list", None)
-            ui.pop("_pre_pause_enabled", None)
-            ui["paused"] = False
-        else:
-            ui["_pre_pause_enabled_list"] = [bool(a.get("enabled")) for a in accounts]
-            ui.pop("_pre_pause_enabled", None)  # clear any legacy key
-            for a in accounts:
-                a["enabled"] = False
-            ui["paused"] = True
-        config_io.save_config(config)
+                    a["enabled"] = False
+                ui["paused"] = True
+        config_io.update_config(_flip_pause)
         self.app.refresh_all()
 
     def _on_share_signals(self):
@@ -5035,14 +5578,10 @@ def _last_filter_run() -> datetime | None:
 
 
 def _lock_active() -> bool:
-    import time
-    if not paths.FILTER_LOCK.exists():
-        return False
-    try:
-        age = time.time() - paths.FILTER_LOCK.stat().st_mtime
-        return age < 600
-    except OSError:
-        return False
+    # Probe the real flock instead of the lock file's mtime, in lockstep with
+    # menu_bar.lock_is_active and the app_entrypoint filter lock: a live holder
+    # is detected for the whole run and a dead holder reads as free at once.
+    return file_lock.is_locked(paths.FILTER_LOCK)
 
 
 def _determine_health(last_run: datetime | None) -> tuple[str, str]:
@@ -5061,6 +5600,28 @@ def _fmt_age(sec: float) -> str:
     if m < 60:
         return f"{m}m"
     return f"{m // 60}h {m % 60}m"
+
+
+def _load_lifetime_stats() -> dict:
+    """Read lifetime_stats.json, returning an all-zero default on missing/corrupt
+    (audit Session 9B). Holds the tallies of decisions.log records that have been
+    pruned away, so the Dashboard's lifetime counts don't reset on prune."""
+    default = {
+        "version": "1.0",
+        "decisions_evaluated_lifetime": 0,
+        "decisions_spam_lifetime": 0,
+        "signals_submitted_lifetime": 0,
+        "signals_approved_lifetime": 0,
+        "signals_rejected_lifetime": 0,
+    }
+    try:
+        with paths.LIFETIME_STATS_PATH.open(encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return default
+    for k, v in default.items():
+        data.setdefault(k, v)
+    return data
 
 
 def _decision_counts() -> tuple[int, int, int]:
@@ -5101,6 +5662,10 @@ def _decision_counts() -> tuple[int, int, int]:
             today_n += 1
         if d >= week_start:
             week_n += 1
+    # Add the persistent counter for records that have been pruned from the
+    # live log (audit Session 9B, B9) so the lifetime total never resets.
+    life = _load_lifetime_stats()
+    life_n += life["decisions_evaluated_lifetime"]
     return today_n, week_n, life_n
 
 
@@ -5183,6 +5748,10 @@ def _spam_killed_counts() -> tuple[int, int]:
         life_n += 1
         if d == today:
             today_n += 1
+    # Add the persistent counter for SPAM records that have been pruned from the
+    # live log (audit Session 9B, B9) so the lifetime spam total never resets.
+    life = _load_lifetime_stats()
+    life_n += life["decisions_spam_lifetime"]
     return today_n, life_n
 
 
@@ -5226,19 +5795,24 @@ def _is_newer(latest: str, installed: str) -> bool:
 
 def _import_tabular_csv(path: Path) -> tuple[int, int]:
     added = skipped = 0
-    wl = config_io.load_whitelist()
-    bl = config_io.load_blacklist()
-    with path.open(newline="") as f:
-        reader = csv.reader(f)
-        header = [h.strip().lower() for h in next(reader, [])]
-        for row in reader:
-            if not row:
-                continue
-            added_this, skipped_this = _absorb_row(header, row, wl, bl)
-            added += added_this
-            skipped += skipped_this
-    config_io.save_whitelist(wl)
-    config_io.save_blacklist(bl)
+    # C7: load BOTH lists, absorb every row, save BOTH — all under ONE lock over
+    # both files (file_lock sorts the pair internally, so it can't deadlock
+    # against a peer taking them in the other order). Fresh reads under the lock
+    # mean a concurrent list-tab edit isn't clobbered by this bulk import.
+    with file_lock.locked(paths.WHITELIST_PATH, paths.BLACKLIST_PATH):
+        wl = config_io.load_whitelist()
+        bl = config_io.load_blacklist()
+        with path.open(newline="") as f:
+            reader = csv.reader(f)
+            header = [h.strip().lower() for h in next(reader, [])]
+            for row in reader:
+                if not row:
+                    continue
+                added_this, skipped_this = _absorb_row(header, row, wl, bl)
+                added += added_this
+                skipped += skipped_this
+        config_io.save_whitelist(wl)
+        config_io.save_blacklist(bl)
     return added, skipped
 
 
@@ -5254,17 +5828,19 @@ def _import_tabular_xlsx(path: Path) -> tuple[int, int]:
     header = [str(h).strip().lower() if h is not None else "" for h in header_row]
 
     added = skipped = 0
-    wl = config_io.load_whitelist()
-    bl = config_io.load_blacklist()
-    for row in rows_iter:
-        if row is None:
-            continue
-        added_this, skipped_this = _absorb_row(
-            header, [str(c) if c is not None else "" for c in row], wl, bl)
-        added += added_this
-        skipped += skipped_this
-    config_io.save_whitelist(wl)
-    config_io.save_blacklist(bl)
+    # C7: same one-lock-over-both-files bulk import as the CSV path.
+    with file_lock.locked(paths.WHITELIST_PATH, paths.BLACKLIST_PATH):
+        wl = config_io.load_whitelist()
+        bl = config_io.load_blacklist()
+        for row in rows_iter:
+            if row is None:
+                continue
+            added_this, skipped_this = _absorb_row(
+                header, [str(c) if c is not None else "" for c in row], wl, bl)
+            added += added_this
+            skipped += skipped_this
+        config_io.save_whitelist(wl)
+        config_io.save_blacklist(bl)
     return added, skipped
 
 

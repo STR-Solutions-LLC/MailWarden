@@ -189,16 +189,7 @@ ls ~/MailWarden
 ```
 This command should return "No such file or directory." If it returns file listings, repeat Step 3.
 
-**Step 5 — Remove IMAP Blacklist folders (if created):**
-If you created Blacklist folders on your mail server during setup, you may remove them using your email client by right-clicking each folder and selecting Delete. The folders to remove are:
-- Blacklist/Both
-- Blacklist/Name-Only
-- Blacklist/Address-Only
-- Blacklist (parent folder)
-
-These folders contain no email you have not placed there yourself. Removing them removes no email from your inbox.
-
-**Step 6 — Revoke Anthropic API key (recommended):**
+**Step 5 — Revoke Anthropic API key (recommended):**
 If you created an Anthropic API key specifically for MailWarden, log into console.anthropic.com and revoke that key to prevent any further charges.
 
 After completing these steps, MailWarden is fully removed from your system.

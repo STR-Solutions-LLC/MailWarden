@@ -30,7 +30,7 @@ from pathlib import Path
 
 from . import paths
 
-BUNDLED_FILTER_VERSION = "1.6.0-beta.16.1"
+BUNDLED_FILTER_VERSION = "1.7.0"
 BUNDLED_INSTALLER_VERSION = "1.0"
 
 # Directories/files under Contents/Resources/ that we ship as payload.
@@ -277,7 +277,7 @@ def bootstrap_runtime() -> dict:
         if defaults_root:
             for name in ("signals.json", "whitelist.json", "blacklist.json",
                          "processed_ids.json", "token_usage.json",
-                         "pending_signals.json"):
+                         "pending_signals.json", "approved_senders.json"):
                 src = defaults_root / name
                 dst = paths.MEMORY_DIR / name
                 if src.exists() and not dst.exists():

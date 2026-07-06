@@ -3,13 +3,56 @@
 """
 Shared utility functions for the spam filter system.
 """
+from __future__ import annotations
 
 import email
 import email.header
 import email.policy
 import html
+import ipaddress
 import re
+import secrets
 import smtplib
+import ssl
+
+
+_dnsbl_cache: dict = {}
+
+
+def make_tls_context() -> ssl.SSLContext:
+    """Return an SSL context that VERIFIES the server certificate and hostname.
+
+    imaplib.IMAP4_SSL / smtplib.SMTP_SSL / SMTP.starttls default to
+    ssl._create_stdlib_context() (PEP 476 deliberately excluded these modules
+    from verify-by-default), which accepts ANY certificate — self-signed,
+    expired, wrong host — so credentials are exposed to an active MITM.
+    ssl.create_default_context() flips that to CERT_REQUIRED + check_hostname.
+
+    CA source: the bundled python.org build ships no system CA store, so when
+    the default context loads zero CAs we fall back to certifi's bundle
+    (already shipped as an anthropic dependency). The launcher additionally
+    exports SSL_CERT_FILE=certifi.where() for the whole process, but this
+    fallback guarantees verification works even if the engine is ever started
+    outside the launcher. If certifi is somehow unavailable the default context
+    is kept as-is: it fails CLOSED (rejects the connection) rather than
+    silently skipping verification."""
+    ctx = ssl.create_default_context()
+    try:
+        if ctx.cert_store_stats().get("x509_ca", 0) == 0:
+            import certifi
+            ctx.load_verify_locations(cafile=certifi.where())
+    except Exception:
+        pass
+    return ctx
+
+
+def clear_dnsbl_cache() -> None:
+    _dnsbl_cache.clear()
+
+
+def random_token(nbytes: int = 6) -> str:
+    """Cryptographically random hex token (default 12 hex chars / 48 bits)."""
+    return secrets.token_hex(nbytes)
 
 
 def smtp_login(smtp_config: dict):
@@ -33,8 +76,9 @@ def smtp_login(smtp_config: dict):
     password = smtp_config.get("password", "")
     use_starttls = smtp_config.get("use_starttls", True)
 
+    tls_context = make_tls_context()
     if port == 465:
-        server = smtplib.SMTP_SSL(host, port, timeout=30)
+        server = smtplib.SMTP_SSL(host, port, timeout=30, context=tls_context)
         server.ehlo()
     else:
         if not use_starttls:
@@ -45,7 +89,7 @@ def smtp_login(smtp_config: dict):
             )
         server = smtplib.SMTP(host, port, timeout=30)
         server.ehlo()
-        server.starttls()
+        server.starttls(context=tls_context)
         server.ehlo()
 
     server.login(username, password)
@@ -95,7 +139,7 @@ def parse_from_address(header_value: str) -> dict:
     angle_match = re.search(r'^(.*?)<([^>]+@[^>]+)>\s*$', header_value)
     if angle_match:
         display_name = angle_match.group(1).strip().strip('"').strip("'").strip()
-        addr = angle_match.group(2).strip().lower()
+        addr = angle_match.group(2).strip().lower().rstrip(".")
         if re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', addr):
             result["address"] = addr
             result["display_name"] = display_name if display_name else None
@@ -104,7 +148,7 @@ def parse_from_address(header_value: str) -> dict:
     # No angle brackets — try the whole string as a bare address
     bare = header_value.strip().strip('"').strip("'").strip()
     if re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', bare):
-        result["address"] = bare.lower()
+        result["address"] = bare.lower().rstrip(".")
 
     return result
 
@@ -116,8 +160,36 @@ def extract_domain(email_address: str) -> str:
     """
     if not email_address or "@" not in email_address:
         return None
-    domain = "@" + email_address.split("@", 1)[1].strip().lower()
+    domain = "@" + email_address.split("@", 1)[1].strip().lower().rstrip(".")
     return domain
+
+
+def _registrable_domain(host: str) -> str:
+    """Best-effort registrable domain = last two labels, lowercased.
+    NOT public-suffix-aware; acceptable because callers anchor on their OWN
+    known hosts / the delivering provider, never arbitrary attacker input."""
+    host = (host or "").strip().lower().strip("[]").rstrip(".")
+    labels = [l for l in host.split(".") if l]
+    if len(labels) < 2:
+        return host
+    return ".".join(labels[-2:])
+
+
+def select_trusted_auth_results(ar_headers, anchor_hosts) -> str:
+    """From all Authentication-Results header values, return the TOPMOST whose
+    authserv-id (the token before the first ';') shares a registrable domain with
+    the trust anchor. Returns "" if none match (trust nothing — safe direction)."""
+    anchor = {_registrable_domain(h) for h in (anchor_hosts or set()) if h}
+    anchor.discard("")
+    if not anchor:
+        return ""
+    for ar in ar_headers or []:
+        ar = str(ar or "")
+        head = ar.split(";", 1)[0].strip()
+        authserv = head.split()[0] if head else ""
+        if _registrable_domain(authserv) in anchor:
+            return ar
+    return ""
 
 
 def get_plain_text_body_from_msg(msg) -> str:
@@ -165,19 +237,26 @@ def check_auth_results(headers: dict) -> dict:
     return {"signal": None, "detail": ""}
 
 
-def summarize_authentication(headers: dict, from_domain: str = "") -> dict:
+def summarize_authentication(headers: dict, from_domain: str = "",
+                             locally_verified: list = None) -> dict:
     """Summarize SPF/DKIM/DMARC results + the cryptographically VERIFIED sending
     domain(s) for the AI classifier (F3). HOST-AGNOSTIC.
 
     Parses the RFC 8601 ``Authentication-Results`` header — emitted by virtually
     every modern mail provider (Gmail, Outlook/Office365, Yahoo/AOL, Proofpoint,
-    cPanel/Exim, Zoho, Fastmail, …) — plus its ARC-sealed variant
-    ``ARC-Authentication-Results`` (present when mail is forwarded/relayed, e.g.
-    through Microsoft) and the standalone ``Received-SPF`` header. It reads only
-    STANDARD tokens (``spf=``, ``dkim=``, ``dmarc=``, ``header.from=``,
-    ``header.d=``, ``header.i=@``, ``smtp.mailfrom=``), never any host-specific
-    format, so it is independent of the user's email provider. Opaque
-    provider-private blobs (X-YMailISG, X-Spam-*, etc.) are ignored.
+    cPanel/Exim, Zoho, Fastmail, …) — and the standalone ``Received-SPF`` header.
+    It reads only STANDARD tokens (``spf=``, ``dkim=``, ``dmarc=``,
+    ``header.from=``, ``header.d=``, ``header.i=@``, ``smtp.mailfrom=``), never
+    any host-specific format, so it is independent of the user's email provider.
+    Opaque provider-private blobs (X-YMailISG, X-Spam-*, etc.) are ignored.
+
+    Security (audit C5/ARC): ``ARC-Authentication-Results`` is deliberately NOT
+    parsed for proven domains — ARC is forgeable, so trusting it would let a
+    relay-forged chain claim any sender. The caller is expected to pass only the
+    main ``Authentication-Results`` value it has already vetted (see
+    ``select_trusted_auth_results``). An advisory ``arc`` verdict is still parsed
+    from the (already-trusted) main header for display context only and grants
+    NO domain.
 
     Security: a domain is listed in ``authenticated_domains`` ONLY when the
     relevant check actually PASSED. A bare ``DKIM-Signature: d=`` (an unverified
@@ -187,13 +266,18 @@ def summarize_authentication(headers: dict, from_domain: str = "") -> dict:
     ``authenticated_domains`` is empty — the classifier then judges on other
     evidence (and, per policy, leans toward NOT_SPAM).
 
+    Local DKIM (audit a-2): the optional ``locally_verified`` list carries
+    domains proven by MailWarden's OWN cryptographic DKIM verification
+    (``verify_dkim_locally``), used only for hosts that stamp no usable
+    Authentication-Results. Passing it treats those domains as a real DKIM pass
+    (added to ``authenticated_domains``, sets ``dkim`` to "pass", drops them from
+    the unverified-claim line). Default None ⇒ byte-identical output to before.
+
     Returns a dict: spf, dkim, dmarc, dmarc_from, spf_mailfrom,
-    claimed_dkim_domain, authenticated_domains (sorted), from_domain.
+    claimed_dkim_domain, authenticated_domains (sorted), locally_verified_domains,
+    from_domain.
     """
-    auth = "  ".join(p for p in (
-        str(headers.get("Authentication-Results", "") or ""),
-        str(headers.get("ARC-Authentication-Results", "") or ""),
-    ) if p)
+    auth = str(headers.get("Authentication-Results", "") or "")
     received_spf = str(headers.get("Received-SPF", "") or "")
     dkim_sig = str(headers.get("DKIM-Signature", "") or "")
 
@@ -213,14 +297,20 @@ def summarize_authentication(headers: dict, from_domain: str = "") -> dict:
     dmarc = _result("dmarc", auth)
     dkim_all = [r.lower() for r in re.findall(r'\bdkim\s*=\s*(\w+)', auth, re.IGNORECASE)]
     dkim = "pass" if "pass" in dkim_all else (dkim_all[0] if dkim_all else "")
+    arc = _result("arc", auth)
 
     authenticated = set()
 
-    # DKIM-authenticated domains — only when DKIM passed.
-    if dkim == "pass":
-        for m in re.finditer(r'header\.(?:i\s*=\s*@?|d\s*=\s*)([a-z0-9.\-]+)',
-                             auth, re.IGNORECASE):
-            authenticated.add(m.group(1).lower().lstrip("@").rstrip("."))
+    # DKIM-authenticated domains — correlate each header.d/header.i with ITS OWN
+    # dkim= result. Split the Authentication-Results into clauses (RFC 8601 resinfo
+    # are ';'-separated) and only harvest from a clause whose own dkim result passed.
+    # (A ';' inside a quoted reason="..." only ever fails safe — it can drop a real
+    # pass, never admit a forged domain.)
+    for clause in auth.split(";"):
+        if re.search(r'dkim\s*=\s*pass\b', clause, re.IGNORECASE):
+            for m in re.finditer(r'header\.(?:i\s*=\s*@?|d\s*=\s*)([a-z0-9.\-]+)',
+                                 clause, re.IGNORECASE):
+                authenticated.add(m.group(1).lower().lstrip("@").rstrip("."))
 
     # DMARC alignment domain (the From: organizational domain) — only when DMARC passed.
     dmarc_from = ""
@@ -242,22 +332,46 @@ def summarize_authentication(headers: dict, from_domain: str = "") -> dict:
     if spf == "pass" and spf_mailfrom:
         authenticated.add(spf_mailfrom)
 
-    # Unverified DKIM-Signature d= CLAIM — never authenticated unless DKIM passed.
-    claimed_dkim = ""
-    m = re.search(r'\bd\s*=\s*([a-z0-9.\-]+)', dkim_sig, re.IGNORECASE)
-    if m:
-        claimed_dkim = m.group(1).lower().rstrip(".")
-        if dkim == "pass":
-            authenticated.add(claimed_dkim)
+    # Locally-verified DKIM domains (audit a-2). Caller contract: pass ONLY
+    # domains proven by MailWarden's own cryptographic verification
+    # (utils.verify_dkim_locally), and ONLY when no trusted Authentication-
+    # Results dkim verdict exists (see spam_filter._locally_verified_dkim). A
+    # local pass is a REAL pass: it authenticates the domain AND sets the dkim
+    # scalar to "pass" so the summary is internally consistent and the domain
+    # drops out of the claimed_unverified list below. This is deliberately NOT
+    # reachable from the owner-command auth gate, which never passes this arg.
+    local = sorted({d.lower().lstrip("@").rstrip(".")
+                    for d in (locally_verified or []) if d})
+    for d in local:
+        authenticated.add(d)
+    if local and dkim != "pass":
+        dkim = "pass"
+
+    # Unverified DKIM-Signature d= CLAIM(s). A DKIM-Signature header is sender-
+    # written and proves nothing on its own — a domain is PROVEN only when its OWN
+    # signature passed (added per-clause above) or via aligned DMARC/SPF. We never
+    # add a bare d= claim to `authenticated`; we DO surface claimed-but-unproven
+    # domains as a phishing signal. The (?:^|[;\s]) guard matches only real d= tags
+    # (base64 b= values contain no ';' or whitespace), avoiding false hits.
+    claimed = []
+    for m in re.finditer(r'(?:^|[;\s])d\s*=\s*([a-z0-9.\-]+)', dkim_sig, re.IGNORECASE):
+        dom = m.group(1).lower().rstrip(".")
+        if dom and dom not in claimed:
+            claimed.append(dom)
+    claimed_dkim = claimed[0] if claimed else ""
+    claimed_unverified = sorted(d for d in claimed if d not in authenticated)
 
     return {
         "spf": spf or "none",
         "dkim": dkim or "none",
         "dmarc": dmarc or "none",
+        "arc": arc or "none",
         "dmarc_from": dmarc_from,
         "spf_mailfrom": spf_mailfrom,
         "claimed_dkim_domain": claimed_dkim,
+        "claimed_unverified_domains": claimed_unverified,
         "authenticated_domains": sorted(authenticated),
+        "locally_verified_domains": local,
         "from_domain": (from_domain or "").lower().lstrip("@").rstrip("."),
     }
 
@@ -341,37 +455,85 @@ def host_spam_verdict(headers: dict) -> dict | None:
     return {"score": score, "flag": verdict, "verdict": verdict}
 
 
-def _extract_sending_ip(received_headers) -> str:
-    """Extract the first external sending IP from Received headers.
-    Skips localhost and private IPs."""
+def _extract_sending_ip(received_headers, own_hosts=None) -> str:
+    """Extract the first external (public) sending IP from Received headers.
+
+    Security (M9/M10):
+      - Traverse TOP-DOWN: the topmost Received header is added by OUR own mail
+        infrastructure and names the host that connected to us (the real sender's
+        edge). We do NOT walk the chain in reverse — attacker-forged lower
+        Received lines must not win.
+      - Skip any header whose ``by``/``from`` host is one of our OWN hosts: that
+        is our own relay, not the sender's connecting IP.
+      - Only trust IPs in bracketed/parenthesized connecting-IP forms
+        (``[1.2.3.4]`` / ``(1.2.3.4)`` / ``[IPv6:..]``), never bare dotted-quads
+        appearing in HELO strings, dates, etc. Bracketed is preferred; paren
+        forms are consulted only if no bracketed public IP is found.
+      - Supports both IPv4 and IPv6; skips any non-public address.
+    """
     if not received_headers:
         return None
     if isinstance(received_headers, str):
         received_headers = [received_headers]
 
-    # Start from the last Received header (earliest in chain) and work up
-    for hdr in reversed(received_headers):
-        hdr_str = str(hdr)
-        # Find IPv4 addresses
-        ips = re.findall(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b', hdr_str)
-        for ip in ips:
-            parts = ip.split(".")
+    own = {h.strip().lower().rstrip(".") for h in (own_hosts or set()) if h}
+
+    def _first_public(candidates):
+        for cand in candidates:
+            cand = cand.strip()
             try:
-                p = [int(x) for x in parts]
+                ip = ipaddress.ip_address(cand)
             except ValueError:
                 continue
-            # Skip private/reserved ranges
-            if p[0] == 10:
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
                 continue
-            if p[0] == 127:
+            return str(ip)
+        return None
+
+    for hdr in received_headers:
+        hdr_str = str(hdr)
+
+        # Skip our own relays: if the 'by' or 'from' host is one of our hosts.
+        if own:
+            skip = False
+            for kw in (r'\bby\s+([^\s;()]+)', r'\bfrom\s+([^\s;()]+)'):
+                m = re.search(kw, hdr_str, re.I)
+                if m and m.group(1).strip().lower().rstrip(".") in own:
+                    skip = True
+                    break
+            if skip:
                 continue
-            if p[0] == 172 and 16 <= p[1] <= 31:
-                continue
-            if p[0] == 192 and p[1] == 168:
-                continue
-            if p[0] == 0:
-                continue
-            return ip
+
+        # Prefer bracketed connecting-IP forms.
+        bracketed = re.findall(r'\[(?:IPv6:)?([0-9a-fA-F:.]+)\]', hdr_str)
+        result = _first_public(bracketed)
+        if result:
+            return result
+
+        # Fall back to parenthesized forms only if no bracketed public IP found.
+        paren = re.findall(r'\((?:IPv6:)?([0-9a-fA-F:.]+)\)', hdr_str)
+        result = _first_public(paren)
+        if result:
+            return result
+
+    return None
+
+
+def _dnsbl_lookup_one(bl: str, reversed_ip: str, timeout: float):
+    """Single DNSBL lookup for one blocklist. Returns bl name on hit, None otherwise."""
+    try:
+        import dns.resolver
+        import dns.exception
+        r = dns.resolver.Resolver()
+        r.timeout = timeout
+        r.lifetime = timeout
+        answers = r.resolve(f"{reversed_ip}.{bl}", "A")
+        for ans in answers:
+            if str(ans).startswith("127."):
+                return bl
+    except Exception:
+        pass
     return None
 
 
@@ -381,6 +543,9 @@ def check_ip_reputation(sending_ip: str, timeout: float = 3.0) -> dict:
     DNSBL hits are noisy/often stale and are left for the AI to weigh."""
     if not sending_ip:
         return {"signal": None, "detail": "", "hits": []}
+
+    if sending_ip in _dnsbl_cache:
+        return _dnsbl_cache[sending_ip]
 
     try:
         import dns.resolver
@@ -394,38 +559,164 @@ def check_ip_reputation(sending_ip: str, timeout: float = 3.0) -> dict:
         "dnsbl.sorbs.net",
     ]
 
-    parts = sending_ip.split(".")
-    if len(parts) != 4:
+    try:
+        ip_obj = ipaddress.ip_address(sending_ip)
+    except ValueError:
         return {"signal": None, "detail": "", "hits": []}
-    reversed_ip = ".".join(reversed(parts))
+    if ip_obj.version == 4:
+        reversed_ip = ".".join(reversed(sending_ip.split(".")))
+    else:
+        # nibble-reversed label without the .ip6.arpa suffix
+        reversed_ip = ip_obj.reverse_pointer[:-len(".ip6.arpa")]
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     hits = []
-    resolver = dns.resolver.Resolver()
-    resolver.timeout = timeout
-    resolver.lifetime = timeout
-
-    for bl in blocklists:
-        query = f"{reversed_ip}.{bl}"
-        try:
-            answers = resolver.resolve(query, "A")
-            for ans in answers:
-                ans_str = str(ans)
-                if ans_str.startswith("127."):
-                    hits.append(bl)
-                    break
-        except dns.resolver.NXDOMAIN:
-            continue  # not listed
-        except (dns.exception.Timeout, dns.resolver.NoNameservers,
-                dns.resolver.NoAnswer):
-            continue
-        except Exception:
-            continue
+    with ThreadPoolExecutor(max_workers=len(blocklists)) as executor:
+        futures = {executor.submit(_dnsbl_lookup_one, bl, reversed_ip, timeout): bl
+                   for bl in blocklists}
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                hits.append(result)
 
     if len(hits) >= 2:
-        return {"signal": "IP_DNSBL_MULTIPLE",
-                "detail": f"IP {sending_ip} listed on: {', '.join(hits)}",
-                "hits": hits}
-    return {"signal": None, "detail": "", "hits": []}
+        result = {"signal": "IP_DNSBL_MULTIPLE",
+                  "detail": f"IP {sending_ip} listed on: {', '.join(hits)}",
+                  "hits": hits}
+    else:
+        result = {"signal": None, "detail": "", "hits": []}
+    _dnsbl_cache[sending_ip] = result
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Local DKIM verification (audit session a-2)
+# (c) 2026 STR Solutions, LLC. All rights reserved.
+# ---------------------------------------------------------------------------
+#
+# Bluehost-class shared mail hosts stamp NO Authentication-Results, so a
+# legitimately DKIM-signed transactional message reaches the classifier fully
+# unauthenticated and its d= domain reads as a suspicious "UNVERIFIED CLAIM".
+# We fix that by cryptographically verifying the sender's OWN DKIM signature
+# ourselves (dkimpy) and feeding the proven domain into summarize_authentication
+# exactly like a provider dkim=pass — see spam_filter._locally_verified_dkim for
+# the trigger gate (runs ONLY when no trusted A-R dkim verdict exists).
+#
+# Security posture: this authenticates domains for the CLASSIFIER prompt only.
+# It is deliberately NOT wired into the owner-command auth gate
+# (_command_auth_ok) — our own resolver's view is weaker provenance than the
+# receiving server's crypto or the server-written Received chain, and a wrong
+# command-auth is a config-mutation risk. A DNS failure, timeout, missing key,
+# rotated key, or ANY error yields NO VERDICT (empty list) — never a "fail".
+
+_dkim_dns_cache: dict = {}          # qname(str) -> bytes|None; per-process (one filter wake)
+_dkim_dns_timeouts = 0              # consecutive-timeout circuit-breaker counter
+_DKIM_DNS_TIMEOUT_LIMIT = 3         # disable local verification after this many in a row
+
+
+def clear_dkim_dns_cache() -> None:
+    """Reset the per-process DKIM DNS cache and circuit breaker (mirrors
+    clear_dnsbl_cache). Used by tests to isolate cases."""
+    global _dkim_dns_timeouts
+    _dkim_dns_cache.clear()
+    _dkim_dns_timeouts = 0
+
+
+def _dkim_get_txt(name, timeout=5):
+    """dnsfunc for dkimpy: cached, lifetime-bounded TXT lookup.
+
+    dkimpy passes ``name`` as bytes (b'selector._domainkey.domain.'). Returns
+    the TXT record as bytes, or None (dkimpy turns a None key into a failed
+    verification = no verdict). Consecutive dns.exception.Timeout events feed a
+    circuit breaker: once _DKIM_DNS_TIMEOUT_LIMIT is reached, every further
+    lookup short-circuits to None without touching the network, bounding a
+    dead-resolver wake. ANY exception -> None (fail safe)."""
+    global _dkim_dns_timeouts
+    key = name.decode("utf-8", "replace") if isinstance(name, (bytes, bytearray)) else str(name)
+    if key in _dkim_dns_cache:
+        return _dkim_dns_cache[key]
+    if _dkim_dns_timeouts >= _DKIM_DNS_TIMEOUT_LIMIT:
+        return None
+    try:
+        import dns.resolver
+        import dns.exception
+    except ImportError:
+        return None
+    try:
+        r = dns.resolver.Resolver()
+        r.timeout = timeout
+        r.lifetime = timeout
+        answers = r.resolve(key, "TXT")
+        txt = b"".join(list(answers)[0].strings)
+        _dkim_dns_cache[key] = txt
+        _dkim_dns_timeouts = 0
+        return txt
+    except dns.exception.Timeout:
+        _dkim_dns_timeouts += 1
+        return None
+    except Exception:
+        # NXDOMAIN, NoAnswer, malformed record, resolver misconfig, etc.
+        _dkim_dns_cache[key] = None
+        return None
+
+
+def verify_dkim_locally(raw_email: bytes, max_signatures: int = 3,
+                        dns_timeout: float = 5.0, budget_seconds: float = 10.0,
+                        logger=None, _dnsfunc=None) -> list:
+    """Cryptographically verify the message's OWN DKIM signature(s) (a-2).
+
+    Returns the sorted, lowercased list of d= domains whose signature actually
+    verified. Returns [] on ANY error — missing dkimpy/dnspython, malformed
+    message or signature, DNS timeout / NXDOMAIN / rotated key, tripped circuit
+    breaker, or exhausted wall-clock budget. NO VERDICT is ever "fail": a
+    failure simply contributes no authenticated domain, so the classifier
+    behaves exactly as it does today for unauthenticated mail.
+
+    Timeout/retry policy: dns_timeout (5s) caps each TXT lookup's total time
+    (dnspython lifetime — no application-level retries on top). At most
+    max_signatures (3) signatures are verified. budget_seconds (10s) caps total
+    wall-clock across all signatures so filtering cannot hang. _dnsfunc is a
+    test seam; production uses _dkim_get_txt (cached + circuit-broken)."""
+    if not raw_email:
+        return []
+    try:
+        import dkim
+    except ImportError:
+        if logger is not None:
+            logger.warning("verify_dkim_locally: dkimpy not installed — no verdict")
+        return []
+    dnsfunc = _dnsfunc or _dkim_get_txt
+
+    # Count DKIM-Signature headers to know how many indices to try.
+    try:
+        parsed = email.message_from_bytes(raw_email, policy=email.policy.compat32)
+        n_sigs = len(parsed.get_all("DKIM-Signature") or [])
+    except Exception:
+        return []
+    if n_sigs == 0:
+        return []
+
+    import time as _time
+    deadline = _time.monotonic() + budget_seconds
+    verified: set = set()
+    limit = min(n_sigs, max_signatures)
+    for idx in range(limit):
+        if _time.monotonic() >= deadline:
+            break
+        try:
+            d = dkim.DKIM(raw_email, timeout=dns_timeout)
+            ok = d.verify(idx=idx, dnsfunc=dnsfunc)
+        except Exception:
+            # dkim.DKIMException (bad message/signature/key) or anything else.
+            continue
+        if ok and getattr(d, "domain", None):
+            dom = d.domain
+            if isinstance(dom, (bytes, bytearray)):
+                dom = dom.decode("utf-8", "replace")
+            dom = dom.strip().lstrip("@").rstrip(".").lower()
+            if dom:
+                verified.add(dom)
+    return sorted(verified)
 
 
 # ---------------------------------------------------------------------------
@@ -448,12 +739,8 @@ _LEAKED_AI_PROMPT_MARKERS = [
     "=== email html rules ===",
     "=== inbox-placement hidden text",
     "run seed:",
-    "prompt preset:",
-    "creative style mode:",
     "return only the complete html document",
     "you are producing html intended for common email clients",
-    "inferred creative strategy",
-    "detected campaign type:",
 ]
 
 
@@ -499,23 +786,16 @@ def check_leaked_ai_prompt(subject: str, plain_text_body: str) -> dict:
 # (a) Our own delimiter tag appearing in received content:
 #     <untrusted_email> or </untrusted_email>
 #     (We control this tag — its presence in a received email is an attack.)
-# (b) Forged AI conversation turns — Anthropic-style \n\nAssistant: / \n\nHuman:
-#     or a line beginning with Assistant:/Human:/System: at line start.
-# (c) "ignore/disregard/forget … instructions" imperative PAIRED within ~50
+# (b) "ignore/disregard/forget … instructions" imperative PAIRED within ~50
 #     chars with a classification-manipulation target.
 _HARD_INJECTION_PATTERNS = [
-    # (a) Our own delimiter tag in inbound content
+    # (a) Our own delimiter tag in inbound content — definitively an attack
     re.compile(r'<\s*/?\s*untrusted_email\s*>', re.IGNORECASE),
-
-    # (b) Anthropic-style double-newline conversation turn injection
-    re.compile(r'\n\n\s*(?:assistant|human)\s*:', re.IGNORECASE),
-    # Line-anchored conversation turn (^ with MULTILINE)
-    re.compile(r'(?:^|\n)[ \t]*(?:assistant|human|system)\s*:\s', re.IGNORECASE),
 ]
 
-# (c) Paired imperative + classification-target (within ~50 chars of each other)
+# (b) Paired imperative + classification-target (within ~50 chars of each other)
 _HARD_INJECTION_IMPERATIVE = re.compile(
-    r'(?:ignore|disregard|forget)\b.{0,50}?\b(?:not\s+spam|mark\s+as\s+safe|legitimate|whitelist|don.t\s+flag|classify\s+as)',
+    r'(?:ignore|disregard|forget)\b.{0,50}?\b(?:not\s+spam|mark\s+as\s+safe|whitelist|don.t\s+flag|classify\s+as)',
     re.IGNORECASE | re.DOTALL,
 )
 

@@ -9,11 +9,11 @@ and launches the filter via subprocess when the user clicks Run Now
 """
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -23,12 +23,12 @@ except ImportError:  # rumps is only present in the bundled .app
     rumps = None  # type: ignore
 
 from . import config_io
+from . import file_lock
 from . import paths
 from . import startup_log
 
 
 POLL_INTERVAL_SEC = 30
-LOCK_MAX_AGE_SEC = 600
 
 # Menu bar indicator: prefer a real image file (the app icon) because
 # text glyphs have repeatedly failed the font-fallback lottery on Sonoma
@@ -141,14 +141,63 @@ def determine_state() -> tuple[str, str, str]:
     )
 
 
-def lock_is_active() -> bool:
-    if not paths.FILTER_LOCK.exists():
-        return False
+def _load_report_state() -> dict:
     try:
-        age = time.time() - paths.FILTER_LOCK.stat().st_mtime
-        return age < LOCK_MAX_AGE_SEC
-    except OSError:
-        return False
+        with paths.REPORT_STATE_PATH.open() as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _enabled_account_names() -> list:
+    try:
+        config = config_io.load_config()
+    except Exception:
+        return []
+    return [a.get("name") for a in config.get("accounts", [])
+            if a.get("enabled", True)]
+
+
+def last_report_success():
+    """Most recent successful daily-report send across ENABLED accounts
+    (orphaned/removed accounts in state are ignored). None if none yet."""
+    accounts = _load_report_state().get("accounts", {})
+    names = _enabled_account_names() or list(accounts.keys())
+    best = None
+    for name in names:
+        ts = accounts.get(name, {}).get("last_success_at")
+        try:
+            dt = datetime.fromisoformat(ts) if ts else None
+        except (ValueError, TypeError):
+            dt = None
+        if dt and (best is None or dt > best):
+            best = dt
+    return best
+
+
+def count_overdue_reports() -> int:
+    """# of ENABLED accounts whose last successful report is >25h old. A missing
+    last_success_at counts as pending (not overdue), so fresh installs / newly
+    added accounts don't false-alarm."""
+    accounts = _load_report_state().get("accounts", {})
+    now = datetime.now()
+    overdue = 0
+    for name in _enabled_account_names():
+        ts = accounts.get(name, {}).get("last_success_at")
+        try:
+            dt = datetime.fromisoformat(ts) if ts else None
+        except (ValueError, TypeError):
+            dt = None
+        if dt is not None and (now - dt).total_seconds() > 25 * 3600:
+            overdue += 1
+    return overdue
+
+
+def lock_is_active() -> bool:
+    # Probe the real flock instead of the lock file's mtime: a live holder is
+    # detected no matter how long it has run, and a dead holder reads as free
+    # immediately (no 10-minute staleness window).
+    return file_lock.is_locked(paths.FILTER_LOCK)
 
 
 def run_filter_subprocess() -> tuple[bool, str]:
@@ -259,38 +308,55 @@ def toggle_pause() -> tuple[bool, str]:
     per-account enabled state for accounts that were already disabled before the
     pause.
     """
-    config = config_io.load_config()
-    accounts = config.get("accounts", [])
-    if not accounts:
+    # C7 fix: persist through config_io.update_config so the whole
+    # load->flip-pause-keys->save runs FRESH under the cross-process lock. A
+    # config change another writer (the filter's command handler, the EULA save,
+    # the Dashboard) committed between this read and write is no longer silently
+    # reverted, and the pause flag can no longer be erased by a peer's blind
+    # save. The mutator touches ONLY the pause keys (accounts[].enabled and the
+    # ui pause snapshot) — every other key is read fresh and re-saved untouched.
+    if not config_io.load_config().get("accounts"):
         return False, "No accounts configured."
 
-    currently_paused = not any(a.get("enabled") for a in accounts)
-    ui = config.setdefault("ui", {})
+    result: dict = {}
 
-    if currently_paused:
-        # Restore per-position (index-keyed to survive duplicate/empty names).
-        pre_list = ui.get("_pre_pause_enabled_list")
-        if isinstance(pre_list, list) and len(pre_list) == len(accounts):
-            for a, was_enabled in zip(accounts, pre_list):
-                a["enabled"] = bool(was_enabled)
+    def _flip_pause(config: dict) -> None:
+        accounts = config.get("accounts", [])
+        if not accounts:
+            # Raced to empty between the guard above and the lock — bail without
+            # changing anything; the outer return uses result["msg"].
+            result["paused"] = False
+            result["msg"] = "No accounts configured."
+            return
+        ui = config.setdefault("ui", {})
+        currently_paused = not any(a.get("enabled", True) for a in accounts)
+        if currently_paused:
+            # Restore per-position (index-keyed to survive duplicate/empty names).
+            pre_list = ui.get("_pre_pause_enabled_list")
+            if isinstance(pre_list, list) and len(pre_list) == len(accounts):
+                for a, was_enabled in zip(accounts, pre_list):
+                    a["enabled"] = bool(was_enabled)
+            else:
+                # Fall back to legacy name-keyed map (older configs) or enable all.
+                legacy = ui.get("_pre_pause_enabled", {})
+                for a in accounts:
+                    a["enabled"] = bool(legacy.get(a.get("name", ""), True))
+            ui.pop("_pre_pause_enabled_list", None)
+            ui.pop("_pre_pause_enabled", None)
+            ui["paused"] = False
+            result["paused"] = False
+            result["msg"] = "Filtering resumed."
         else:
-            # Fall back to legacy name-keyed map (older configs) or enable all.
-            legacy = ui.get("_pre_pause_enabled", {})
+            ui["_pre_pause_enabled_list"] = [bool(a.get("enabled", True)) for a in accounts]
+            ui.pop("_pre_pause_enabled", None)  # clear any legacy key
             for a in accounts:
-                a["enabled"] = bool(legacy.get(a.get("name", ""), True))
-        ui.pop("_pre_pause_enabled_list", None)
-        ui.pop("_pre_pause_enabled", None)
-        ui["paused"] = False
-        config_io.save_config(config)
-        return False, "Filtering resumed."
-    else:
-        ui["_pre_pause_enabled_list"] = [bool(a.get("enabled")) for a in accounts]
-        ui.pop("_pre_pause_enabled", None)  # clear any legacy key
-        for a in accounts:
-            a["enabled"] = False
-        ui["paused"] = True
-        config_io.save_config(config)
-        return True, "Filtering paused."
+                a["enabled"] = False
+            ui["paused"] = True
+            result["paused"] = True
+            result["msg"] = "Filtering paused."
+
+    config_io.update_config(_flip_pause)
+    return result["paused"], result["msg"]
 
 
 # ---------------------------------------------------------------------------
@@ -438,10 +504,12 @@ class MailWardenMenuBar(rumps.App if rumps else object):
             super().__init__(MENUBAR_ICON_TEXT_FALLBACK, quit_button=None)
         self.status_item = rumps.MenuItem("MailWarden: starting…")
         self.last_run_item = rumps.MenuItem("Last run: —")
+        self.report_item = rumps.MenuItem("Last report: —")
         self.pause_item = rumps.MenuItem("Pause Filtering", callback=self.on_pause_toggle)
         self.menu = [
             self.status_item,
             self.last_run_item,
+            self.report_item,
             None,
             rumps.MenuItem("Run Now", callback=self.on_run_now),
             rumps.MenuItem("Open Dashboard", callback=self.on_open_dashboard),
@@ -454,6 +522,20 @@ class MailWardenMenuBar(rumps.App if rumps else object):
 
     def refresh_status(self, _timer=None):
         shape, short, long_line = determine_state()
+        # Report-health override: surface the most recent successful report
+        # send and any overdue accounts, and demote a GREEN filter state to
+        # YELLOW if a report is overdue (the report agent failing is itself a
+        # problem even when the filter is healthy).
+        overdue = count_overdue_reports()
+        last_rep = last_report_success()
+        if last_rep is None:
+            self.report_item.title = "Last report: pending"
+        else:
+            rep_fmt = last_rep.strftime("%Y-%m-%d %H:%M")
+            self.report_item.title = ("Last report: " + rep_fmt
+                                      + (f" ({overdue} overdue)" if overdue else ""))
+        if overdue and shape == STATE_GREEN[0]:
+            shape, short = STATE_YELLOW[0], STATE_YELLOW[1]
         # When using the image icon we leave the title empty so only the
         # icon appears in the menu bar. When falling back to text, we
         # keep the text title visible.
@@ -466,7 +548,7 @@ class MailWardenMenuBar(rumps.App if rumps else object):
 
         config = config_io.load_config()
         paused = config.get("ui", {}).get("paused", False) or not any(
-            a.get("enabled") for a in config.get("accounts", []))
+            a.get("enabled", True) for a in config.get("accounts", []))
         self.pause_item.title = "Resume Filtering" if paused else "Pause Filtering"
 
     def on_run_now(self, _sender):

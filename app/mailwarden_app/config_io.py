@@ -10,11 +10,14 @@ UI are interchangeable with files written by the filter.
 """
 import json
 import os
+import re
+import secrets
 import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from . import file_lock
 from . import paths
 
 
@@ -59,8 +62,18 @@ DEFAULT_CONFIG: dict = {
     "accounts": [],
     "anthropic": {
         "api_key": "",
+        # classify_mode "cascade" = two-model double-check: screen_model
+        # judges every email; confirm_model re-judges anything the screen
+        # would junk, and mail is junked only when both agree (rescue-only).
+        # "single" runs `model` on every email like pre-cascade releases.
+        # load_config's _deep_merge back-fills these keys onto older saved
+        # configs, so ALL existing installs move to the cascade on upgrade
+        # (Matt's decision, 2026-07-02); `model` is retained and used only
+        # when classify_mode == "single".
+        "classify_mode": "cascade",
         "model": "claude-haiku-4-5-20251001",
-        "confidence_threshold": 0.85,
+        "screen_model": "claude-haiku-4-5-20251001",
+        "confirm_model": "claude-sonnet-4-6",
     },
     "filter": {
         "dry_run": True,
@@ -72,6 +85,7 @@ DEFAULT_CONFIG: dict = {
         # than interval_minutes after the last real run. The UI clamps this to
         # a sane range (5–360 minutes).
         "interval_minutes": 15,
+        "confidence_threshold": 0.85,
     },
     "smtp": {
         "host": "",
@@ -151,11 +165,28 @@ def smtp_config_from_account(
     }
 
 
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """Return overlay with any missing keys back-filled from base, recursively.
+
+    Existing overlay values are never overwritten — user config wins.
+    """
+    import copy
+    result = dict(overlay)
+    for key, base_val in base.items():
+        if key not in result:
+            result[key] = copy.deepcopy(base_val)
+        elif isinstance(base_val, dict) and isinstance(result[key], dict):
+            result[key] = _deep_merge(base_val, result[key])
+    return result
+
+
 def load_config() -> dict:
     """Load config.json if present, else return a deep copy of DEFAULT_CONFIG.
 
-    Migration: older configs lack per-account spam_action. Treat missing as
-    "junk" so existing behavior is preserved on upgrade.
+    Migrations applied on load:
+    - Back-fill spam_action on accounts created before this field existed.
+    - C4: move confidence_threshold from anthropic → filter block.
+    - M16: back-fill any keys added to DEFAULT_CONFIG since config was saved.
     """
     import copy
     if paths.CONFIG_PATH.exists():
@@ -165,6 +196,15 @@ def load_config() -> dict:
             # Back-fill spam_action on accounts created before this field existed.
             for acct in data.get("accounts", []):
                 acct.setdefault("spam_action", "junk")
+            # C4: migrate confidence_threshold from anthropic → filter block.
+            anthropic_block = data.get("anthropic", {})
+            filter_block = data.setdefault("filter", {})
+            if "confidence_threshold" in anthropic_block and \
+               "confidence_threshold" not in filter_block:
+                filter_block["confidence_threshold"] = \
+                    anthropic_block.pop("confidence_threshold")
+            # M16: fill in any schema keys missing from this (older) saved config.
+            data = _deep_merge(DEFAULT_CONFIG, data)
             return data
         except (json.JSONDecodeError, OSError):
             pass
@@ -178,6 +218,26 @@ def save_config(config: dict) -> None:
         os.chmod(paths.CONFIG_PATH, 0o600)
     except OSError:
         pass
+
+
+def update_config(mutator) -> dict:
+    """Atomic read-modify-write of config.json under the cross-process lock.
+
+    Loads the LATEST config FRESH inside the lock, applies ``mutator(config)``
+    (which mutates the dict in place — its return value is ignored), saves, and
+    returns the saved config. Holding file_lock.locked() across the whole span
+    means a concurrent writer (the filter's command handlers, the EULA save, a
+    peer UI process) cannot land a change between this load and save that the
+    blind save would silently revert (audit C7). The mutator must touch ONLY the
+    keys this caller intends to change — everything else it reads fresh and
+    re-saves untouched. A TimeoutError from locked() (only if a peer hangs >30s)
+    propagates to the caller's existing error handling.
+    """
+    with file_lock.locked(paths.CONFIG_PATH):
+        config = load_config()
+        mutator(config)
+        save_config(config)
+        return config
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +298,20 @@ def add_blocklist_entry(value: str, kind: str, scope) -> bool:
     EITHER shape), its scope is updated in place rather than duplicating the
     value. Returns True if the file was changed, False on a bad kind/empty value.
     """
+    # Lock the whole load→modify→save span (C7): a concurrent writer of
+    # blacklist.json (the filter's "block sender" handler, a list-tab edit)
+    # cannot land a change between the fresh load and the save below.
+    with file_lock.locked(paths.BLACKLIST_PATH):
+        return _add_blocklist_entry_locked(value, kind, scope)
+
+
+def _add_blocklist_entry_locked(value: str, kind: str, scope) -> bool:
+    """Unlocked core of add_blocklist_entry — the caller MUST already hold the
+    blacklist.json sidecar lock. flock is not re-entrant across two fds in one
+    process, so a caller that already holds the lock (e.g.
+    apply_blocklist_proposal_from_pending) calls this directly instead of the
+    public wrapper, which would deadlock against itself. Same logic, same
+    return contract as add_blocklist_entry."""
     field = _BLOCK_KIND_TO_FIELD.get((kind or "").strip().lower())
     if field is None:
         return False
@@ -291,8 +365,34 @@ def save_pending_signals(data: dict) -> None:
     save_json_atomic(paths.PENDING_SIGNALS_PATH, data)
 
 
+# Retired shipped-default signals (fix a-1). Stripped in-memory on every load so
+# existing installs whose memory/signals.json inherited them stop surfacing them
+# without a forced disk rewrite. EXACT-match only — never substring — so a
+# genuine user-taught signal is never collateral. Keep in sync across the 4 copies.
+_RETIRED_DEFAULT_SIGNALS = frozenset({
+    "Benign conversational text block (meeting scheduling, personal reflection) prepended before promotional/scam content - used as filter evasion",
+    "CSS class names using random nature/object word combinations (e.g., 'nebula-quartz', 'pebble-orbit', 'aurora-cinder', 'thistle-comet') in HTML emails",
+    "Mismatch between casual/personal opening paragraphs and promotional closing content",
+    "Points/rewards expiration urgency with specific dollar amounts ($100)",
+})
+
+
+def scrub_retired_signals(data: dict) -> dict:
+    """Strip retired shipped-default signals in-memory. Returns the same dict."""
+    if not isinstance(data, dict):
+        return data
+    sig = data.get("signals")
+    if isinstance(sig, dict):
+        for key in ("hard_signals", "soft_signals"):
+            vals = sig.get(key)
+            if isinstance(vals, list):
+                sig[key] = [s for s in vals if s not in _RETIRED_DEFAULT_SIGNALS]
+    return data
+
+
 def load_signals() -> dict:
-    return load_json(paths.SIGNALS_PATH, {"signals": {}, "ai_refinements": []})
+    return scrub_retired_signals(
+        load_json(paths.SIGNALS_PATH, {"signals": {}, "ai_refinements": []}))
 
 
 def save_signals(data: dict) -> None:
@@ -307,6 +407,14 @@ def save_signals(data: dict) -> None:
 # expired / reinforced / deleted) is appended as JSONL to
 # ~/MailWarden/memory/signal_refinements.log so the Dashboard's history
 # section is cheap to render without reconstructing state.
+
+
+# Provenance marker for a curate rule the OWNER authored directly in the
+# Unwanted Categories editor (typed, no example email, no Claude call), as
+# opposed to one the learner derived from a forwarded/taught example. Same
+# rule_class + storage + prompt path as a learned curate rule — only the
+# source differs, so the editor can list/manage authored rules on their own.
+AUTHORED_SOURCE = "user_authored"
 
 
 def list_active_refinements() -> list[dict]:
@@ -354,18 +462,21 @@ def delete_active_refinement(refinement_id: str, source: str = "dashboard",
                               reason: str = "") -> bool:
     """Remove a refinement from the active list. Logs the deletion.
     Returns True if something was deleted, False if id wasn't found."""
-    data = load_signals()
-    remaining = []
-    found = None
-    for r in data.get("ai_refinements", []):
-        if r.get("id") == refinement_id:
-            found = r
-            continue
-        remaining.append(r)
-    if found is None:
-        return False
-    data["ai_refinements"] = remaining
-    save_signals(data)
+    # Lock the signals.json RMW span (C7): the learner's merge-save or a
+    # concurrent Dashboard edit cannot race this delete and resurrect the row.
+    with file_lock.locked(paths.SIGNALS_PATH):
+        data = load_signals()
+        remaining = []
+        found = None
+        for r in data.get("ai_refinements", []):
+            if r.get("id") == refinement_id:
+                found = r
+                continue
+            remaining.append(r)
+        if found is None:
+            return False
+        data["ai_refinements"] = remaining
+        save_signals(data)
     append_refinement_log({
         "ts": now_iso(),
         "event": "deleted",
@@ -377,6 +488,52 @@ def delete_active_refinement(refinement_id: str, source: str = "dashboard",
     return True
 
 
+def list_retired_refinements() -> list[dict]:
+    """Retired (email-dropped) refinements, for the Dashboard's Dropped-rules
+    panel. Mirrors list_active_refinements' shape but with an EXACT predicate:
+    only records explicitly marked "retired" count — an absent status must NOT
+    (unlike list_active_refinements, which treats an absent status as active).
+    Only the email DROP corridor (spam_filter.retire_ai_refinement) sets this
+    status; the Dashboard Delete button removes the record outright, so a
+    deleted rule never lands here."""
+    return [r for r in load_signals().get("ai_refinements", [])
+            if r.get("status") == "retired"]
+
+
+def restore_refinement(refinement_id: str, source: str = "dashboard") -> dict | None:
+    """Config_io twin of spam_filter.unretire_ai_refinement — MUST stay in sync
+    with it (the two trees never import each other, so the semantics are
+    duplicated; the engine body is the source of truth). RESTORE a dropped rule:
+    flip its ai_refinement status from "retired" back to "active". The retired
+    record was never deleted, so this is a pure status flip — the rule is used
+    again on the next filter tick. Returns the reactivated refinement dict on
+    success, or None if no matching RETIRED rule was found (missing OR already
+    active — idempotent, safe on repeated clicks)."""
+    # Lock the signals.json RMW span (C7): a fresh read under the lock means a
+    # concurrent learner merge-save / Dashboard edit isn't clobbered by this one.
+    restored = None
+    with file_lock.locked(paths.SIGNALS_PATH):
+        data = load_signals()
+        for r in data.get("ai_refinements", []) or []:
+            if r.get("id") == refinement_id and r.get("status") == "retired":
+                r["status"] = "active"
+                r.pop("retired_at", None)
+                r["last_reinforced"] = now_iso()
+                restored = r
+                break
+        if restored is not None:
+            save_signals(data)
+    if restored is not None:
+        append_refinement_log({
+            "ts": now_iso(),
+            "event": "restored_by_owner",
+            "id": refinement_id,
+            "headline": restored.get("headline", ""),
+            "source": source,
+        })
+    return restored
+
+
 def set_refinement_scope(refinement_id: str, scope) -> bool:
     """Set the per-account ``scope`` on an active refinement and persist.
 
@@ -386,13 +543,137 @@ def set_refinement_scope(refinement_id: str, scope) -> bool:
     per-account toggle row so a scope change takes effect on the next filter
     tick without an email round-trip.
     """
-    data = load_signals()
-    for r in data.get("ai_refinements", []):
-        if r.get("id") == refinement_id:
-            r["scope"] = scope
+    # Lock the signals.json RMW span (C7): a fresh read under the lock means a
+    # concurrent learner merge-save / Dashboard edit isn't clobbered by this one.
+    with file_lock.locked(paths.SIGNALS_PATH):
+        data = load_signals()
+        for r in data.get("ai_refinements", []):
+            if r.get("id") == refinement_id:
+                r["scope"] = scope
+                save_signals(data)
+                return True
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Owner-authored "Unwanted Categories" curate rules (Batch C).
+#
+# These reuse the EXISTING curate refinement mechanism end-to-end — same
+# rule_class ("curate"), same storage (signals.json[ai_refinements]), same
+# prompt injection (spam_filter._build_learned_lines renders them on the
+# identical "USER PREFERENCE (curate)" path a learned curate rule uses). The
+# ONLY differences: the owner types the category description directly (no
+# example email, no Claude call), so the record is created here rather than by
+# the learner; and source==AUTHORED_SOURCE marks the provenance so the editor
+# can manage authored rules separately and the learner/contradiction guard is
+# never surprised. Enable/disable reuse the retire/restore status flip; delete
+# reuses delete_active_refinement.
+# ---------------------------------------------------------------------------
+
+
+def build_authored_curate_refinement(refinement_id: str, description: str,
+                                     scope) -> dict | None:
+    """PURE (no IO). Build an ACTIVE curate ai_refinement authored directly by
+    the owner. Mirrors the LEARNED curate record shape
+    (learn_signals._build_refinement with verdict "spam" + rule_class "curate")
+    so it flows through the identical classifier path; only the provenance
+    differs (source=AUTHORED_SOURCE, evidence empty, no Claude rationale).
+
+    Returns None when ``description`` is blank — a headline-less refinement is
+    inert (spam_filter._build_learned_lines skips a refinement with no
+    headline), so a blank rule is refused rather than written."""
+    desc = (description or "").strip()
+    if not desc:
+        return None
+    now = now_iso()
+    return {
+        "id": refinement_id,
+        "kind": "new_pattern",
+        "verdict": "spam",
+        "rule_class": "curate",
+        "headline": desc,
+        "rationale": "",
+        "what_this_doesnt_cover": "",
+        "confidence": "high",
+        "evidence": [],
+        "first_learned": now,
+        "last_reinforced": now,
+        "match_count": 0,
+        "status": "active",
+        "scope": scope,
+        "source": AUTHORED_SOURCE,
+    }
+
+
+def create_authored_refinement(description: str, scope,
+                               source: str = "dashboard") -> dict | None:
+    """Author a NEW unwanted-category curate rule and persist it (Batch C).
+
+    Locked read-modify-write of signals.json: mint a fresh R- id, build the
+    ACTIVE curate record, append, save, and log an "authored" event. The rule
+    is in effect on the next filter tick (signals.json is reloaded per run).
+    Returns the saved record, or None if ``description`` was blank (nothing
+    written)."""
+    if not (description or "").strip():
+        return None
+    with file_lock.locked(paths.SIGNALS_PATH):
+        data = load_signals()
+        rid = _mint_refinement_id(data)
+        record = build_authored_curate_refinement(rid, description, scope)
+        data.setdefault("ai_refinements", []).append(record)
+        save_signals(data)
+    append_refinement_log({
+        "ts": now_iso(),
+        "event": "authored",
+        "id": rid,
+        "headline": record["headline"],
+        "source": source,
+    })
+    return record
+
+
+def list_authored_refinements() -> list[dict]:
+    """Every owner-authored curate rule (source==AUTHORED_SOURCE), whether
+    ACTIVE or disabled (status "retired"), newest first — the data behind the
+    Unwanted Categories editor. Unlike list_active_refinements, status is NOT
+    filtered, because the editor shows disabled rules too (with a toggle to
+    re-enable)."""
+    rows = [r for r in load_signals().get("ai_refinements", [])
+            if r.get("source") == AUTHORED_SOURCE]
+    rows.sort(key=lambda r: r.get("first_learned", ""), reverse=True)
+    return rows
+
+
+def retire_refinement(refinement_id: str, source: str = "dashboard") -> bool:
+    """Config_io twin of spam_filter.retire_ai_refinement — MUST stay in sync
+    with it (the two trees never import each other, so the semantics are
+    duplicated; the engine body is the source of truth). DISABLE a rule: flip
+    its ai_refinement status from "active" to "retired" (never delete —
+    reversible; restore_refinement, the unretire twin, flips it back). Excludes
+    it from prompt injection on the next filter tick. Returns True if a matching
+    ACTIVE rule was retired, False if missing / already inactive (idempotent —
+    safe on repeated clicks). Used by the Unwanted Categories editor's
+    enable/disable toggle."""
+    retired = False
+    with file_lock.locked(paths.SIGNALS_PATH):
+        data = load_signals()
+        for r in data.get("ai_refinements", []) or []:
+            if r.get("id") == refinement_id \
+                    and r.get("status", "active") == "active":
+                r["status"] = "retired"
+                r["retired_at"] = now_iso()
+                retired = True
+                break
+        if retired:
             save_signals(data)
-            return True
-    return False
+    if retired:
+        append_refinement_log({
+            "ts": now_iso(),
+            "event": "retired_by_owner",
+            "id": refinement_id,
+            "source": source,
+        })
+    return retired
 
 
 def apply_refinement_from_pending(sfid: str, source: str = "dashboard") -> dict | None:
@@ -404,63 +685,98 @@ def apply_refinement_from_pending(sfid: str, source: str = "dashboard") -> dict 
     when the SFID wasn't found / wasn't an approvable kind / was already
     resolved.
     """
-    pending = load_pending_signals()
-    conv = None
-    for c in pending.get("conversations", []):
-        if c.get("id") == sfid:
-            conv = c
-            break
-    if conv is None:
-        return None
-    if conv.get("status") not in ("awaiting_reply",):
-        return None
-    if conv.get("kind") != "spam_example_proposal":
-        return None
-    refinement = conv.get("proposed_refinement")
-    if not isinstance(refinement, dict):
-        return None
+    # ONE lock over BOTH files for the whole operation (C7). file_lock.locked
+    # sorts the two sidecar paths into a fixed order internally, so this can
+    # never deadlock against another op that takes the same pair in the opposite
+    # order. Fresh reads under the lock mean a concurrent learner save or a
+    # parallel approval cannot be clobbered.
+    with file_lock.locked(paths.PENDING_SIGNALS_PATH, paths.SIGNALS_PATH):
+        pending = load_pending_signals()
+        conv = None
+        for c in pending.get("conversations", []):
+            if c.get("id") == sfid:
+                conv = c
+                break
+        if conv is None:
+            return None
+        if conv.get("status") not in ("awaiting_reply",):
+            return None
+        if conv.get("kind") != "spam_example_proposal":
+            return None
+        refinement = conv.get("proposed_refinement")
+        if not isinstance(refinement, dict):
+            return None
 
-    # Add to active list
-    data = load_signals()
-    refinements = data.setdefault("ai_refinements", [])
-    existing_ids = {r.get("id") for r in refinements}
-    if refinement.get("id") in existing_ids:
-        # Already active — treat as no-op but still mark conv resolved
-        pass
-    else:
-        refinement = dict(refinement)
-        # P1 approval backstop: proposals created before scope-capture existed
-        # carry no scope. Bind them to the inbox that forwarded the example so
-        # the rule does not silently leak onto every account. Only fills a
-        # MISSING scope key — never overwrites a scope the proposal already has
-        # (including an empty list, which is a deliberate "no accounts").
-        if "scope" not in refinement:
-            conv_forwarder = (conv.get("forwarder") or "").strip().lower()
-            if conv_forwarder:
-                refinement["scope"] = [conv_forwarder]
-        refinement["status"] = "active"
-        refinement.setdefault("first_learned", now_iso())
-        refinement.setdefault("last_reinforced", now_iso())
-        refinement.setdefault("match_count", 1)
-        refinements.append(refinement)
-        save_signals(data)
+        # Add to active list. Finding #8: the id may reference a rule the owner
+        # DROPped. Approving does not un-drop it, so distinguish a genuine new
+        # rule from an already-active one (no-op) from a RETIRED one that this
+        # apply cannot reactivate (honest fail — the owner must RESTORE it).
+        data = load_signals()
+        refinements = data.setdefault("ai_refinements", [])
+        rid = refinement.get("id")
+        existing = next((r for r in refinements if r.get("id") == rid),
+                        None) if rid else None
+        if existing is not None and existing.get("status", "active") != "active":
+            outcome = "retired"
+        elif existing is not None:
+            # Already active — treat as no-op but still mark conv resolved.
+            outcome = "already_active"
+        else:
+            outcome = "applied"
+            refinement = dict(refinement)
+            # P1 approval backstop: proposals created before scope-capture
+            # existed carry no scope. Bind them to the inbox that forwarded the
+            # example so the rule does not silently leak onto every account.
+            # Only fills a MISSING scope key — never overwrites a scope the
+            # proposal already has (including an empty list, a deliberate
+            # "no accounts").
+            if "scope" not in refinement:
+                conv_forwarder = (conv.get("forwarder") or "").strip().lower()
+                if conv_forwarder:
+                    refinement["scope"] = [conv_forwarder]
+            refinement["status"] = "active"
+            refinement.setdefault("first_learned", now_iso())
+            refinement.setdefault("last_reinforced", now_iso())
+            refinement.setdefault("match_count", 1)
+            refinements.append(refinement)
+            save_signals(data)
 
-    conv["status"] = "approved"
-    conv["resolution"] = "approved"
-    conv.setdefault("conversation_history", []).append({
-        "role": "system",
-        "timestamp": now_iso(),
-        "content": f"Approved via {source}",
-    })
-    save_pending_signals(pending)
-    append_refinement_log({
-        "ts": now_iso(),
-        "event": "applied",
-        "id": refinement.get("id"),
-        "sfid": sfid,
-        "headline": refinement.get("headline", ""),
-        "source": source,
-    })
+        if outcome != "retired":
+            # Retired: leave the proposal PENDING (do not resolve it) so the
+            # Dashboard can ack honestly and point the owner at the email
+            # RESTORE reply.
+            conv["status"] = "approved"
+            conv["resolution"] = "approved"
+            conv.setdefault("conversation_history", []).append({
+                "role": "system",
+                "timestamp": now_iso(),
+                "content": f"Approved via {source}",
+            })
+            save_pending_signals(pending)
+    # Log ONLY a genuine append as "applied" (re-approving an already-active
+    # rule must not double-log). A retired-id approval is a no-op → "apply_failed".
+    if outcome == "applied":
+        append_refinement_log({
+            "ts": now_iso(),
+            "event": "applied",
+            "id": refinement.get("id"),
+            "sfid": sfid,
+            "headline": refinement.get("headline", ""),
+            "source": source,
+        })
+        return refinement
+    if outcome == "retired":
+        append_refinement_log({
+            "ts": now_iso(),
+            "event": "apply_failed",
+            "id": rid,
+            "sfid": sfid,
+            "reason": "referenced rule is retired",
+            "source": source,
+        })
+        return {"id": rid, "status": "retired",
+                "headline": refinement.get("headline", "")}
+    # already_active: truthful "it's active" for the caller; no re-log.
     return refinement
 
 
@@ -474,33 +790,41 @@ def apply_blocklist_proposal_from_pending(sfid: str,
     tick. Returns the written entry dict, or None when the SFID wasn't found /
     wasn't a block_sender_proposal / was already resolved.
     """
-    pending = load_pending_signals()
-    conv = None
-    for c in pending.get("conversations", []):
-        if c.get("id") == sfid:
-            conv = c
-            break
-    if conv is None:
-        return None
-    if conv.get("status") not in ("awaiting_reply",):
-        return None
-    if conv.get("kind") != "block_sender_proposal":
-        return None
-    entry = conv.get("blocklist_entry")
-    if not isinstance(entry, dict) or not entry.get("value"):
-        return None
+    # ONE lock over BOTH files for the whole operation (C7), sorted internally
+    # so it can't deadlock against a peer taking the same pair in the other
+    # order. The blacklist write below uses the UNLOCKED core
+    # (_add_blocklist_entry_locked) on purpose: flock is not re-entrant across
+    # two fds in one process, so calling the locking add_blocklist_entry here
+    # would block forever waiting on the lock this very call already holds.
+    with file_lock.locked(paths.PENDING_SIGNALS_PATH, paths.BLACKLIST_PATH):
+        pending = load_pending_signals()
+        conv = None
+        for c in pending.get("conversations", []):
+            if c.get("id") == sfid:
+                conv = c
+                break
+        if conv is None:
+            return None
+        if conv.get("status") not in ("awaiting_reply",):
+            return None
+        if conv.get("kind") != "block_sender_proposal":
+            return None
+        entry = conv.get("blocklist_entry")
+        if not isinstance(entry, dict) or not entry.get("value"):
+            return None
 
-    add_blocklist_entry(entry.get("value", ""), entry.get("kind", "domain"),
-                        entry.get("scope", "all"))
+        _add_blocklist_entry_locked(entry.get("value", ""),
+                                    entry.get("kind", "domain"),
+                                    entry.get("scope", "all"))
 
-    conv["status"] = "approved"
-    conv["resolution"] = "approved"
-    conv.setdefault("conversation_history", []).append({
-        "role": "system",
-        "timestamp": now_iso(),
-        "content": f"Block-sender approved via {source}",
-    })
-    save_pending_signals(pending)
+        conv["status"] = "approved"
+        conv["resolution"] = "approved"
+        conv.setdefault("conversation_history", []).append({
+            "role": "system",
+            "timestamp": now_iso(),
+            "content": f"Block-sender approved via {source}",
+        })
+        save_pending_signals(pending)
     append_refinement_log({
         "ts": now_iso(),
         "event": "applied",
@@ -512,25 +836,298 @@ def apply_blocklist_proposal_from_pending(sfid: str,
     return entry
 
 
+# ---------------------------------------------------------------------------
+# False-positive narrowing helpers — DUPLICATED from spam_filter.py.
+#
+# config_io (the GUI package) and the engine (payload/MailWarden/src) are two
+# packages that never import each other — they share JSON sidecars only — so the
+# small PURE FP helpers the Dashboard "Approve" needs are copied here verbatim
+# rather than imported. They MUST stay byte-identical to their spam_filter.py
+# originals; a drift-guard test (tests/test_fp_dashboard_approve.py) feeds one
+# fixture to both parsers and asserts identical output. If you edit one copy,
+# edit the other. Keeping spam_filter.py untouched also keeps the offline eval
+# byte-identical to baseline.
+#
+# Mirrors spam_filter.py: _FP_SECTION_LABELS / _FP_LABEL_* (~3444),
+# _normalize_fp_analysis (~3466), _parse_fp_proposed_changes (~3482),
+# _fp_changes_appliable (~3500), _mint_refinement_id (~3339),
+# _fp_narrowing_headline (~3330), _fp_narrowing_to_refinement (~3352).
+# ---------------------------------------------------------------------------
+
+_FP_SECTION_LABELS = (
+    "WHY IT WAS FLAGGED", "WHY THE USER IS RIGHT",
+    "PROPOSED CHANGE", "TRADEOFF", "MY RECOMMENDATION",
+)
+_FP_LABEL_ALT = "|".join(re.escape(x) for x in _FP_SECTION_LABELS)
+# A label line WITH a colon; leading heading hashes and/or bold markers are
+# tolerated, and inline content may follow ("**TRADEOFF:** low risk"). The
+# colon may sit inside the bold span ("**LABEL:**") or outside ("**LABEL**:").
+_FP_LABEL_COLON = re.compile(
+    r'^[ \t]*#{0,6}[ \t]*(?:\*\*|__)?[ \t]*'
+    r'(?P<label>' + _FP_LABEL_ALT + r')'
+    r'[ \t]*(?::[ \t]*(?:\*\*|__)?|(?:\*\*|__)[ \t]*:)'
+    r'[ \t]*(?P<rest>.*?)[ \t]*$')
+# A Markdown HEADING label with no colon ("## PROPOSED CHANGE") — the label
+# must be the entire line, and at least one '#' is required so plain prose
+# ("PROPOSED CHANGE ideas …") is never mistaken for a section boundary.
+_FP_LABEL_BARE = re.compile(
+    r'^[ \t]*#{1,6}[ \t]*(?:\*\*|__)?[ \t]*'
+    r'(?P<label>' + _FP_LABEL_ALT + r')'
+    r'[ \t]*(?:\*\*|__)?[ \t]*$')
+
+
+def _normalize_fp_analysis(analysis: str) -> str:
+    """Rewrite Markdown-dressed FP section labels to bare 'LABEL:' lines so the
+    strict capture below can find them. Non-label lines pass through verbatim."""
+    out = []
+    for line in analysis.split("\n"):
+        m = _FP_LABEL_COLON.match(line) or _FP_LABEL_BARE.match(line)
+        if m:
+            rest = (m.groupdict().get("rest") or "").strip()
+            out.append(m.group("label") + ":")
+            if rest:
+                out.append(rest)
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _parse_fp_proposed_changes(analysis: str) -> dict:
+    """Extract PROPOSED CHANGE / TRADEOFF from an FP analysis, tolerating
+    Markdown heading/bold dressing on the labels. Preserves the original
+    capture contract: PROPOSED CHANGE is bounded by TRADEOFF, and TRADEOFF by
+    MY RECOMMENDATION."""
+    proposed = {"signals_to_narrow": {}, "tradeoffs": ""}
+    norm = _normalize_fp_analysis(analysis or "")
+    prop_match = re.search(
+        r'(?ms)^PROPOSED CHANGE:\s*\n(.*?)(?=^TRADEOFF:$)', norm)
+    trade_match = re.search(
+        r'(?ms)^TRADEOFF:\s*\n(.*?)(?=^MY RECOMMENDATION:$)', norm)
+    if prop_match:
+        proposed["signals_to_narrow"]["from_analysis"] = prop_match.group(1).strip()
+    if trade_match:
+        proposed["tradeoffs"] = trade_match.group(1).strip()
+    return proposed
+
+
+def _fp_changes_appliable(proposed_changes: dict) -> bool:
+    """True when a parsed FP proposal carries at least one non-blank narrowing."""
+    narrowings = (proposed_changes or {}).get("signals_to_narrow") or {}
+    return any(str(v).strip() for v in narrowings.values())
+
+
+def _mint_refinement_id(signals: dict) -> str:
+    """Mint an R-YYYYMMDD-<token> id unique against this signals dict's
+    ai_refinements. Same format as spam_filter._mint_refinement_id /
+    utils.random_token (secrets.token_hex(6)); no pending read, so it is safe
+    to call while already holding the SIGNALS_PATH lock."""
+    existing = {r.get("id", "") for r in (signals.get("ai_refinements") or [])}
+    today = datetime.now().strftime("%Y%m%d")
+    while True:
+        rid = f"R-{today}-{secrets.token_hex(6)}"
+        if rid not in existing:
+            return rid
+
+
+def _fp_refinement_id(conv: dict, signals: dict) -> str:
+    """Deterministic R- id for an FP-narrowing approval (finding 3). Twin of
+    spam_filter._fp_refinement_id.
+
+    Both approval channels (Dashboard Approve + email YES) run the same conv
+    through this, so they mint the SAME id for one proposal — the apply-time
+    dedup then turns a second apply into a no-op (already_active) instead of a
+    duplicate rule. The SFID is 'SFID-YYYYMMDD-<token>' and unique per proposal,
+    so 'R-YYYYMMDD-<token>' (its tail re-prefixed) is unique too and keeps the
+    _mint_refinement_id format. Falls back to a random unique id only when no
+    SFID is present."""
+    sfid = (conv.get("id") or "").strip()
+    if sfid.startswith("SFID-") and len(sfid) > len("SFID-"):
+        return "R-" + sfid[len("SFID-"):]
+    return _mint_refinement_id(signals)
+
+
+def _fp_narrowing_headline(proposed_changes: dict) -> str:
+    """Join the non-blank narrowing texts of a parsed FP proposal into one
+    plain-English headline (in practice a single 'from_analysis' entry)."""
+    narrowings = (proposed_changes or {}).get("signals_to_narrow") or {}
+    parts = [str(v).strip() for v in narrowings.values() if str(v).strip()]
+    return "\n".join(parts)
+
+
+def _fp_narrowing_to_refinement(proposed_changes: dict, conv: dict,
+                                signals: dict, *, source: str) -> dict:
+    """Build a LEGITIMATE ai_refinement record from an approved FP narrowing.
+
+    verdict 'legitimate' so the classifier renders it as a NOT_SPAM exclusion;
+    scope 'all' so it keeps the global reach the legacy soft_signals narrowing
+    had; a real R- id so it is visible/deletable in the Dashboard. PURE (no IO).
+
+    Finding 3: the id is DETERMINISTIC — derived from the proposal's SFID — so
+    the Dashboard-Approve and email-YES channels mint the SAME id and a second
+    apply dedupes instead of creating a duplicate rule. ``signals`` is used only
+    for the fallback random id when no SFID is present."""
+    now = now_iso()
+    subject = (conv.get("original_subject") or "").strip()
+    return {
+        "id": _fp_refinement_id(conv, signals),
+        "kind": "fp_narrowing",
+        "verdict": "legitimate",
+        "rule_class": None,
+        "headline": _fp_narrowing_headline(proposed_changes),
+        "rationale": (proposed_changes.get("tradeoffs") or "").strip(),
+        "what_this_doesnt_cover": "",
+        "confidence": "medium",
+        "evidence": [subject or "false-positive-forward"],
+        "first_learned": now,
+        "last_reinforced": now,
+        "match_count": 1,
+        "status": "active",
+        "scope": "all",
+        "source": source,
+    }
+
+
+def apply_fp_narrowing_from_pending(sfid: str,
+                                    source: str = "dashboard") -> dict | None:
+    """Approve a pending false_positive narrowing from the Dashboard (Feature 1).
+
+    Mirrors the engine's email-YES false_positive arm in spam_filter.run_filter
+    and the spam-example twin apply_refinement_from_pending: verify-before-ack +
+    self-heal, then route the approved narrowing through the MODERN refinements
+    store (a LEGITIMATE, scope-"all" ai_refinement with a real R- id) and run the
+    same applied / already_active / retired state logic — so a Dashboard approval
+    lands in the identical state an email YES would.
+
+    Returns:
+      {"status": "applied"|"already_active"|"retired", "id": rid, "headline": h}
+      {"status": "no_change"}  — the proposal carried no readable change (the
+                                 self-heal re-parse also failed): NOTHING written,
+                                 conv left PENDING, logged "apply_failed".
+      None                     — sfid not found / not awaiting_reply / not a
+                                 false_positive proposal.
+    """
+    # ONE lock over BOTH sidecars for the whole op (C7). file_lock.locked sorts
+    # the pair into a fixed order internally, so this can never deadlock against
+    # another op taking the same pair in the opposite order. Fresh reads under
+    # the lock mean a concurrent learner save / parallel approval isn't clobbered.
+    with file_lock.locked(paths.PENDING_SIGNALS_PATH, paths.SIGNALS_PATH):
+        pending = load_pending_signals()
+        conv = None
+        for c in pending.get("conversations", []):
+            if c.get("id") == sfid:
+                conv = c
+                break
+        if conv is None:
+            return None
+        if conv.get("status") not in ("awaiting_reply",):
+            return None
+        # FP conversations predate the "kind" field, so the default matches the
+        # engine's own conv.get("kind", "false_positive").
+        if conv.get("kind", "false_positive") != "false_positive":
+            return None
+
+        # Verify-before-ack + self-heal (mirrors spam_filter's legacy-FP arm):
+        # an older parser may have stored an EMPTY proposed_changes for a
+        # Markdown-dressed analysis. Re-parse api_analysis with the tolerant
+        # parser and persist the healed changes before deciding.
+        proposed = conv.get("proposed_changes") or {}
+        if not _fp_changes_appliable(proposed):
+            proposed = _parse_fp_proposed_changes(conv.get("api_analysis", ""))
+            if _fp_changes_appliable(proposed):
+                conv["proposed_changes"] = proposed
+        if not _fp_changes_appliable(proposed):
+            # Nothing appliable: do NOT approve, do NOT write signals, leave the
+            # conv PENDING; record the honest no-op (never "applied").
+            append_refinement_log({
+                "ts": now_iso(),
+                "event": "apply_failed",
+                "sfid": sfid,
+                "reason": "analysis contained no readable proposed change",
+                "source": source,
+            })
+            return {"status": "no_change"}
+
+        # Build the modern refinement (fresh R- id) and run the same 3-way
+        # applied / already_active / retired logic as apply_refinement_from_pending.
+        data = load_signals()
+        refinements = data.setdefault("ai_refinements", [])
+        refinement = _fp_narrowing_to_refinement(proposed, conv, data,
+                                                 source=source)
+        rid = refinement.get("id")
+        existing = next((r for r in refinements if r.get("id") == rid),
+                        None) if rid else None
+        if existing is not None and existing.get("status", "active") != "active":
+            outcome = "retired"
+        elif existing is not None:
+            outcome = "already_active"
+        else:
+            outcome = "applied"
+            refinements.append(refinement)
+            save_signals(data)
+
+        if outcome != "retired":
+            # applied / already_active: resolve the conv (any self-heal write is
+            # persisted with it). "retired" leaves the conv PENDING so the owner
+            # can act on the honest ack.
+            conv["status"] = "approved"
+            conv["resolution"] = "approved"
+            conv.setdefault("conversation_history", []).append({
+                "role": "system",
+                "timestamp": now_iso(),
+                "content": f"Approved via {source}",
+            })
+            save_pending_signals(pending)
+    # Log ONLY a genuine append as "applied" (an already-active re-approval must
+    # not double-log; a retired-id approval is a no-op → "apply_failed").
+    if outcome == "applied":
+        append_refinement_log({
+            "ts": now_iso(),
+            "event": "applied",
+            "id": rid,
+            "sfid": sfid,
+            "headline": refinement.get("headline", ""),
+            "source": source,
+        })
+        return {"status": "applied", "id": rid,
+                "headline": refinement.get("headline", "")}
+    if outcome == "retired":
+        append_refinement_log({
+            "ts": now_iso(),
+            "event": "apply_failed",
+            "id": rid,
+            "sfid": sfid,
+            "reason": "referenced rule is retired",
+            "source": source,
+        })
+        return {"status": "retired", "id": rid,
+                "headline": refinement.get("headline", "")}
+    # already_active: truthful "it's active" for the caller; no re-log.
+    return {"status": "already_active", "id": rid,
+            "headline": refinement.get("headline", "")}
+
+
 def reject_pending(sfid: str, source: str = "dashboard",
                     reason: str = "") -> bool:
     """Mark a pending SFID proposal as rejected. Works for any kind."""
-    pending = load_pending_signals()
-    conv = None
-    for c in pending.get("conversations", []):
-        if c.get("id") == sfid:
-            conv = c
-            break
-    if conv is None or conv.get("status") not in ("awaiting_reply",):
-        return False
-    conv["status"] = "rejected"
-    conv["resolution"] = "rejected"
-    conv.setdefault("conversation_history", []).append({
-        "role": "system",
-        "timestamp": now_iso(),
-        "content": f"Rejected via {source}" + (f": {reason}" if reason else ""),
-    })
-    save_pending_signals(pending)
+    # Lock the pending_signals.json RMW span (C7): a concurrent filter command
+    # handler / parallel approval cannot race this reject and lose either edit.
+    with file_lock.locked(paths.PENDING_SIGNALS_PATH):
+        pending = load_pending_signals()
+        conv = None
+        for c in pending.get("conversations", []):
+            if c.get("id") == sfid:
+                conv = c
+                break
+        if conv is None or conv.get("status") not in ("awaiting_reply",):
+            return False
+        conv["status"] = "rejected"
+        conv["resolution"] = "rejected"
+        conv.setdefault("conversation_history", []).append({
+            "role": "system",
+            "timestamp": now_iso(),
+            "content": f"Rejected via {source}" + (f": {reason}" if reason else ""),
+        })
+        save_pending_signals(pending)
     refinement_id = (conv.get("proposed_refinement") or {}).get("id", "")
     append_refinement_log({
         "ts": now_iso(),
@@ -545,13 +1142,16 @@ def reject_pending(sfid: str, source: str = "dashboard",
 
 def withdraw_pending(sfid: str, source: str = "dashboard") -> bool:
     """Remove a pending proposal the user no longer wants to decide on."""
-    pending = load_pending_signals()
-    before = len(pending.get("conversations", []))
-    pending["conversations"] = [c for c in pending.get("conversations", [])
-                                 if c.get("id") != sfid]
-    if len(pending["conversations"]) == before:
-        return False
-    save_pending_signals(pending)
+    # Lock the pending_signals.json RMW span (C7): the fresh read under the lock
+    # means a concurrent writer's change to the conversation list isn't erased.
+    with file_lock.locked(paths.PENDING_SIGNALS_PATH):
+        pending = load_pending_signals()
+        before = len(pending.get("conversations", []))
+        pending["conversations"] = [c for c in pending.get("conversations", [])
+                                     if c.get("id") != sfid]
+        if len(pending["conversations"]) == before:
+            return False
+        save_pending_signals(pending)
     append_refinement_log({
         "ts": now_iso(),
         "event": "withdrawn",
