@@ -8,7 +8,9 @@ from __future__ import annotations
 import email
 import email.header
 import email.policy
+import email.utils
 import html
+import imaplib
 import ipaddress
 import re
 import secrets
@@ -44,6 +46,111 @@ def make_tls_context() -> ssl.SSLContext:
     except Exception:
         pass
     return ctx
+
+
+# ---------------------------------------------------------------------------
+# System→owner mail delivery via IMAP APPEND (Changeset 3).
+#
+# MailWarden's own owner-facing mail (daily report, FP analysis, acks, learner
+# notices) is delivered by placing the message DIRECTLY in the owner's mailbox
+# via IMAP APPEND instead of sending it over SMTP. SMTP-sent, self-addressed
+# (from-owner-to-owner) system mail trips SpamAssassin / provider filters / Apple
+# Mail junk — an analysis reply was junked downstream. APPEND bypasses every
+# transit filter, guarantees the X-MailWarden-System stamp survives, and works
+# on any IMAP provider with zero setup. The command corridor is untouched: owner
+# REPLIES still arrive over normal mail. On ANY APPEND failure the caller falls
+# back to the existing (stamped) SMTP send, so a message is never lost.
+# ---------------------------------------------------------------------------
+
+
+def _open_imap_for_append(account: dict):
+    """Open + log in an IMAP4_SSL connection for ``account`` (verified TLS, same
+    conventions as the engine's connect_imap). Injection seam for tests."""
+    conn = imaplib.IMAP4_SSL(account["imap_host"],
+                             int(account.get("imap_port", 993)),
+                             timeout=15.0, ssl_context=make_tls_context())
+    conn.login(account["username"], account["password"])
+    return conn
+
+
+def deliver_message_imap(account: dict, msg, logger, *, mailbox: str = "INBOX"):
+    """APPEND a fully-built RFC822 ``msg`` straight into ``account``'s mailbox,
+    bypassing SMTP transit filters. Appended WITHOUT the \\Seen flag so it lands
+    as UNREAD new mail. RAISES on any failure so the caller can fall back to
+    SMTP. The message MUST already carry Date + Message-ID (APPEND does not add
+    them — use ensure_rfc822_headers first)."""
+    conn = _open_imap_for_append(account)
+    try:
+        # flags="" -> no \\Seen (unread). date_time=None -> server sets the
+        # internal date; the message's own Date header is preserved as-is.
+        typ, data = conn.append(mailbox, "", None, msg.as_bytes())
+        if typ != "OK":
+            raise RuntimeError("IMAP APPEND returned %r: %r" % (typ, data))
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+
+
+def account_for_recipient(config: dict, to_addr: str):
+    """The configured account whose username == ``to_addr`` (case-insensitive),
+    or None. We APPEND ONLY when a match is found — that is the mailbox we own
+    and poll — so a system mail addressed to any non-account (e.g. an external
+    summary recipient) is never mis-filed; it falls back to SMTP instead."""
+    target = (to_addr or "").strip().lower()
+    if not target:
+        return None
+    for a in config.get("accounts", []) or []:
+        if (a.get("username", "") or "").strip().lower() == target:
+            return a
+    return None
+
+
+def ensure_rfc822_headers(msg, *, from_addr: str = "") -> None:
+    """Ensure Date + Message-ID are present (IMAP APPEND does NOT add them, and a
+    message lacking them is malformed in the mailbox). Idempotent — never
+    overwrites headers the builder already set. Good hygiene for the SMTP path
+    too, so it runs regardless of delivery route."""
+    if not msg.get("Date"):
+        msg["Date"] = email.utils.formatdate(localtime=True)
+    if not msg.get("Message-ID"):
+        domain = None
+        src = from_addr or (msg.get("From", "") or "")
+        if "@" in src:
+            domain = src.rsplit("@", 1)[1].strip().strip(">")
+        msg["Message-ID"] = email.utils.make_msgid(domain=domain or None)
+
+
+def deliver_owner_mail(config: dict, msg, to_addr: str, logger,
+                       smtp_send) -> tuple:
+    """Deliver a system→owner ``msg``. Ensures Date+Message-ID, then PREFERS IMAP
+    APPEND into the recipient's own mailbox (only when ``to_addr`` is a
+    configured account we own), and on ANY APPEND failure — or when ``to_addr``
+    is not an owned account — falls back to ``smtp_send()`` (the caller's
+    existing stamped SMTP path). Logs which route was used. Never raises for a
+    routing/APPEND problem: a report is never lost to an APPEND failure.
+
+    Returns ``(route, success)`` where route is "imap" | "smtp". ``success`` is
+    True for a completed APPEND, otherwise the truthiness of ``smtp_send()``'s
+    return — so a caller whose ``smtp_send`` returns a bool (e.g. the learner)
+    gets a real success signal, while callers that ignore the return value (the
+    report / send_email / EULA paths) are unaffected."""
+    ensure_rfc822_headers(msg, from_addr=msg.get("From", "") or "")
+    subj = (msg.get("Subject", "") or "")[:60]
+    account = account_for_recipient(config, to_addr)
+    if account is not None:
+        try:
+            deliver_message_imap(account, msg, logger)
+            logger.info("  Delivered via IMAP APPEND -> %s INBOX: %s"
+                        % (to_addr, subj))
+            return ("imap", True)
+        except Exception as e:
+            logger.warning("  IMAP APPEND to %s failed (%s) — SMTP fallback"
+                           % (to_addr, e))
+    ok = smtp_send()
+    logger.info("  Delivered via SMTP: %s" % subj)
+    return ("smtp", bool(ok))
 
 
 def clear_dnsbl_cache() -> None:

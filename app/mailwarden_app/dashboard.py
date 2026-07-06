@@ -3398,6 +3398,8 @@ class UnwantedCategoriesTab(ttk.Frame):
                 f"ID {r.get('id', '')}")
         ttk.Label(card, text=meta, style="Muted.TLabel",
                   wraplength=720).pack(anchor=tk.W)
+        ttk.Label(card, text=self._enforcement_text(r), style="Muted.TLabel",
+                  wraplength=720).pack(anchor=tk.W)
         btns = ttk.Frame(card)
         btns.pack(anchor=tk.W, pady=(6, 0))
         rid = r.get("id", "")
@@ -3412,6 +3414,32 @@ class UnwantedCategoriesTab(ttk.Frame):
         ttk.Button(btns, text="Delete",
                    command=lambda i=rid: self._on_delete(i)).pack(
                        side=tk.LEFT, padx=(8, 0))
+
+    @staticmethod
+    def _enforcement_text(r: dict) -> str:
+        """Plain-language line for how a rule is enforced, shown on its card:
+        instant subject-keyword/sender match, AI judgment, or both. Legacy
+        authored rules (no enforcement field) read as AI judgment, matching how
+        the engine injects them."""
+        entries = r.get("deterministic_entries") or []
+        kw = [e.get("value", "") for e in entries
+              if e.get("kind") == "subject_keyword"]
+        snd = [e.get("value", "") for e in entries
+               if e.get("kind") in ("address", "domain")]
+        parts = []
+        if kw:
+            parts.append("subject keyword: " + ", ".join(kw))
+        if snd:
+            parts.append("sender: " + ", ".join(snd))
+        instant = "Enforced instantly by " + " and ".join(parts) if parts \
+            else "Enforced instantly"
+        enf = (r.get("enforcement") or "").strip().lower()
+        if enf == "deterministic":
+            return instant
+        if enf == "mixed":
+            return instant + ", plus AI judgment for the rest"
+        # "ai" or legacy authored rule with no enforcement field.
+        return "Enforced by AI judgment"
 
     # ---- actions ----
 
@@ -3450,22 +3478,32 @@ class UnwantedCategoriesTab(ttk.Frame):
 
     def _after_breadth_check(self, desc, scope, verdict):
         self._busy = False
+        # Same verdict, second job: work out how the rule should be enforced and
+        # pull any exact subject tokens / senders out for the deterministic gates
+        # (falls back to a local regex pass when the advisor was unavailable).
+        enforcement = breadth_advisor.extract_enforcement(desc, verdict)
         if breadth_advisor.should_warn(verdict):
             self._status.config(text="")
-            self._show_broad_warning(desc, scope, verdict)
+            self._show_broad_warning(desc, scope, verdict, enforcement)
             return
-        # Not broad, or a fail-open outcome (no key / API error): add now. Show a
-        # soft "couldn't check" note only when a check was attempted and failed.
+        # Not broad. If the rule reads like a mailing list / newsletter but names
+        # nothing exact to match on, offer to capture a subject tag so it can be
+        # caught instantly (skippable — skipping saves it as an AI-judgment rule).
+        if enforcement.get("enforcement") == "ai" and enforcement.get("list_like"):
+            self._prompt_list_tag(desc, scope, verdict, enforcement)
+            return
+        # Otherwise add now. Show a soft "couldn't check" note only when a check
+        # was attempted and failed.
         if verdict.get("reason") == "error":
             note = ("Added. MailWarden couldn't check this rule just now, so it "
                     "was added as-is. It takes effect on the next check.")
         else:
             note = "Added. It takes effect on the next check."
-        self._create_rule(desc, scope, status_note=note)
+        self._create_rule(desc, scope, enforcement, status_note=note)
 
-    def _create_rule(self, desc, scope, status_note):
-        record = config_io.create_authored_refinement(desc, scope,
-                                                       source="dashboard")
+    def _create_rule(self, desc, scope, enforcement, status_note):
+        record = config_io.create_authored_refinement(
+            desc, scope, source="dashboard", enforcement=enforcement)
         if record is None:
             self._status.config(text="Type a short description first.")
             return
@@ -3473,7 +3511,63 @@ class UnwantedCategoriesTab(ttk.Frame):
         self._status.config(text=status_note)
         self.refresh()
 
-    def _show_broad_warning(self, desc, scope, verdict):
+    @staticmethod
+    def _enforcement_for_tag(tag: str) -> dict:
+        """Build a DETERMINISTIC enforcement from a subject tag the owner typed
+        into the mailing-list prompt: the tag is an exact subject keyword, so the
+        keyword gate catches these emails without the AI ever judging them."""
+        t = (tag or "").strip().lower()
+        return {
+            "enforcement": "deterministic", "residual_text": "",
+            "subject_tokens": [t], "sender_addresses": [], "sender_domains": [],
+            "deterministic_entries": [{"kind": "subject_keyword", "value": t}],
+            "list_like": True, "source": "manual_tag",
+        }
+
+    def _prompt_list_tag(self, desc, scope, verdict, enforcement):
+        """The rule reads like a mailing list but names nothing exact. Ask for
+        something ALWAYS in those subjects (usually a tag). Skippable: skipping
+        keeps the original AI-judgment enforcement. Mirrors the breadth-advisor
+        dialog's shape (Toplevel + two buttons + WM_DELETE fallback)."""
+        dlg = tk.Toplevel(self.app)
+        dlg.title("Anything always in the subject?")
+        dlg.transient(self.app)
+        dlg.resizable(False, False)
+        frm = ttk.Frame(dlg, padding=(16, 14))
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            frm, wraplength=460, justify="left",
+            text=("This looks like a mailing list or newsletter. If every one of "
+                  "these emails has the same thing in the subject line — often a "
+                  "tag like \"[PSIAN]\" — type it here and MailWarden will catch "
+                  "them instantly, without guessing. Leave it blank to let "
+                  "MailWarden judge each email instead.")).pack(anchor=tk.W)
+        tag_var = tk.StringVar()
+        ent = ttk.Entry(frm, textvariable=tag_var, width=40)
+        ent.pack(anchor=tk.W, pady=(8, 0))
+        ent.focus_set()
+        note = "Added. It takes effect on the next check."
+
+        def _use():
+            tag = tag_var.get().strip()
+            dlg.destroy()
+            enf = self._enforcement_for_tag(tag) if tag else enforcement
+            self._create_rule(desc, scope, enf, status_note=note)
+
+        def _skip():
+            dlg.destroy()
+            self._create_rule(desc, scope, enforcement, status_note=note)
+
+        btns = ttk.Frame(frm)
+        btns.pack(anchor=tk.E, pady=(14, 0))
+        ttk.Button(btns, text="Use this tag", style="Primary.TButton",
+                   command=_use).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Skip", command=_skip).pack(
+            side=tk.LEFT, padx=(6, 0))
+        dlg.protocol("WM_DELETE_WINDOW", _skip)
+        dlg.grab_set()
+
+    def _show_broad_warning(self, desc, scope, verdict, enforcement):
         """Broad-rule heads-up: show the concern + a tighter suggestion and make
         the owner choose. 'Add it anyway' is the affirmative-OK gate (a
         determined owner still proceeds); 'Let me revise' returns to the form,
@@ -3500,7 +3594,7 @@ class UnwantedCategoriesTab(ttk.Frame):
         def _add_anyway():
             dlg.destroy()
             self._create_rule(
-                desc, scope,
+                desc, scope, enforcement,
                 status_note="Added. It takes effect on the next check.")
 
         def _revise():

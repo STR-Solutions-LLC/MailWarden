@@ -1231,24 +1231,39 @@ def _send(config: dict, to_addr: str, subject: str, body: str,
             smtp_conn[0] = None
 
     msg = _build_msg()
-    for attempt in range(2):          # attempt 0 = normal; attempt 1 = retry
-        try:
-            server = _get_server()
-            server.sendmail(msg["From"], [to_addr], msg.as_string())
-            if smtp_conn is None:     # legacy path — close immediately
-                try:
-                    server.quit()
-                except Exception:
-                    pass
-            return True
-        except Exception as e:
-            if attempt == 0:
-                logger.warning(f"SMTP send error (will retry once): {e}")
-                _reset_server()       # force a fresh connection on retry
-            else:
-                logger.error(f"SMTP send failed: {e}")
-                _reset_server()
-    return False
+
+    def _smtp_send() -> bool:
+        # The stamped SMTP path with the connection-holder retry — now the
+        # FALLBACK when IMAP APPEND is unavailable (recipient is not a configured
+        # account) or fails.
+        for attempt in range(2):      # attempt 0 = normal; attempt 1 = retry
+            try:
+                server = _get_server()
+                server.sendmail(msg["From"], [to_addr], msg.as_string())
+                if smtp_conn is None:  # legacy path — close immediately
+                    try:
+                        server.quit()
+                    except Exception:
+                        pass
+                return True
+            except Exception as e:
+                if attempt == 0:
+                    logger.warning(f"SMTP send error (will retry once): {e}")
+                    _reset_server()   # force a fresh connection on retry
+                else:
+                    logger.error(f"SMTP send failed: {e}")
+                    _reset_server()
+        return False
+
+    # Changeset 3 / finding C: deliver through the shared chokepoint —
+    # utils.deliver_owner_mail prefers IMAP APPEND into the owner's mailbox
+    # (bypasses the SMTP transit filters that junk self-addressed system mail)
+    # and falls back to the stamped SMTP retry above. It returns (route, success);
+    # _smtp_send returns a bool, so success is a real signal for this caller's
+    # bool contract.
+    from utils import deliver_owner_mail
+    _route, ok = deliver_owner_mail(config, msg, to_addr, logger, _smtp_send)
+    return ok
 
 
 # ---------------------------------------------------------------------------

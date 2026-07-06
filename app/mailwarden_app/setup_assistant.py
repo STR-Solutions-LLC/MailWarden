@@ -628,12 +628,22 @@ class SetupAssistant(tk.Tk):
             if not smtp.get("host") or not from_addr:
                 return
 
+            import email.utils
             from email.message import EmailMessage
 
             msg = EmailMessage()
             msg["Subject"] = help_content.welcome_email_subject()
             msg["From"] = from_addr
             msg["To"] = to_addr
+            # Stamp as MailWarden system mail + supply Date/Message-ID.
+            # EmailMessage/send_message add none of these; without the stamp the
+            # welcome email is not recognised as our own, and a message with no
+            # Date/Message-ID is malformed in the mailbox. (This path stays on
+            # SMTP — it runs in the GUI before the engine/IMAP is available.)
+            msg["X-MailWarden-System"] = "1"
+            msg["Date"] = email.utils.formatdate(localtime=True)
+            _dom = from_addr.rsplit("@", 1)[1] if "@" in from_addr else None
+            msg["Message-ID"] = email.utils.make_msgid(domain=_dom or None)
             msg.set_content(help_content.welcome_email_body(to_addr))
 
             # Route through validators.safe_smtp_connect so the welcome email

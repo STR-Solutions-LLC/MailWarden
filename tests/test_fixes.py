@@ -4353,6 +4353,53 @@ def test_curate_preference_overrides_rule1_when_unmistakable():
 
 
 # ---------------------------------------------------------------------------
+# Hybrid rework: a USER-AUTHORED curate rule (Unwanted Categories editor) carries
+# STRONGER prompt wording than a learned curate rule — the owner's OWN written
+# rule OUTRANKS authenticated-sender protection on a clear match. This LIVE,
+# skip-gated test proves the model actually junks on that wording (the offline
+# tests can only pin the prompt TEXT, not model behavior). Same authenticated
+# RULE-1 fixture (06_jeffries.eml, DKIM=pass, brand-matched); the rule is an
+# AI-enforced (no deterministic marker) user_authored curate rule, so the whole
+# rule reaches the classifier under the OUTRANKS wording. No blacklist is passed,
+# so the deterministic gate is not involved — this isolates the AI decision.
+# Reuses the real fixture; no hand-written email body.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not os.environ.get("ANTHROPIC_API_KEY"),
+                    reason="live user-authored curate override needs ANTHROPIC_API_KEY")
+def test_user_authored_curate_overrides_rule1_on_clear_match():
+    import json as _json
+    defaults = os.path.join(os.path.dirname(__file__), "..",
+                            "resources", "defaults", "signals.json")
+    with open(defaults) as f:
+        signals = _json.load(f)
+    # An owner-AUTHORED curate rule (source=user_authored), AI-enforced so the
+    # full rule is injected with the OUTRANKS wording.
+    signals["ai_refinements"] = [{
+        "status": "active",
+        "verdict": "spam",
+        "rule_class": "curate",
+        "source": "user_authored",
+        "enforcement": "ai",
+        "headline": "Political fundraising asking for donations",
+    }]
+    cfg_path = os.path.expanduser("~/MailWarden/config/config.json")
+    anthro = {}
+    if os.path.isfile(cfg_path):
+        with open(cfg_path) as f:
+            anthro = (_json.load(f).get("anthropic", {}) or {})
+    api_key = os.environ.get("ANTHROPIC_API_KEY") or anthro.get("api_key", "")
+    model = anthro.get("model") or "claude-haiku-4-5-20251001"
+    raw = (_FIXTURES / "06_jeffries.eml").read_bytes()
+    res = spam_filter.classify_eml_offline(
+        raw, signals, api_key=api_key, model=model, threshold=0.85)
+    assert res["final_decision"] == "JUNK", (
+        f"A user-authored curate rule must OUTRANK authenticated-sender "
+        f"protection on a clear match; got {res['final_decision']} "
+        f"(reason: {res.get('reason')})")
+
+
+# ---------------------------------------------------------------------------
 # fix (a-1): curate-carve-out prompt guard (OFFLINE, deterministic, no API).
 # The live test above proves the curate EXCEPTION end-to-end but is skip-gated
 # (needs ANTHROPIC_API_KEY), so normal CI never exercises it. This test pins the

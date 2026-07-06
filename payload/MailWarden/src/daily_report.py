@@ -1511,45 +1511,63 @@ def send_report(config: dict, subject: str, body: str, logger: logging.Logger,
     msg["Subject"] = subject
     msg["From"] = from_addr
     msg["To"] = to_addr
+    # Stamp the daily report as MailWarden system mail, exactly like
+    # spam_filter.send_email (~1866), so the filter's loop-top self-loop guard
+    # recognises and skips it on re-ingestion instead of junking the very report
+    # that quotes junked mail. Without this the report's only protection was the
+    # MWR body-prefix guard, which is unreachable once the owner/auth checks null
+    # out mwr_match (the report is sent from the single global SMTP identity to
+    # each account, and the owner's server may carry no Authentication-Results).
+    msg["X-MailWarden-System"] = "1"
 
-    # Retry transient/network failures; permanent errors (auth, refused
-    # recipient/sender, data) raise immediately. PERMANENT is checked first
-    # because smtplib exceptions are OSError subclasses.
-    permanent = (smtplib.SMTPAuthenticationError, smtplib.SMTPRecipientsRefused,
-                 smtplib.SMTPSenderRefused, smtplib.SMTPDataError,
-                 smtplib.SMTPNotSupportedError)
-    transient = (smtplib.SMTPConnectError, smtplib.SMTPHeloError,
-                 smtplib.SMTPServerDisconnected, TimeoutError,
-                 ConnectionError, OSError)
-    attempts = 3
-    backoffs = [2, 4]  # seconds before attempts 2 and 3
-    for attempt in range(1, attempts + 1):
-        server = None
-        try:
-            from utils import smtp_login
-            server = smtp_login(smtp_config)
-            server.sendmail(from_addr, [to_addr], msg.as_string())
-            logger.info(f"Daily report sent to {to_addr}")
-            return
-        except permanent as e:
-            logger.error(f"SMTP to {to_addr} failed (permanent, no retry): {e}")
-            raise
-        except transient as e:
-            if attempt >= attempts:
-                logger.error(f"SMTP to {to_addr} failed after {attempts} attempts: {e}")
+    def _smtp_send():
+        # The stamped SMTP path — now the FALLBACK when IMAP APPEND is
+        # unavailable (recipient is not a configured account) or fails.
+        # Retry transient/network failures; permanent errors (auth, refused
+        # recipient/sender, data) raise immediately. PERMANENT is checked first
+        # because smtplib exceptions are OSError subclasses.
+        permanent = (smtplib.SMTPAuthenticationError,
+                     smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused,
+                     smtplib.SMTPDataError, smtplib.SMTPNotSupportedError)
+        transient = (smtplib.SMTPConnectError, smtplib.SMTPHeloError,
+                     smtplib.SMTPServerDisconnected, TimeoutError,
+                     ConnectionError, OSError)
+        attempts = 3
+        backoffs = [2, 4]  # seconds before attempts 2 and 3
+        for attempt in range(1, attempts + 1):
+            server = None
+            try:
+                from utils import smtp_login
+                server = smtp_login(smtp_config)
+                server.sendmail(from_addr, [to_addr], msg.as_string())
+                logger.info(f"Daily report sent to {to_addr}")
+                return
+            except permanent as e:
+                logger.error(f"SMTP to {to_addr} failed (permanent, no retry): {e}")
                 raise
-            logger.warning(f"SMTP to {to_addr} transient failure "
-                           f"(attempt {attempt}/{attempts}): {e}; retrying")
-            time.sleep(backoffs[attempt - 1])
-        except Exception as e:
-            logger.error(f"SMTP to {to_addr} failed: {e}")
-            raise
-        finally:
-            if server:
-                try:
-                    server.quit()
-                except Exception:
-                    pass
+            except transient as e:
+                if attempt >= attempts:
+                    logger.error(f"SMTP to {to_addr} failed after {attempts} attempts: {e}")
+                    raise
+                logger.warning(f"SMTP to {to_addr} transient failure "
+                               f"(attempt {attempt}/{attempts}): {e}; retrying")
+                time.sleep(backoffs[attempt - 1])
+            except Exception as e:
+                logger.error(f"SMTP to {to_addr} failed: {e}")
+                raise
+            finally:
+                if server:
+                    try:
+                        server.quit()
+                    except Exception:
+                        pass
+
+    # Changeset 3: deliver the report by IMAP APPEND into the owner's mailbox
+    # (bypasses the SMTP transit filters that junk self-addressed system mail),
+    # with the stamped SMTP retry path above as the never-lose fallback.
+    # deliver_owner_mail also backfills Date + Message-ID (APPEND omits them).
+    from utils import deliver_owner_mail
+    deliver_owner_mail(config, msg, to_addr, logger, _smtp_send)
 
 
 def main(now=None):

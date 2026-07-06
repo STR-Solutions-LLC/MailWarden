@@ -677,6 +677,7 @@ def retire_ai_refinement(rule_id: str, logger: logging.Logger) -> bool:
     True if a matching ACTIVE rule was retired; False if missing / already
     inactive (idempotent — safe on replayed commands)."""
     retired = False
+    was_authored = False
     with file_lock.locked(SIGNALS_PATH):
         data = load_signals()
         for r in data.get("ai_refinements", []) or []:
@@ -685,6 +686,7 @@ def retire_ai_refinement(rule_id: str, logger: logging.Logger) -> bool:
                 r["status"] = "retired"
                 r["retired_at"] = datetime.now().isoformat()
                 retired = True
+                was_authored = r.get("source") == "user_authored"
                 break
         if retired:
             save_signals(data)
@@ -694,6 +696,12 @@ def retire_ai_refinement(rule_id: str, logger: logging.Logger) -> bool:
             "event": "retired_by_owner",
             "id": rule_id,
         })
+        # Cascade (twin of config_io.retire_refinement): a DROP of an authored
+        # rule via the email corridor must ALSO stop its deterministic gate hits,
+        # so remove its provenance-tagged blacklist entries (restore re-adds them;
+        # hand-added blocks and other rules' shared tokens are untouched).
+        if was_authored:
+            remove_ai_provenance_entries_local(rule_id, logger)
     return retired
 
 
@@ -724,6 +732,14 @@ def unretire_ai_refinement(rule_id: str, logger: logging.Logger) -> dict:
             "event": "restored_by_owner",
             "id": rule_id,
         })
+        # Cascade (twin of config_io.restore_refinement): re-add the authored
+        # rule's deterministic blacklist entries that its DROP removed, honoring
+        # its current scope.
+        if restored.get("source") == "user_authored":
+            entries = restored.get("deterministic_entries") or []
+            if entries:
+                add_ai_provenance_entries_local(
+                    entries, restored.get("scope", "all"), rule_id, logger)
     return restored
 
 
@@ -997,6 +1013,158 @@ def add_blocklist_entry_local(value: str, kind: str, scope, logger) -> bool:
         items.append({"value": v, "scope": scope})
         save_blacklist(bl)
         return True
+
+
+# ---------------------------------------------------------------------------
+# Provenance cascade for authored "Unwanted Categories" rules — ENGINE TWIN.
+#
+# EXACT twin of config_io.write_provenance_entries / remove_provenance_entries
+# (+ _provenance_owners / _union_scopes / _blocklist_value_of). The two trees
+# never import each other and share only blacklist.json, so the MULTI-OWNER,
+# PER-OWNER-SCOPE logic is duplicated verbatim; if you edit one copy, edit the
+# other (config_io.py:346). Used by retire_ai_refinement / unretire_ai_refinement
+# so the email DROP/RESTORE corridor keeps an authored rule's deterministic
+# entries in lock-step with its status — otherwise a dropped MIXED rule's
+# keyword/sender entries would keep junking forever while the UI says it is off.
+# ---------------------------------------------------------------------------
+_AUTHORED_MARKER_FIELDS = {
+    "subject_keyword": "subject_keywords",
+    "address": "addresses",
+    "domain": "domains",
+}
+
+
+def _blocklist_value_of(item, *, strip_at: bool) -> str:
+    """Normalized comparable value of a blacklist item (string OR {"value"...})."""
+    raw = item.get("value") if isinstance(item, dict) else item
+    if not isinstance(raw, str):
+        return ""
+    s = raw.strip().lower()
+    return s.lstrip("@") if strip_at else s
+
+
+def _provenance_owners(entry) -> list:
+    """Per-owner {"id","scope"} records that own this entry. [] for a hand/PB2
+    block (no provenance). Legacy single-id string / list-of-ids are read as
+    owners inheriting the entry's current scope (migrated on write). Twin of
+    config_io._provenance_owners."""
+    if not isinstance(entry, dict):
+        return []
+    prov = entry.get("provenance")
+    if prov is None:
+        return []
+    entry_scope = entry.get("scope", "all")
+    owners = []
+    if isinstance(prov, str):
+        if prov.strip():
+            owners.append({"id": prov, "scope": entry_scope})
+        return owners
+    if isinstance(prov, list):
+        for p in prov:
+            if isinstance(p, dict) and isinstance(p.get("id"), str) \
+                    and p["id"].strip():
+                owners.append({"id": p["id"],
+                               "scope": p.get("scope", entry_scope)})
+            elif isinstance(p, str) and p.strip():
+                owners.append({"id": p, "scope": entry_scope})
+    return owners
+
+
+def _union_scopes(scopes):
+    """Union of an iterable of block-list scopes ("all"/None absorbs; else union
+    the account lists preserving order; empty -> "all"). Twin of
+    config_io._union_scopes."""
+    out = []
+    any_seen = False
+    for s in scopes:
+        any_seen = True
+        if s is None or s == "all":
+            return "all"
+        items = list(s) if isinstance(s, (list, tuple)) else [s]
+        for a in items:
+            if a not in out:
+                out.append(a)
+    return out if any_seen else "all"
+
+
+def add_ai_provenance_entries_local(entries, scope, provenance, logger) -> int:
+    """Engine twin of config_io.write_provenance_entries (MULTI-OWNER, PER-OWNER
+    SCOPE). Create when absent; ADOPT (add/refresh this rule's {"id","scope"}
+    owner + recompute the entry scope = union of ALL owners, migrating legacy
+    shapes) when already rule-owned; LEAVE a hand-added / PB2 block untouched.
+    Locked RMW. Returns entries created or adopted."""
+    if not entries:
+        return 0
+    with file_lock.locked(BLACKLIST_PATH):
+        bl = load_blacklist(logger)
+        changed = 0
+        for e in entries:
+            kind = (e.get("kind") or "").strip().lower()
+            field = _AUTHORED_MARKER_FIELDS.get(kind)
+            if field is None:
+                continue
+            strip_at = (field == "domains")
+            v = (e.get("value") or "").strip().lower()
+            if strip_at:
+                v = v.lstrip("@")
+            if not v:
+                continue
+            items = bl.setdefault(field, [])
+            existing = next(
+                (it for it in items
+                 if _blocklist_value_of(it, strip_at=strip_at) == v), None)
+            if existing is None:
+                items.append({"value": v, "scope": scope,
+                              "provenance": [{"id": provenance, "scope": scope}]})
+                changed += 1
+                continue
+            owners = _provenance_owners(existing)
+            if not owners:
+                continue  # hand-added / PB2 block — sacrosanct
+            owners = [o for o in owners if o["id"] != provenance]
+            owners.append({"id": provenance, "scope": scope})
+            existing["provenance"] = owners
+            existing["scope"] = _union_scopes([o["scope"] for o in owners])
+            changed += 1
+        if changed:
+            save_blacklist(bl)
+    return changed
+
+
+def remove_ai_provenance_entries_local(provenance, logger) -> int:
+    """Engine twin of config_io.remove_provenance_entries (MULTI-OWNER, PER-OWNER
+    SCOPE). Removes this rule's owner record and RECOMPUTES the entry scope as the
+    union of the REMAINING owners (so a shared token narrows back to the
+    survivors' accounts — no over-block); drops the entry only when its LAST owner
+    is removed. Hand-added entries are never touched. Locked RMW. Returns entries
+    fully removed."""
+    removed = 0
+    with file_lock.locked(BLACKLIST_PATH):
+        bl = load_blacklist(logger)
+        changed = False
+        for field in _AUTHORED_MARKER_FIELDS.values():
+            items = bl.get(field)
+            if not isinstance(items, list):
+                continue
+            new_items = []
+            for it in items:
+                owners = _provenance_owners(it)
+                if any(o["id"] == provenance for o in owners):
+                    changed = True
+                    remaining = [o for o in owners if o["id"] != provenance]
+                    if remaining:
+                        it["provenance"] = remaining
+                        it["scope"] = _union_scopes(
+                            [o["scope"] for o in remaining])
+                        new_items.append(it)
+                    else:
+                        removed += 1
+                else:
+                    new_items.append(it)
+            bl[field] = new_items
+        if changed:
+            save_blacklist(bl)
+    return removed
 
 
 def save_whitelist(data: dict):
@@ -1507,19 +1675,33 @@ def deliver_eula_if_needed(config: dict, logger: logging.Logger) -> bool:
             "Repository: https://github.com/STR-Solutions-LLC/MailWarden\n"
         )
 
-        # Send via this account's SMTP (config.smtp). utils.smtp_login
-        # refuses plaintext credential submission.
+        # Deliver into the owner's mailbox. Changeset 3: IMAP APPEND first
+        # (bypasses SMTP transit filters), stamped SMTP as the fallback.
         smtp_config = config.get("smtp", {})
         try:
-            from utils import smtp_login
-            server = smtp_login(smtp_config)
+            from utils import smtp_login, deliver_owner_mail
 
             msg = MIMEText(body, "plain")
             msg["Subject"] = "Welcome to MailWarden — getting started + license"
             msg["From"] = smtp_config.get("from_address", smtp_config.get("username", ""))
             msg["To"] = username
-            server.sendmail(msg["From"], [username], msg.as_string())
-            server.quit()
+            # Stamp as system mail (was previously unstamped): required on all
+            # delivery paths so the loop-top self-loop guard skips it.
+            msg["X-MailWarden-System"] = "1"
+
+            def _smtp_send():
+                # RAISES on failure so the outer except leaves this account
+                # unmarked and the EULA is retried next run.
+                server = smtp_login(smtp_config)
+                try:
+                    server.sendmail(msg["From"], [username], msg.as_string())
+                finally:
+                    try:
+                        server.quit()
+                    except Exception:
+                        pass
+
+            deliver_owner_mail(config, msg, username, logger, _smtp_send)
 
             sent_to[acct_name] = current_version
             newly_sent[acct_name] = current_version
@@ -1865,22 +2047,31 @@ def send_email(config: dict, subject: str, body: str, logger: logging.Logger,
     # recognise its own outgoing mail and skip it on re-ingestion.
     msg["X-MailWarden-System"] = "1"
 
-    server = None
-    try:
-        # utils.smtp_login handles SMTP_SSL vs STARTTLS and refuses to
-        # send credentials over a plaintext connection.
-        from utils import smtp_login
-        server = smtp_login(smtp_config)
-        server.sendmail(from_addr, [to_addr], msg.as_string())
-        logger.info(f"  Email sent: {subject[:60]}")
-    except Exception as e:
-        logger.error(f"  Failed to send email: {e}")
-    finally:
-        if server:
-            try:
-                server.quit()
-            except Exception:
-                pass
+    def _smtp_send():
+        # The stamped SMTP path — now the FALLBACK when IMAP APPEND is
+        # unavailable (to_addr is not an owned account) or fails.
+        server = None
+        try:
+            # utils.smtp_login handles SMTP_SSL vs STARTTLS and refuses to
+            # send credentials over a plaintext connection.
+            from utils import smtp_login
+            server = smtp_login(smtp_config)
+            server.sendmail(from_addr, [to_addr], msg.as_string())
+        except Exception as e:
+            logger.error(f"  Failed to send email: {e}")
+        finally:
+            if server:
+                try:
+                    server.quit()
+                except Exception:
+                    pass
+
+    # Changeset 3: deliver by IMAP APPEND into the owner's mailbox (bypasses
+    # SMTP transit filters that were junking our own system mail), with the
+    # stamped SMTP path as the never-lose fallback. deliver_owner_mail also
+    # backfills Date + Message-ID (APPEND does not add them).
+    from utils import deliver_owner_mail
+    deliver_owner_mail(config, msg, to_addr, logger, _smtp_send)
 
 
 def _strip_date_fragment(name: str) -> str:
@@ -2849,6 +3040,50 @@ def _command_sender_is_owner(from_email: str, account: dict,
     if config is not None:
         return sender in _owner_identities(config)
     return False
+
+
+# Body openings that unambiguously identify MailWarden's OWN OUTGOING mail — the
+# daily report and every analysis/ack email send_email/send_report produce. An
+# owner's REPLY never starts with one of these (it starts with the owner's typed
+# YES/NO/APPROVE/question), so a header-independent own-mail skip keyed on these
+# prefixes protects our outgoing mail from being self-junked (e.g. when a relay
+# strips X-MailWarden-System) WITHOUT ever swallowing a real owner command.
+# Overlaps intentionally with run_filter's inline _own_prefixes (SFID guard); the
+# stamp is the primary defense and these are belt-and-suspenders.
+_OWN_OUTGOING_BODY_MARKERS = (
+    "SPAM FILTER DAILY REPORT",
+    "Your false positive has been analyzed",
+    "The proposed signal change has been applied",
+    "Understood. Signals remain unchanged",
+    "MailWarden analyzed the spam example you submitted and proposes a new "
+    "refinement to add to the filter.",
+    "The refinement has been applied",
+    "The refinement proposal has been rejected",
+    "Your reply looks like it may include a condition:",
+    "MailWarden could not apply this signal change",
+    "MailWarden received your reply but couldn't read any instruction in it.",
+    "MailWarden couldn't answer your question right now.",
+)
+
+
+def _is_own_outgoing_mail(msg_data: dict, account: dict, config: dict) -> bool:
+    """Header-INDEPENDENT check that a message is MailWarden's own outgoing mail
+    (daily report / FP analysis / ack), so the loop can skip classifying — and
+    thus junking — it even when X-MailWarden-System was stripped in transit.
+
+    True ONLY when BOTH hold: the From address is one of the owner's own
+    identities (accounts + the SMTP identity — per-account reports are sent from
+    the single global SMTP identity), AND the plain-text body starts with a
+    marker only our outgoing mail carries. An owner REPLY starts with the owner's
+    own text, so it is never matched here and still reaches strict command
+    handling (this guard NEVER honors a command — it only prevents junking)."""
+    if not _command_sender_is_owner(msg_data.get("from_email", ""),
+                                    account, config):
+        return False
+    body = (msg_data.get("plain_text_body", "") or "").strip()
+    if not body:
+        return False
+    return any(body.startswith(m) for m in _OWN_OUTGOING_BODY_MARKERS)
 
 
 def _command_auth_ok(msg_data: dict, from_email: str,
@@ -4046,17 +4281,53 @@ def _build_learned_lines(signals: dict, account_name: str = None):
                 body += f" {rationale[:700]}"
         elif rule_class == "curate":
             # A user PREFERENCE about LEGITIMATE mail the owner no longer wants
-            # (e.g. fundraising they are sick of). Apply NARROWLY: junk only mail
-            # that unmistakably matches this preference; never extend it to
-            # adjacent legitimate mail, and never junk an authenticated sender
-            # over a single keyword. This is NOT a bad-actor threat.
-            body = (f"USER PREFERENCE (curate): {headline} — the user has "
-                    f"chosen NOT to receive this kind of LEGITIMATE mail; for "
-                    f"this account, treat mail that clearly matches as unwanted "
-                    f"(junk it) EVEN THOUGH it is not bad-actor spam. Apply ONLY "
-                    f"to mail that unmistakably matches this narrow preference; "
-                    f"NEVER extend it to adjacent legitimate mail, and never junk "
-                    f"an authenticated sender over a single keyword.")
+            # (e.g. fundraising they are sick of). This is NOT a bad-actor threat.
+            #
+            # Enforcement routing (authored "Unwanted Categories" rules only;
+            # LEARNED curate rules carry no "enforcement" field and fall through
+            # as full-headline injection, exactly as before):
+            #   deterministic -> the exact tokens/senders are enforced by the
+            #                    keyword/blacklist gate, which fires BEFORE the AI,
+            #                    so this rule is NEVER injected into the prompt.
+            #   mixed         -> only the residual that still needs judgment is
+            #                    injected (the exact markers are gated).
+            #   ai / legacy   -> inject the whole headline, as before.
+            enforcement = (r.get("enforcement") or "").strip().lower()
+            if enforcement == "deterministic":
+                continue
+            curate_text = headline
+            if enforcement == "mixed":
+                curate_text = (r.get("residual_text") or "").strip()
+                if not curate_text:
+                    continue
+            # Provenance decides the guardrail strength. An authored rule
+            # (source==config_io.AUTHORED_SOURCE, "user_authored") is the owner's
+            # OWN explicit instruction and OUTRANKS authenticated-sender
+            # protection when the mail clearly matches what they described — but
+            # is still held to exactly that (never widened). A learned curate rule
+            # keeps the cautious wording that must NOT junk an authenticated
+            # sender over a single keyword.
+            if (r.get("source") or "").strip().lower() == "user_authored":
+                body = (f"USER PREFERENCE (curate, the user's own written rule): "
+                        f"{curate_text} — the user WROTE this rule to stop "
+                        f"receiving this kind of LEGITIMATE mail; for this "
+                        f"account, junk any mail that clearly matches what the "
+                        f"user described, EVEN from an authenticated, brand-"
+                        f"matched sender. The user's own rule OUTRANKS "
+                        f"authenticated-sender protection here, because the user "
+                        f"explicitly asked for this mail to be removed. Match it "
+                        f"as the user described (for example the exact subject "
+                        f"tag or sender they named); NEVER extend it to adjacent "
+                        f"legitimate mail the user did not describe. This is the "
+                        f"user's preference, not a bad-actor threat.")
+            else:
+                body = (f"USER PREFERENCE (curate): {curate_text} — the user has "
+                        f"chosen NOT to receive this kind of LEGITIMATE mail; for "
+                        f"this account, treat mail that clearly matches as unwanted "
+                        f"(junk it) EVEN THOUGH it is not bad-actor spam. Apply ONLY "
+                        f"to mail that unmistakably matches this narrow preference; "
+                        f"NEVER extend it to adjacent legitimate mail, and never junk "
+                        f"an authenticated sender over a single keyword.")
             if rationale:
                 body += f" {rationale[:700]}"
         else:
@@ -6891,6 +7162,29 @@ def run_filter(force: bool = False):
                             f"  Skipping own MailWarden system email "
                             f"(X-MailWarden-System: 1): {msg_data.get('subject','')[:60]}"
                         )
+                        _record_processed(processed, account_key,
+                                          account_processed, msg_id)
+                        continue
+
+                    # Defense-in-depth (own-mail self-junk guard, task #10):
+                    # even if the X-MailWarden-System stamp above was stripped in
+                    # transit, NEVER classify/junk our OWN outgoing mail — the
+                    # daily report (which quotes junked spam), the FP-analysis
+                    # email (whose subject embeds the original spam subject and
+                    # would trip the subject-keyword gate), or any ack. This runs
+                    # BEFORE every classification gate and is NOT conditioned on
+                    # _command_auth_ok, so it holds even on setups where the
+                    # owner/auth checks null out mwr_match. Header-independent:
+                    # keyed on the owner identity + an own-outgoing body marker an
+                    # owner reply never has. Records processed + leaves UNSEEN,
+                    # exactly like the stamp guard. This ONLY prevents junking —
+                    # it does NOT honor commands/approvals (those keep their
+                    # strict _command_auth_ok gate below, untouched).
+                    if _is_own_outgoing_mail(msg_data, account, config):
+                        logger.debug(
+                            "  Skipping own outgoing MailWarden mail "
+                            "(header-independent guard): %s"
+                            % (msg_data.get("subject", "")[:60],))
                         _record_processed(processed, account_key,
                                           account_processed, msg_id)
                         continue

@@ -343,6 +343,193 @@ def _add_blocklist_entry_locked(value: str, kind: str, scope) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# Provenance-tagged deterministic entries for authored "Unwanted Categories"
+# rules.
+#
+# When an authored rule names exact subject tokens / sender addresses / domains,
+# those are enforced by the deterministic keyword & blacklist gates (which fire
+# BEFORE the AI classifier) instead of by the prompt. Each such entry is written
+# in the EXISTING migration-safe object shape {"value","scope"} with ONE added
+# key, "provenance" = a LIST of PER-OWNER records {"id","scope"} (MULTI-OWNER).
+# The engine's _normalize_block_entries reads only value+scope and ignores extra
+# keys, so old plain-string and old {"value","scope"} entries keep working
+# unchanged and no store rewrite is needed. "provenance" is used ONLY here, to
+# cascade-remove a rule's own entries on retire/delete: an entry is dropped only
+# when its LAST owner is removed, and the entry's effective "scope" is recomputed
+# as the UNION OF THE REMAINING OWNERS' scopes on every add AND remove — so a
+# token two rules with different account scopes share narrows back to the
+# survivor's scope when one is deleted (no over-block), and a hand-added block
+# (no provenance) is NEVER touched. Legacy string / list-of-ids provenance is
+# read as owners inheriting the entry's current scope, then migrated on write.
+#
+# The four cascade helpers here (config_io) and their engine twins
+# (spam_filter.add_ai_provenance_entries_local / remove_ai_provenance_entries_local
+# + _provenance_owners / _union_scopes) MUST stay in sync — the two trees never
+# import each other and share only these JSON sidecars, so the per-owner-scope
+# logic is duplicated verbatim. If you edit one copy, edit the other.
+# ---------------------------------------------------------------------------
+
+# The blacklist fields an authored marker can land in (subset of
+# _BLOCK_KIND_TO_FIELD — display_name is not an authored marker kind).
+_AUTHORED_MARKER_FIELDS = {
+    "subject_keyword": "subject_keywords",
+    "address": "addresses",
+    "domain": "domains",
+}
+
+
+def _blocklist_value_of(item, *, strip_at: bool) -> str:
+    """Normalized comparable value of a blacklist item (string OR {"value"...})."""
+    raw = item.get("value") if isinstance(item, dict) else item
+    if not isinstance(raw, str):
+        return ""
+    s = raw.strip().lower()
+    return s.lstrip("@") if strip_at else s
+
+
+def _provenance_owners(entry) -> list:
+    """The authored-rule owners of a blacklist entry, each as {"id","scope"} —
+    PER-OWNER scope, so the entry's effective scope can be recomputed as the
+    union of the REMAINING owners after one is removed (no over-block). Read
+    every shape:
+      - no "provenance" key            -> [] (hand-added / PB2 block; sacrosanct)
+      - legacy single-id STRING        -> [{id, <entry scope>}]  (inherit)
+      - legacy LIST of id strings      -> [{id, <entry scope>}, ...] (inherit)
+      - current LIST of {"id","scope"} -> as-is
+    Legacy owners inherit the entry's current top-level scope (the best info
+    available); the shape is migrated to {"id","scope"} on the next write."""
+    if not isinstance(entry, dict):
+        return []
+    prov = entry.get("provenance")
+    if prov is None:
+        return []
+    entry_scope = entry.get("scope", "all")
+    owners = []
+    if isinstance(prov, str):
+        if prov.strip():
+            owners.append({"id": prov, "scope": entry_scope})
+        return owners
+    if isinstance(prov, list):
+        for p in prov:
+            if isinstance(p, dict) and isinstance(p.get("id"), str) \
+                    and p["id"].strip():
+                owners.append({"id": p["id"],
+                               "scope": p.get("scope", entry_scope)})
+            elif isinstance(p, str) and p.strip():
+                owners.append({"id": p, "scope": entry_scope})
+    return owners
+
+
+def _union_scopes(scopes) -> "str | list":
+    """Union of an iterable of block-list scopes. "all" (or a None scope, which
+    the gate treats as global) absorbs everything; otherwise union the account
+    lists, preserving first-seen order. Empty input -> "all" (defensive; callers
+    only union a non-empty owner set)."""
+    out = []
+    any_seen = False
+    for s in scopes:
+        any_seen = True
+        if s is None or s == "all":
+            return "all"
+        items = list(s) if isinstance(s, (list, tuple)) else [s]
+        for a in items:
+            if a not in out:
+                out.append(a)
+    return out if any_seen else "all"
+
+
+def write_provenance_entries(entries, scope, provenance) -> int:
+    """Write authored-rule deterministic markers into blacklist.json under the
+    MULTI-OWNER, PER-OWNER-SCOPE provenance model. Locked RMW. Returns the count
+    of entries created or adopted.
+
+    ``entries`` is a list of {"kind": "subject_keyword"|"address"|"domain",
+    "value": <str>}. For each value:
+      - absent   -> create {"value","scope","provenance":[{"id","scope"}]}.
+      - owned    -> ADOPT: add/refresh this rule's {"id","scope"} owner record
+        and recompute the entry's effective scope = union of ALL owners' scopes,
+        migrating any legacy string/list-of-ids provenance to {"id","scope"}.
+      - hand-added (plain string / dict with no provenance) -> LEFT UNTOUCHED:
+        the rule takes NO ownership, so a later delete can never take a hand
+        entry; it already enforces the value."""
+    if not entries:
+        return 0
+    with file_lock.locked(paths.BLACKLIST_PATH):
+        bl = load_blacklist()
+        changed = 0
+        for e in entries:
+            kind = (e.get("kind") or "").strip().lower()
+            field = _AUTHORED_MARKER_FIELDS.get(kind)
+            if field is None:
+                continue
+            strip_at = (field == "domains")
+            v = (e.get("value") or "").strip().lower()
+            if strip_at:
+                v = v.lstrip("@")
+            if not v:
+                continue
+            items = bl.setdefault(field, [])
+            existing = next(
+                (it for it in items
+                 if _blocklist_value_of(it, strip_at=strip_at) == v), None)
+            if existing is None:
+                items.append({"value": v, "scope": scope,
+                              "provenance": [{"id": provenance, "scope": scope}]})
+                changed += 1
+                continue
+            owners = _provenance_owners(existing)
+            if not owners:
+                # Hand-added / PB2 block — sacrosanct. No ownership taken.
+                continue
+            owners = [o for o in owners if o["id"] != provenance]
+            owners.append({"id": provenance, "scope": scope})
+            existing["provenance"] = owners
+            existing["scope"] = _union_scopes([o["scope"] for o in owners])
+            changed += 1
+        if changed:
+            save_blacklist(bl)
+    return changed
+
+
+def remove_provenance_entries(provenance) -> int:
+    """Drop this rule's ownership of its deterministic blacklist entries (MULTI-
+    OWNER, PER-OWNER SCOPE). For each entry this rule owns, remove its owner
+    record and RECOMPUTE the entry's effective scope as the union of the
+    REMAINING owners' scopes — so an entry a rule scoped to account X shared
+    narrows back to the survivors' accounts and X mail is no longer junked. The
+    entry is deleted only when its LAST owner is removed. Hand-added entries (no
+    provenance) are never touched. Locked RMW. Returns the count of entries FULLY
+    removed (last owner gone)."""
+    removed = 0
+    with file_lock.locked(paths.BLACKLIST_PATH):
+        bl = load_blacklist()
+        changed = False
+        for field in _AUTHORED_MARKER_FIELDS.values():
+            items = bl.get(field)
+            if not isinstance(items, list):
+                continue
+            new_items = []
+            for it in items:
+                owners = _provenance_owners(it)
+                if any(o["id"] == provenance for o in owners):
+                    changed = True
+                    remaining = [o for o in owners if o["id"] != provenance]
+                    if remaining:
+                        it["provenance"] = remaining
+                        it["scope"] = _union_scopes(
+                            [o["scope"] for o in remaining])
+                        new_items.append(it)
+                    else:
+                        removed += 1  # last owner -> entry dropped
+                else:
+                    new_items.append(it)
+            bl[field] = new_items
+        if changed:
+            save_blacklist(bl)
+    return removed
+
+
 def load_token_usage() -> dict:
     return load_json(
         paths.TOKEN_USAGE_PATH,
@@ -485,6 +672,10 @@ def delete_active_refinement(refinement_id: str, source: str = "dashboard",
         "source": source,
         "reason": reason,
     })
+    # Cascade: drop this authored rule's deterministic blacklist entries (only
+    # its own provenance-tagged rows; hand-added blocks are never touched).
+    if found.get("source") == AUTHORED_SOURCE:
+        remove_provenance_entries(refinement_id)
     return True
 
 
@@ -493,9 +684,10 @@ def list_retired_refinements() -> list[dict]:
     panel. Mirrors list_active_refinements' shape but with an EXACT predicate:
     only records explicitly marked "retired" count — an absent status must NOT
     (unlike list_active_refinements, which treats an absent status as active).
-    Only the email DROP corridor (spam_filter.retire_ai_refinement) sets this
-    status; the Dashboard Delete button removes the record outright, so a
-    deleted rule never lands here."""
+    The "retired" status is set by the email DROP corridor
+    (spam_filter.retire_ai_refinement) AND by the Dashboard/editor disable toggle
+    (config_io.retire_refinement); the Dashboard Delete button removes the record
+    outright, so a deleted rule never lands here."""
     return [r for r in load_signals().get("ai_refinements", [])
             if r.get("status") == "retired"]
 
@@ -531,6 +723,13 @@ def restore_refinement(refinement_id: str, source: str = "dashboard") -> dict | 
             "headline": restored.get("headline", ""),
             "source": source,
         })
+        # Cascade: re-add the authored rule's deterministic blacklist entries
+        # that its retire removed, honoring the rule's current scope.
+        if restored.get("source") == AUTHORED_SOURCE:
+            entries = restored.get("deterministic_entries") or []
+            if entries:
+                write_provenance_entries(entries, restored.get("scope", "all"),
+                                         refinement_id)
     return restored
 
 
@@ -572,12 +771,23 @@ def set_refinement_scope(refinement_id: str, scope) -> bool:
 
 
 def build_authored_curate_refinement(refinement_id: str, description: str,
-                                     scope) -> dict | None:
+                                     scope, enforcement: dict | None = None) -> dict | None:
     """PURE (no IO). Build an ACTIVE curate ai_refinement authored directly by
     the owner. Mirrors the LEARNED curate record shape
     (learn_signals._build_refinement with verdict "spam" + rule_class "curate")
     so it flows through the identical classifier path; only the provenance
     differs (source=AUTHORED_SOURCE, evidence empty, no Claude rationale).
+
+    ``enforcement`` (optional) is the classifier from breadth_advisor.
+    extract_enforcement. When supplied it adds three fields the engine reads:
+      - "enforcement": "deterministic" | "mixed" | "ai" — how the rule is applied
+        (deterministic-only rules are NOT injected into the prompt; mixed rules
+        inject only their residual; ai rules inject the whole headline).
+      - "residual_text": the judgment half a MIXED rule injects.
+      - "deterministic_entries": the {kind,value} markers written to the keyword/
+        blacklist store (kept on the record so a RESTORE can re-add them).
+    When ``enforcement`` is None the record keeps the legacy shape and behaves as
+    today (full-headline injection, no deterministic entries).
 
     Returns None when ``description`` is blank — a headline-less refinement is
     inert (spam_filter._build_learned_lines skips a refinement with no
@@ -586,7 +796,7 @@ def build_authored_curate_refinement(refinement_id: str, description: str,
     if not desc:
         return None
     now = now_iso()
-    return {
+    record = {
         "id": refinement_id,
         "kind": "new_pattern",
         "verdict": "spam",
@@ -603,23 +813,33 @@ def build_authored_curate_refinement(refinement_id: str, description: str,
         "scope": scope,
         "source": AUTHORED_SOURCE,
     }
+    if enforcement:
+        record["enforcement"] = enforcement.get("enforcement", "ai")
+        record["residual_text"] = enforcement.get("residual_text", desc)
+        record["deterministic_entries"] = list(
+            enforcement.get("deterministic_entries", []))
+    return record
 
 
 def create_authored_refinement(description: str, scope,
-                               source: str = "dashboard") -> dict | None:
+                               source: str = "dashboard",
+                               enforcement: dict | None = None) -> dict | None:
     """Author a NEW unwanted-category curate rule and persist it (Batch C).
 
     Locked read-modify-write of signals.json: mint a fresh R- id, build the
-    ACTIVE curate record, append, save, and log an "authored" event. The rule
-    is in effect on the next filter tick (signals.json is reloaded per run).
-    Returns the saved record, or None if ``description`` was blank (nothing
-    written)."""
+    ACTIVE curate record, append, save, and log an "authored" event. When
+    ``enforcement`` carries deterministic markers, they are ALSO written to
+    blacklist.json (tagged with this rule's id + scope) so the keyword/sender
+    gates enforce them before the AI runs. The rule is in effect on the next
+    filter tick (both sidecars are reloaded per run). Returns the saved record,
+    or None if ``description`` was blank (nothing written)."""
     if not (description or "").strip():
         return None
     with file_lock.locked(paths.SIGNALS_PATH):
         data = load_signals()
         rid = _mint_refinement_id(data)
-        record = build_authored_curate_refinement(rid, description, scope)
+        record = build_authored_curate_refinement(rid, description, scope,
+                                                  enforcement)
         data.setdefault("ai_refinements", []).append(record)
         save_signals(data)
     append_refinement_log({
@@ -629,6 +849,10 @@ def create_authored_refinement(description: str, scope,
         "headline": record["headline"],
         "source": source,
     })
+    # Sequential (not nested) lock: the blacklist write takes its own lock after
+    # the signals lock is released, so there is no cross-file lock-ordering risk.
+    if enforcement and enforcement.get("deterministic_entries"):
+        write_provenance_entries(enforcement["deterministic_entries"], scope, rid)
     return record
 
 
@@ -655,6 +879,7 @@ def retire_refinement(refinement_id: str, source: str = "dashboard") -> bool:
     safe on repeated clicks). Used by the Unwanted Categories editor's
     enable/disable toggle."""
     retired = False
+    was_authored = False
     with file_lock.locked(paths.SIGNALS_PATH):
         data = load_signals()
         for r in data.get("ai_refinements", []) or []:
@@ -663,6 +888,7 @@ def retire_refinement(refinement_id: str, source: str = "dashboard") -> bool:
                 r["status"] = "retired"
                 r["retired_at"] = now_iso()
                 retired = True
+                was_authored = r.get("source") == AUTHORED_SOURCE
                 break
         if retired:
             save_signals(data)
@@ -673,6 +899,11 @@ def retire_refinement(refinement_id: str, source: str = "dashboard") -> bool:
             "id": refinement_id,
             "source": source,
         })
+        # Cascade: disabling an authored rule must also stop its deterministic
+        # gate hits, so remove its provenance-tagged blacklist entries (restore
+        # re-adds them). Hand-added blocks are untouched.
+        if was_authored:
+            remove_provenance_entries(refinement_id)
     return retired
 
 
