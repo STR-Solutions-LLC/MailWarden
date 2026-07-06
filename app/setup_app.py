@@ -20,7 +20,7 @@ from setuptools import setup
 
 HERE = Path(__file__).parent.resolve()
 APP_NAME = "MailWarden"
-VERSION = "1.6.0-beta.19"
+VERSION = "1.7.0"
 
 # ----------------------------------------------------------------------------
 # Copy the shared bundled defaults and runtime payload into app/resources/
