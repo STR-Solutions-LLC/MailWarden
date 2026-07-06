@@ -409,6 +409,14 @@ def save_signals(data: dict) -> None:
 # section is cheap to render without reconstructing state.
 
 
+# Provenance marker for a curate rule the OWNER authored directly in the
+# Unwanted Categories editor (typed, no example email, no Claude call), as
+# opposed to one the learner derived from a forwarded/taught example. Same
+# rule_class + storage + prompt path as a learned curate rule — only the
+# source differs, so the editor can list/manage authored rules on their own.
+AUTHORED_SOURCE = "user_authored"
+
+
 def list_active_refinements() -> list[dict]:
     data = load_signals()
     return [r for r in data.get("ai_refinements", [])
@@ -545,6 +553,127 @@ def set_refinement_scope(refinement_id: str, scope) -> bool:
                 save_signals(data)
                 return True
         return False
+
+
+# ---------------------------------------------------------------------------
+# Owner-authored "Unwanted Categories" curate rules (Batch C).
+#
+# These reuse the EXISTING curate refinement mechanism end-to-end — same
+# rule_class ("curate"), same storage (signals.json[ai_refinements]), same
+# prompt injection (spam_filter._build_learned_lines renders them on the
+# identical "USER PREFERENCE (curate)" path a learned curate rule uses). The
+# ONLY differences: the owner types the category description directly (no
+# example email, no Claude call), so the record is created here rather than by
+# the learner; and source==AUTHORED_SOURCE marks the provenance so the editor
+# can manage authored rules separately and the learner/contradiction guard is
+# never surprised. Enable/disable reuse the retire/restore status flip; delete
+# reuses delete_active_refinement.
+# ---------------------------------------------------------------------------
+
+
+def build_authored_curate_refinement(refinement_id: str, description: str,
+                                     scope) -> dict | None:
+    """PURE (no IO). Build an ACTIVE curate ai_refinement authored directly by
+    the owner. Mirrors the LEARNED curate record shape
+    (learn_signals._build_refinement with verdict "spam" + rule_class "curate")
+    so it flows through the identical classifier path; only the provenance
+    differs (source=AUTHORED_SOURCE, evidence empty, no Claude rationale).
+
+    Returns None when ``description`` is blank — a headline-less refinement is
+    inert (spam_filter._build_learned_lines skips a refinement with no
+    headline), so a blank rule is refused rather than written."""
+    desc = (description or "").strip()
+    if not desc:
+        return None
+    now = now_iso()
+    return {
+        "id": refinement_id,
+        "kind": "new_pattern",
+        "verdict": "spam",
+        "rule_class": "curate",
+        "headline": desc,
+        "rationale": "",
+        "what_this_doesnt_cover": "",
+        "confidence": "high",
+        "evidence": [],
+        "first_learned": now,
+        "last_reinforced": now,
+        "match_count": 0,
+        "status": "active",
+        "scope": scope,
+        "source": AUTHORED_SOURCE,
+    }
+
+
+def create_authored_refinement(description: str, scope,
+                               source: str = "dashboard") -> dict | None:
+    """Author a NEW unwanted-category curate rule and persist it (Batch C).
+
+    Locked read-modify-write of signals.json: mint a fresh R- id, build the
+    ACTIVE curate record, append, save, and log an "authored" event. The rule
+    is in effect on the next filter tick (signals.json is reloaded per run).
+    Returns the saved record, or None if ``description`` was blank (nothing
+    written)."""
+    if not (description or "").strip():
+        return None
+    with file_lock.locked(paths.SIGNALS_PATH):
+        data = load_signals()
+        rid = _mint_refinement_id(data)
+        record = build_authored_curate_refinement(rid, description, scope)
+        data.setdefault("ai_refinements", []).append(record)
+        save_signals(data)
+    append_refinement_log({
+        "ts": now_iso(),
+        "event": "authored",
+        "id": rid,
+        "headline": record["headline"],
+        "source": source,
+    })
+    return record
+
+
+def list_authored_refinements() -> list[dict]:
+    """Every owner-authored curate rule (source==AUTHORED_SOURCE), whether
+    ACTIVE or disabled (status "retired"), newest first — the data behind the
+    Unwanted Categories editor. Unlike list_active_refinements, status is NOT
+    filtered, because the editor shows disabled rules too (with a toggle to
+    re-enable)."""
+    rows = [r for r in load_signals().get("ai_refinements", [])
+            if r.get("source") == AUTHORED_SOURCE]
+    rows.sort(key=lambda r: r.get("first_learned", ""), reverse=True)
+    return rows
+
+
+def retire_refinement(refinement_id: str, source: str = "dashboard") -> bool:
+    """Config_io twin of spam_filter.retire_ai_refinement — MUST stay in sync
+    with it (the two trees never import each other, so the semantics are
+    duplicated; the engine body is the source of truth). DISABLE a rule: flip
+    its ai_refinement status from "active" to "retired" (never delete —
+    reversible; restore_refinement, the unretire twin, flips it back). Excludes
+    it from prompt injection on the next filter tick. Returns True if a matching
+    ACTIVE rule was retired, False if missing / already inactive (idempotent —
+    safe on repeated clicks). Used by the Unwanted Categories editor's
+    enable/disable toggle."""
+    retired = False
+    with file_lock.locked(paths.SIGNALS_PATH):
+        data = load_signals()
+        for r in data.get("ai_refinements", []) or []:
+            if r.get("id") == refinement_id \
+                    and r.get("status", "active") == "active":
+                r["status"] = "retired"
+                r["retired_at"] = now_iso()
+                retired = True
+                break
+        if retired:
+            save_signals(data)
+    if retired:
+        append_refinement_log({
+            "ts": now_iso(),
+            "event": "retired_by_owner",
+            "id": refinement_id,
+            "source": source,
+        })
+    return retired
 
 
 def apply_refinement_from_pending(sfid: str, source: str = "dashboard") -> dict | None:

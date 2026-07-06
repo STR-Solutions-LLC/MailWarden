@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from . import breadth_advisor
 from . import config_io
 from . import explain_text
 from . import file_lock
@@ -214,6 +215,7 @@ class Dashboard(tk.Tk):
         self.accounts_tab = AccountsTab(self.notebook, self)
         self.lists_tab = ListsTab(self.notebook, self)
         self.signals_tab = SignalsTab(self.notebook, self)
+        self.unwanted_tab = UnwantedCategoriesTab(self.notebook, self)
         self.check_tab = CheckEmailTab(self.notebook, self)
         self.usage_tab = UsageTab(self.notebook, self)
         self.settings_tab = SettingsTab(self.notebook, self)
@@ -225,6 +227,7 @@ class Dashboard(tk.Tk):
             (self.accounts_tab, "Accounts"),
             (self.lists_tab, "Whitelist / Blacklist"),
             (self.signals_tab, "Signal History"),
+            (self.unwanted_tab, "Unwanted Categories"),
             (self.check_tab, "Check an Email"),
             (self.usage_tab, "API Usage"),
             (self.settings_tab, "Settings"),
@@ -515,6 +518,7 @@ class Dashboard(tk.Tk):
         self.accounts_tab.refresh()
         self.lists_tab.refresh()
         self.signals_tab.refresh()
+        self.unwanted_tab.refresh()
         self.usage_tab.refresh()
         self.settings_tab.refresh()
         self.diagnostics_tab.refresh()
@@ -2718,8 +2722,13 @@ class SignalsTab(ttk.Frame):
     def _render_active(self):
         self._active_box.clear()
         body = self._active_box.body
+        # Owner-authored curate rules are managed in their own "Unwanted
+        # Categories" tab (add / enable-disable / delete there), so they are
+        # kept out of this learned-rules view to avoid a second, confusing
+        # management surface for the same rule.
         refinements = sorted(
-            config_io.list_active_refinements(),
+            (r for r in config_io.list_active_refinements()
+             if r.get("source") != config_io.AUTHORED_SOURCE),
             key=lambda r: r.get("last_reinforced", r.get("first_learned", "")),
             reverse=True)
         if not refinements:
@@ -2815,8 +2824,12 @@ class SignalsTab(ttk.Frame):
         appear here."""
         self._dropped_box.clear()
         body = self._dropped_box.body
+        # A disabled owner-authored rule is also status "retired"; keep those
+        # out of this email-dropped-rules panel — they are enabled/disabled from
+        # the "Unwanted Categories" tab, not restored from here.
         retired = sorted(
-            config_io.list_retired_refinements(),
+            (r for r in config_io.list_retired_refinements()
+             if r.get("source") != config_io.AUTHORED_SOURCE),
             key=lambda r: r.get("retired_at", ""),
             reverse=True)
         if not retired:
@@ -3233,6 +3246,300 @@ class SignalsTab(ttk.Frame):
         messagebox.showinfo("Reset",
                              "Signals reset to shipped defaults.")
         self.refresh()
+
+
+# =============================================================================
+# UNWANTED CATEGORIES  (owner-authored curate rules — Batch C)
+# =============================================================================
+class UnwantedCategoriesTab(ttk.Frame):
+    """Author, list, turn on/off, and delete your own 'unwanted category' rules.
+
+    A rule here tells MailWarden about a kind of legitimate mail you've decided
+    you don't want (for example, political fundraising from a particular party).
+    You describe the category in plain words — no example email needed. Under
+    the hood these are the SAME curate rules MailWarden makes when you teach it
+    from an example; the only difference is you wrote this one yourself
+    (config_io.AUTHORED_SOURCE). They only affect mail that arrives AFTER you
+    add them, and never touch a sender on your Whitelist.
+    """
+
+    def __init__(self, parent, app: Dashboard):
+        super().__init__(parent)
+        self.app = app
+        self._scroll = _ScrollableTab(self)
+        self._scroll.pack(fill=tk.BOTH, expand=True)
+        self._f = ttk.Frame(self._scroll.body, padding=(12, 8))
+        self._f.pack(fill=tk.BOTH, expand=True)
+        self._desc_var = tk.StringVar()
+        self._scope_vars: "list[tuple[str, tk.BooleanVar]]" = []
+        self._busy = False
+        self._build()
+        self.refresh()
+
+    # ---- build ----
+
+    def _build(self):
+        ttk.Label(
+            self._f, style="Muted.TLabel", wraplength=760,
+            text=("Tell MailWarden about a kind of mail you've decided you "
+                  "don't want — even when it's perfectly legitimate. Describe "
+                  "the category in your own words (for example, \"political "
+                  "fundraising from Republican campaigns\" or \"webinar "
+                  "invitations from software companies\"). MailWarden will move "
+                  "mail that clearly matches into your junk folder from now on. "
+                  "This only affects mail that arrives after you add the rule — "
+                  "it never reaches back into mail you've already received.")
+        ).pack(anchor=tk.W, pady=(0, 6))
+
+        ttk.Label(
+            self._f, style="Muted.TLabel", wraplength=760,
+            text=("Keep the description specific. A vague rule like "
+                  "\"newsletters\" could hide mail you actually want. If there "
+                  "are senders you always want to hear from, add them to your "
+                  "Whitelist (Whitelist / Blacklist tab) — a category rule "
+                  "never junks a whitelisted sender.")
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        form = ttk.LabelFrame(self._f, text="Add an unwanted category",
+                              padding=(10, 8))
+        form.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(form, text="Describe the category you don't want:",
+                  style="Muted.TLabel").pack(anchor=tk.W)
+        entry = ttk.Entry(form, textvariable=self._desc_var, width=88)
+        entry.pack(anchor=tk.W, pady=(2, 6))
+        self._desc_entry = entry
+
+        # Per-account scope toggles (default: every account ON). No accounts
+        # configured -> the rule applies everywhere ("all"); the row is hidden.
+        self._scope_row_holder = ttk.Frame(form)
+        self._scope_row_holder.pack(anchor=tk.W, fill=tk.X)
+        self._build_scope_row()
+
+        actions = ttk.Frame(form)
+        actions.pack(anchor=tk.W, pady=(8, 0))
+        ttk.Button(actions, text="Add category rule", style="Primary.TButton",
+                   command=self._on_add).pack(side=tk.LEFT)
+        self._status = ttk.Label(actions, text="", style="Muted.TLabel")
+        self._status.pack(side=tk.LEFT, padx=(10, 0))
+
+        self._list_box = _ScrollSection(
+            self._f, text="Your unwanted-category rules", height=300)
+        self._list_box.pack(fill=tk.X, pady=(0, 8))
+
+    def _build_scope_row(self):
+        for w in self._scope_row_holder.winfo_children():
+            w.destroy()
+        self._scope_vars = []
+        usernames = self._account_usernames()
+        if not usernames:
+            return
+        ttk.Label(self._scope_row_holder, text="Applies to which account(s)?",
+                  style="Muted.TLabel").pack(anchor=tk.W, pady=(2, 0))
+        row = ttk.Frame(self._scope_row_holder)
+        row.pack(anchor=tk.W)
+        for u in usernames:
+            var = tk.BooleanVar(value=True)   # default: every account
+            ttk.Checkbutton(row, text=u, variable=var).pack(
+                side=tk.LEFT, padx=(0, 12))
+            self._scope_vars.append((u, var))
+
+    @staticmethod
+    def _account_usernames() -> list[str]:
+        accounts = config_io.load_config().get("accounts", []) or []
+        return [a.get("username", "") for a in accounts if a.get("username")]
+
+    def _picked_scope(self):
+        """Scope from the add-form toggles: "all" when no accounts are
+        configured or every one is ticked, the ticked subset otherwise, or None
+        when accounts exist but none are ticked (caller must prompt)."""
+        usernames = self._account_usernames()
+        if not usernames:
+            return "all"
+        on = [u for (u, v) in self._scope_vars if v.get()]
+        if not on:
+            return None
+        return scope_from_toggle_state(usernames, on)
+
+    # ---- refresh & render ----
+
+    def refresh(self):
+        # Rebuild the scope row so a newly added/removed account shows up.
+        self._build_scope_row()
+        self._render_list()
+        self._list_box.bind_wheel_recursive()
+
+    def _render_list(self):
+        self._list_box.clear()
+        body = self._list_box.body
+        rules = config_io.list_authored_refinements()
+        if not rules:
+            ttk.Label(
+                body, style="Muted.TLabel", wraplength=720,
+                text=("You haven't added any category rules yet. Describe a "
+                      "kind of mail you don't want above and click "
+                      "\"Add category rule\".")
+            ).pack(anchor=tk.W)
+            return
+        for r in rules:
+            self._render_card(body, r)
+
+    def _render_card(self, body, r: dict):
+        card = ttk.Frame(body, padding=(10, 8), relief="groove", borderwidth=1)
+        card.pack(fill=tk.X, pady=4)
+        on = r.get("status", "active") == "active"
+        headline = r.get("headline") or "(no description)"
+        ttk.Label(card, text=headline, style="Subheading.TLabel",
+                  wraplength=720).pack(anchor=tk.W)
+        state_word = "On — junking matching mail" if on else "Off — not in effect"
+        meta = (f"{state_word}  ·  applies to "
+                f"{SignalsTab._scope_text(r.get('scope', 'all'))}  ·  "
+                f"added {r.get('first_learned', '')[:16]}  ·  "
+                f"ID {r.get('id', '')}")
+        ttk.Label(card, text=meta, style="Muted.TLabel",
+                  wraplength=720).pack(anchor=tk.W)
+        btns = ttk.Frame(card)
+        btns.pack(anchor=tk.W, pady=(6, 0))
+        rid = r.get("id", "")
+        if on:
+            ttk.Button(btns, text="Turn off",
+                       command=lambda i=rid: self._on_disable(i)).pack(
+                           side=tk.LEFT)
+        else:
+            ttk.Button(btns, text="Turn on", style="Primary.TButton",
+                       command=lambda i=rid: self._on_enable(i)).pack(
+                           side=tk.LEFT)
+        ttk.Button(btns, text="Delete",
+                   command=lambda i=rid: self._on_delete(i)).pack(
+                       side=tk.LEFT, padx=(8, 0))
+
+    # ---- actions ----
+
+    def _on_add(self):
+        if self._busy:
+            return
+        desc = self._desc_var.get().strip()
+        if not desc:
+            self._status.config(text="Type a short description first.")
+            return
+        scope = self._picked_scope()
+        if scope is None:
+            self._status.config(text="Pick at least one account.")
+            return
+        # Resolve the SCREEN model + key from the app's existing Anthropic
+        # config (cascade -> screen_model), the same source the Check-an-Email
+        # screen uses. No new auth.
+        anthro = config_io.load_config().get("anthropic", {}) or {}
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "") \
+            or anthro.get("api_key", "") or ""
+        if anthro.get("classify_mode", "cascade") == "cascade":
+            model = anthro.get("screen_model") or "claude-haiku-4-5-20251001"
+        else:
+            model = anthro.get("model") or "claude-haiku-4-5-20251001"
+        # Advisory breadth check on a worker thread so the UI never freezes.
+        # FAIL OPEN: any problem -> add the rule anyway (handled downstream).
+        self._busy = True
+        self._status.config(text="Checking this rule…")
+        import threading
+        threading.Thread(target=self._do_breadth_check,
+                         args=(desc, scope, api_key, model), daemon=True).start()
+
+    def _do_breadth_check(self, desc, scope, api_key, model):
+        verdict = breadth_advisor.check_category_breadth(desc, api_key, model)
+        self.app.after(0, self._after_breadth_check, desc, scope, verdict)
+
+    def _after_breadth_check(self, desc, scope, verdict):
+        self._busy = False
+        if breadth_advisor.should_warn(verdict):
+            self._status.config(text="")
+            self._show_broad_warning(desc, scope, verdict)
+            return
+        # Not broad, or a fail-open outcome (no key / API error): add now. Show a
+        # soft "couldn't check" note only when a check was attempted and failed.
+        if verdict.get("reason") == "error":
+            note = ("Added. MailWarden couldn't check this rule just now, so it "
+                    "was added as-is. It takes effect on the next check.")
+        else:
+            note = "Added. It takes effect on the next check."
+        self._create_rule(desc, scope, status_note=note)
+
+    def _create_rule(self, desc, scope, status_note):
+        record = config_io.create_authored_refinement(desc, scope,
+                                                       source="dashboard")
+        if record is None:
+            self._status.config(text="Type a short description first.")
+            return
+        self._desc_var.set("")
+        self._status.config(text=status_note)
+        self.refresh()
+
+    def _show_broad_warning(self, desc, scope, verdict):
+        """Broad-rule heads-up: show the concern + a tighter suggestion and make
+        the owner choose. 'Add it anyway' is the affirmative-OK gate (a
+        determined owner still proceeds); 'Let me revise' returns to the form,
+        prefilled with the suggestion when there is one."""
+        dlg = tk.Toplevel(self.app)
+        dlg.title("This rule looks broad")
+        dlg.transient(self.app)
+        dlg.resizable(False, False)
+        frm = ttk.Frame(dlg, padding=(16, 14))
+        frm.pack(fill=tk.BOTH, expand=True)
+        concern = verdict.get("concern") or (
+            "it might catch mail you actually want.")
+        ttk.Label(frm, wraplength=460, justify="left",
+                  text=("This rule is pretty broad — " + concern)).pack(
+                      anchor=tk.W)
+        suggestion = verdict.get("suggestion") or ""
+        if suggestion:
+            ttk.Label(frm, wraplength=460, justify="left", style="Muted.TLabel",
+                      text=("A tighter version: " + suggestion)).pack(
+                          anchor=tk.W, pady=(8, 0))
+        btns = ttk.Frame(frm)
+        btns.pack(anchor=tk.E, pady=(14, 0))
+
+        def _add_anyway():
+            dlg.destroy()
+            self._create_rule(
+                desc, scope,
+                status_note="Added. It takes effect on the next check.")
+
+        def _revise():
+            dlg.destroy()
+            if suggestion:
+                self._desc_var.set(suggestion)
+            self._status.config(text="Revise your rule, then add it again.")
+            try:
+                self._desc_entry.focus_set()
+            except Exception:
+                pass
+
+        ttk.Button(btns, text="Let me revise", style="Primary.TButton",
+                   command=_revise).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Add it anyway",
+                   command=_add_anyway).pack(side=tk.LEFT, padx=(6, 0))
+        dlg.protocol("WM_DELETE_WINDOW", _revise)
+        dlg.grab_set()
+
+    def _on_disable(self, refinement_id: str):
+        if refinement_id and config_io.retire_refinement(
+                refinement_id, source="dashboard"):
+            self.refresh()
+
+    def _on_enable(self, refinement_id: str):
+        if refinement_id and config_io.restore_refinement(
+                refinement_id, source="dashboard") is not None:
+            self.refresh()
+
+    def _on_delete(self, refinement_id: str):
+        if not refinement_id:
+            return
+        if not messagebox.askyesno(
+                "Delete category rule",
+                "Delete this rule for good? Mail that matched it will no longer "
+                "be junked. This can't be undone (but you can add it again)."):
+            return
+        if config_io.delete_active_refinement(refinement_id, source="dashboard"):
+            self.refresh()
 
 
 # =============================================================================

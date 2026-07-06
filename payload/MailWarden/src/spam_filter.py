@@ -5206,12 +5206,21 @@ def resolve_min_cacheable_tokens(api_config: dict | None = None) -> dict:
 
 def _min_cacheable_for_model(model: str, table: dict) -> int:
     """Minimum cacheable prefix size for ``model``: the value of the LONGEST
-    table key that ``model`` starts with (so ``claude-haiku-4-5-20251001``
-    matches ``claude-haiku-4-5``), else the conservative default for an unknown
-    model."""
+    table key that ``model`` matches on a version boundary (so
+    ``claude-haiku-4-5-20251001`` matches ``claude-haiku-4-5``), else the
+    conservative default for an unknown model.
+
+    A match requires the key to be the WHOLE id or to be followed by the ``-``
+    version separator — never a bare ``str.startswith``. Without that boundary a
+    future ``claude-sonnet-4-50`` would prefix-match the ``claude-sonnet-4-5``
+    entry and inherit the wrong minimum; the boundary makes it fall through to
+    the conservative default instead. Cosmetic — the minimum only gates a cache
+    breakpoint, never a verdict — but closed so a new dated/point release can
+    never silently borrow a neighbour's threshold."""
     best_key = None
     for k in table:
-        if model.startswith(k) and (best_key is None or len(k) > len(best_key)):
+        if (model == k or model.startswith(k + "-")) \
+                and (best_key is None or len(k) > len(best_key)):
             best_key = k
     return table[best_key] if best_key is not None \
         else _CONSERVATIVE_MIN_CACHEABLE_TOKENS

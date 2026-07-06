@@ -319,6 +319,38 @@ TWO_JOBS_PROTECT_CURATE = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Unwanted Categories editor (Dashboard tab + Help section)
+# ---------------------------------------------------------------------------
+UNWANTED_CATEGORIES_HELP = (
+    "The Unwanted Categories tab lets you write your own curate rules by hand — "
+    "no example email needed. Use it when you already know a kind of mail you "
+    "don't want, even though it's perfectly legitimate: political fundraising "
+    "from a particular party, webinar invitations, \"we miss you\" win-back "
+    "emails, and the like.\n\n"
+    "To add one: open the Unwanted Categories tab, describe the category in "
+    "your own words (for example, \"political fundraising from Republican "
+    "campaigns\"), choose which account(s) it applies to, and click \"Add "
+    "category rule\". From then on, MailWarden moves mail that clearly matches "
+    "into your junk folder.\n\n"
+    "Two things to know. First, a category rule only affects mail that arrives "
+    "AFTER you add it — it does not reach back through mail you've already "
+    "received. Second, keep the description specific. A vague rule like "
+    "\"newsletters\" could hide mail you actually want. If there are senders "
+    "you always want to hear from, add them to your Whitelist — a category rule "
+    "never junks a whitelisted sender.\n\n"
+    "MailWarden gives broad rules a quick heads-up. When you add a rule, it "
+    "checks whether the wording is broad enough to catch mail you might want. "
+    "If it looks broad, it tells you why and suggests a tighter version — but "
+    "the choice is yours: add it anyway, or revise it. If it can't check right "
+    "then (no internet, for example), it just adds the rule.\n\n"
+    "You stay in control. Every rule you add is listed on the tab with a Turn "
+    "off button (stop using it without deleting it), a Turn on button (start "
+    "using it again), and a Delete button (remove it for good). Turning a rule "
+    "off or deleting it takes effect on the next check."
+)
+
+
 # Kept for backwards compatibility with anything that still imports the
 # old single constant. New code uses the split sections above.
 DECISION_PIPELINE_EXPLANATION = "\n\n".join([
@@ -590,6 +622,7 @@ HELP_TAB_SECTIONS = [
     ("Why MailWarden is different", WHY_MAILWARDEN_IS_DIFFERENT),
     ("How it decides, in the moment", HOW_IT_DECIDES),
     ("Two things MailWarden does — Protect and Curate", TWO_JOBS_PROTECT_CURATE),
+    ("Unwanted Categories — write your own rules by hand", UNWANTED_CATEGORIES_HELP),
     ("How spam gets handled — Junk, Trash, or Delete", SPAM_HANDLING_CHOICE),
     ("Why your API bill stays small (even with a big inbox)", UNREAD_CACHING_BEHAVIOR),
     ("Train your own filter — the coolest part", TRAIN_YOUR_FILTER),
