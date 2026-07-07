@@ -428,12 +428,19 @@ def _run_classify_eml() -> int:
         h.setFormatter(_logging.Formatter("    [%(levelname)s] %(message)s"))
         log.addHandler(h)
 
+    # Load owner-approved senders the same way the live filter does so the
+    # offline CLI honors RULE 0 (owner-approved authenticated sender) exactly
+    # as run_filter would. (whitelist/blacklist remain omitted here — a
+    # pre-existing gap, intentionally out of scope for this change.)
+    approved = spam_filter.load_approved_senders(log)
+
     res = spam_filter.classify_eml_offline(
         raw, signals,
         api_key=api_key, model=model, max_tokens=500,
         classify_mode=classify_mode, confirm_model=confirm_model,
         threshold=threshold, account_name=account,
         run_dnsbl=run_dnsbl, logger=log,
+        approved_domains=approved.get("_domains_set", set()),
     )
 
     pre = res.get("pre_classifier", {})

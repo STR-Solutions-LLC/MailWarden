@@ -102,11 +102,8 @@ DEFAULT_CONFIG: dict = {
         # silently ignored (never crash).
         "recipient": "",
     },
-    "whitelist": {"folder": None},
-    "blacklist": {"folder": None},
-    "signal_learner": {
-        "enabled": True,
-    },
+    # Legacy configs may still carry whitelist.folder / blacklist.folder /
+    # signal_learner.enabled — nothing reads them, so they are silently ignored.
     "eula": {
         "current_version": "1.0",
         "sent_to_accounts": {},

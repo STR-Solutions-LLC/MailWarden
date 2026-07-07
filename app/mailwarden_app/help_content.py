@@ -192,8 +192,8 @@ PRIVACY_STATEMENT = """Your privacy is the default.
 MailWarden runs entirely on your Mac. It connects only to:
   1. Your own email server (IMAP + SMTP) to read, move, and send mail
   2. The Anthropic Claude API to classify individual emails
-  3. GitHub, once every two weeks, to check if a newer version of
-     MailWarden is available
+  3. GitHub — when you open the Dashboard (at most once every two
+     weeks) — to check for a newer version of MailWarden
 
 That is the complete list of outbound network connections. MailWarden
 does not send us, or anyone else, your email content, contacts, API
@@ -205,7 +205,7 @@ signal detection becomes subtly different from every other
 installation. If you find MailWarden helpful and would like to
 contribute your learned patterns (never your emails) back to help
 improve the software for others, you can do so voluntarily from the
-Help tab — we will never ask for them.
+Settings tab — we will never ask for them.
 
 Questions or feedback: info@rentalist.pro"""
 
@@ -262,7 +262,7 @@ TRADE_OFFS = (
 
 
 WHAT_MAILWARDEN_DOES_NOT_DO = (
-    "MailWarden never reads your email for any purpose other than the classification described above. It stores no message content long-term — only short decision records (sender, subject, verdict, confidence) for the daily report. Nothing is sent to STR Solutions. The only outbound connections are your own email server, the Anthropic API, and (once every two weeks) a GitHub version check."
+    "MailWarden never reads your email for any purpose other than the classification described above. It stores no message content long-term — only short decision records (sender, subject, verdict, confidence) for the daily report. Nothing is sent to STR Solutions. The only outbound connections are your own email server, the Anthropic API, and a GitHub version check that runs only when you open the Dashboard (at most once every two weeks)."
 )
 
 
@@ -341,7 +341,7 @@ UNWANTED_CATEGORIES_HELP = (
     "Instant matches vs. judgment. If your description names something exact "
     "that's always in these emails — a subject tag like \"[PSIAN]\", or a "
     "specific sender address or domain — MailWarden pulls that out and blocks "
-    "those emails the moment they arrive, with no guessing. Anything that still "
+    "those emails on the next inbox check, with no guessing. Anything that still "
     "needs a judgment call is left to the AI. Each rule's card tells you which "
     "way it's working: \"Enforced instantly by subject keyword: [psian]\", "
     "\"Enforced by AI judgment\", or both. When your rule sounds like a mailing "
@@ -407,7 +407,7 @@ Your spam filter is now running. By default it checks your inbox every 15
 minutes (you can set this anywhere from 5 to 360 minutes in the Dashboard),
 uses AI to identify spam, and moves flagged mail into your junk folder.
 Once a day (at 8:00 AM), you'll get a report summarizing what
-was filtered. Every junked sender in that report is numbered — if MailWarden
+was filtered. Every sender the AI or a tripwire junks is numbered — if MailWarden
 ever junks someone you want to hear from, reply APPROVE and the number (for
 example, APPROVE 3) to rescue them. If the block came from a rule you set
 yourself, MailWarden replies with how to change that rule instead.
@@ -472,7 +472,8 @@ Questions or feedback: {FEEDBACK_EMAIL}
 # Unread caching behaviour (Help tab section)
 # ---------------------------------------------------------------------------
 UNREAD_CACHING_BEHAVIOR = (
-    "MailWarden evaluates each unread email exactly once. Every message it "
+    "MailWarden evaluates each unread email once and then remembers it for "
+    "30 days. Every message it "
     "checks — whether the verdict is spam or not-spam — gets its Message-ID "
     "recorded in a local cache. On every subsequent run, the filter "
     "pulls the list of unread messages from your account, compares against "

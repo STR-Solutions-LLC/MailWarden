@@ -2073,6 +2073,13 @@ class CheckEmailTab(ttk.Frame):
             signals = config_io.load_signals()
             whitelist = config_io.load_whitelist()
             blacklist = config_io.load_blacklist()
+            # Load owner-approved senders the same way the live filter does, so
+            # this screen honors RULE 0 (owner-approved authenticated sender)
+            # exactly as run_filter would — otherwise Check-an-Email would junk
+            # mail the real filter passes.
+            import logging as _logging
+            approved = spam_filter.load_approved_senders(
+                _logging.getLogger("check_email"))
             cfg = config_io.load_config()
             anthro = cfg.get("anthropic", {}) or {}
             api_key = os.environ.get("ANTHROPIC_API_KEY", "") \
@@ -2093,7 +2100,8 @@ class CheckEmailTab(ttk.Frame):
                 raw_bytes, signals, api_key=api_key, model=model,
                 classify_mode=classify_mode, confirm_model=confirm_model,
                 threshold=threshold, account_name=None,
-                whitelist=whitelist, blacklist=blacklist)
+                whitelist=whitelist, blacklist=blacklist,
+                approved_domains=approved.get("_domains_set", set()))
             self.app.after(0, self._render_result, res, threshold)
         except Exception as e:  # noqa: BLE001
             self.app.after(0, self._render_error, f"{type(e).__name__}: {e}")

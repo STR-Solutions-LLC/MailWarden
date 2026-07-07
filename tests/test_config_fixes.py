@@ -98,7 +98,9 @@ def test_load_config_deep_merges_missing_keys(patched_config_path):
     minimal = {"accounts": [], "anthropic": {"api_key": "sk-test"}}
     patched_config_path.write_text(json.dumps(minimal))
     result = load_config()
-    assert "signal_learner" in result
+    # signal_learner was removed from DEFAULT_CONFIG as a dead key, so it is no
+    # longer back-filled onto minimal configs (nothing reads it).
+    assert "signal_learner" not in result
     assert "eula" in result
     assert "ui" in result
     assert result["filter"]["dry_run"] is True
