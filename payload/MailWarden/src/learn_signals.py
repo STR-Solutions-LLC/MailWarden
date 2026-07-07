@@ -331,6 +331,41 @@ def _get_plain_body(msg: email.message.Message) -> str:
     return ""
 
 
+def _get_html_body(msg: email.message.Message) -> str:
+    """First text/html part, decoded. Mirrors _get_plain_body's walk."""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/html":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    return payload.decode(charset, errors="replace")
+    else:
+        if msg.get_content_type() == "text/html":
+            payload = msg.get_payload(decode=True)
+            if payload:
+                charset = msg.get_content_charset() or "utf-8"
+                return payload.decode(charset, errors="replace")
+    return ""
+
+
+def _get_body_text(msg: email.message.Message) -> str:
+    """Body text the way the CLASSIFIER sees it (build_user_message precedence):
+    prefer the HTML part's visible text, falling back to the plain part only
+    when there is no HTML or it yields no visible text. The learner previously
+    read text/plain ONLY, so a spammer's empty/decoy plain part starved it of
+    the words the AI actually judged — it then learned nothing (or the decoy).
+    Whitespace-only HTML output is treated as empty, exactly like the classifier.
+    """
+    from utils import html_to_text
+    html = _get_html_body(msg)
+    if html:
+        visible = html_to_text(html)
+        if visible.strip():
+            return visible
+    return _get_plain_body(msg)
+
+
 def parse_eml(filepath: Path) -> dict:
     with open(filepath, "rb") as f:
         msg = email.message_from_binary_file(f, policy=email.policy.compat32)
@@ -339,7 +374,7 @@ def parse_eml(filepath: Path) -> dict:
         "from": _decode(msg.get("From", "")),
         "subject": _decode(msg.get("Subject", "")),
         "received_headers": [str(h) for h in (msg.get_all("Received") or [])][:3],
-        "plain_text_body": _get_plain_body(msg)[:1000],
+        "plain_text_body": _get_body_text(msg)[:1000],
         "forwarder": _decode(msg.get("X-MailWarden-Forwarder", "") or ""),
         "user_explanation": _decode(msg.get("X-MailWarden-User-Explanation", "") or "").strip(),
     }
@@ -970,7 +1005,7 @@ def propose_from_teaching(eml_bytes: bytes, *, direction: str,
         "from": str(msg.get("From", "") or ""),
         "subject": _decode(msg.get("Subject", "") or ""),
         "received_headers": [str(h) for h in (msg.get_all("Received", []) or [])[:3]],
-        "plain_text_body": _get_plain_body(msg),
+        "plain_text_body": _get_body_text(msg),
         "user_explanation": (user_explanation or "").strip(),
     }
 

@@ -35,7 +35,7 @@ from utils import (
     summarize_authentication, host_spam_verdict,
     random_token, select_trusted_auth_results,
     clear_dnsbl_cache, verify_dkim_locally,
-    make_tls_context,
+    make_tls_context, html_to_text,
 )
 from learn_signals import save_signals, is_shared_mail_domain
 
@@ -934,16 +934,29 @@ def check_blacklist(from_header: str, blacklist: dict, account_name=None) -> tup
                 account_name):
             return ("address", addr)
 
-    # Check domain match (added with Direct Blacklist support)
+    # Check domain match — exact, OR a subdomain of a blocked domain, symmetric
+    # with the whitelist's F4 suffix match. Blocking "retailer.com" also blocks
+    # "em.retailer.com"; the leading "." prevents look-alikes
+    # ("evilretailer.com") and right-anchored tricks ("retailer.com.evil.com")
+    # from matching. Per-entry scope is honored identically to the exact case
+    # (the matched parent entry's scope decides). A subdomain that is itself a
+    # separately-listed entry hits the exact branch first.
     if addr:
         domain = extract_domain(addr)
         if domain:
             domain_normalized = domain.lower().lstrip("@")
-            if domain_normalized in blacklist.get("_domains_set", set()) and \
+            bl_domains = blacklist.get("_domains_set", set())
+            if domain_normalized in bl_domains and \
                     _blacklist_entry_in_scope(
                         blacklist.get("_domains_scope", {}).get(domain_normalized),
                         account_name):
                 return ("domain", domain)
+            for bl in bl_domains:
+                if bl and domain_normalized.endswith("." + bl) and \
+                        _blacklist_entry_in_scope(
+                            blacklist.get("_domains_scope", {}).get(bl),
+                            account_name):
+                    return ("domain", domain)
 
     # Check display name match (case-insensitive)
     if display_name:
@@ -1296,7 +1309,12 @@ def _apply_parsed_list_entries(store: dict, parsed: dict) -> dict:
     # as many times as it appears — preserved here intentionally.
     existing_addrs = {v for v in (_whitelist_addr_value(a)
                                   for a in store.get("addresses", [])) if v}
-    existing_domains = {d.lower() for d in store.get("domains", [])}
+    # This helper is shared with the Direct BLACKLIST handler, whose domain
+    # entries can be scoped {"value","scope"} dicts (a02d7ea) — a raw d.lower()
+    # crashes on them. Extract tolerantly and @-strip so dedup matches the
+    # domain normalizers (load_whitelist / _normalize_block_entries strip_at).
+    existing_domains = {v.lstrip("@") for v in (_whitelist_addr_value(d)
+                                                for d in store.get("domains", [])) if v}
     summary = {"added_addrs": [], "added_domains": [],
                "already_addrs": [], "already_domains": []}
 
@@ -5269,155 +5287,6 @@ def get_html_body(msg: email.message.Message) -> str:
     return ""
 
 
-# --- html_to_text hardening (availability) ----------------------------------
-# These replace the previous inline regexes, which were quadratic on
-# adversarial input (a run of unmatched '<' made the old tag-strip r'<[^>]+>'
-# rescan to end-of-input from every '<'; the ambiguous r'\s*/?\s*' in the old
-# br pattern backtracked O(m^2) over an unclosed whitespace run; the old
-# script/style pattern's lazy '.*?' rescanned to end-of-input for every
-# unclosed opener). Since the HTML body is attacker-controlled and
-# html_to_text now runs on the hot path of every classification, conversion
-# must be linear-time. Every replacement below is EXACTLY semantics-
-# preserving (verified byte-identical old-vs-new over the full 119-email
-# corpus + all fixtures):
-#   - Greedy quantifiers (\s*) whose neighbours are disjoint keep matching
-#     linear WITHOUT possessive syntax. Each \s* is followed by a NON-
-#     whitespace literal ('b'/'/'/'>'/'(') and no \s* is nested inside another
-#     quantifier, so on a non-match the engine gives back whitespace one char
-#     at a time against a literal that can never be whitespace — O(n), never
-#     O(n^2). (Possessive quantifiers '\s*+' would encode that intent, but the
-#     shipped engine runs under the bundled universal2 /usr/bin/python3 =
-#     CPython 3.9.6, whose 're' raises "multiple repeat" on possessive/atomic
-#     syntax at import — a launch crash. Possessive quantifiers and atomic
-#     groups '(?>...)' are therefore FORBIDDEN in shipped code; the guard in
-#     tests/test_py39_annotation_safety.py enforces it.)
-#   - The generic tag-strip and the script/style block-strip become manual
-#     str.find scans (below) that replicate the old patterns' semantics
-#     exactly — including '<' characters INSIDE a tag span (real mail does
-#     this: MSO conditional comments like '<!--[if !mso]><!-->'), which is
-#     why a narrowed [^<>] character class was NOT usable.
-#   - The br pattern is '<\s*br\s*(?:/\s*)?>', NOT '<\s*br\s*/?\s*>'. The
-#     linearity above requires every \s* to be followed by a MANDATORY
-#     non-whitespace token. The naive '\s*/?\s*' violates that: two \s* runs
-#     separated only by an OPTIONAL '/', so one whitespace run splits O(m) ways
-#     between them and a non-match (a long unterminated '<br…') backtracks
-#     O(m^2) — measured minutes at the 500KB cap, reachable via
-#     parse_forwarded_email. Folding the '/' into '(?:/\s*)?' makes the '/'
-#     mandatory-to-enter the optional group, so the preceding \s* again sees a
-#     non-whitespace neighbour ('/' or '>'). Match set is identical (exhaustive
-#     cross-product proof) and it stays linear. Do NOT "simplify" it back.
-_HTML_BR_RE = re.compile(r'<\s*br\s*(?:/\s*)?>', re.IGNORECASE)
-_HTML_BLOCK_CLOSE_RE = re.compile(
-    r'<\s*/\s*(p|div|tr|li|h[1-6]|blockquote)\s*>', re.IGNORECASE)
-_SCRIPT_STYLE_OPEN_HEAD_RE = re.compile(r'<\s*(script|style)', re.IGNORECASE)
-_SCRIPT_STYLE_CLOSE_RES = {
-    "script": re.compile(r'<\s*/\s*script\s*>', re.IGNORECASE),
-    "style":  re.compile(r'<\s*/\s*style\s*>', re.IGNORECASE),
-}
-
-
-def _strip_tags(text: str) -> str:
-    """Remove every '<'...'>' span with a non-empty interior — the exact
-    semantics of the old r'<[^>]+>' sub (greedy [^>]+ always runs to the
-    first following '>', and may span interior '<' characters), but linear:
-    each str.find consumes the region it scanned, so an adversarial run of
-    unmatched '<' costs O(n) instead of the old O(n^2) rescans."""
-    out = []
-    pos = 0
-    while True:
-        i = text.find('<', pos)
-        if i == -1:
-            out.append(text[pos:])
-            return "".join(out)
-        j = text.find('>', i + 1)
-        if j == -1:
-            # No '>' anywhere ahead: nothing later can match either.
-            out.append(text[pos:])
-            return "".join(out)
-        if j == i + 1:
-            # '<>' — empty interior never matched [^>]+; keep the '<' and
-            # continue scanning after it.
-            out.append(text[pos:i + 1])
-            pos = i + 1
-            continue
-        out.append(text[pos:i])
-        pos = j + 1
-
-
-def _strip_script_style_blocks(text: str) -> str:
-    """Remove <script>...</script> and <style>...</style> blocks wholesale.
-
-    Replaces the old single regex (r'<\\s*(script|style)[^>]*>.*?<\\s*/\\s*\\1\\s*>',
-    DOTALL) with an equivalent linear scan. Old semantics, replicated
-    exactly: the opening tag runs to the first '>' after the tag word
-    ([^>]* may span interior '<'); the earliest same-type closer ends the
-    block; an opener with no same-type closer ahead is left in place (the
-    generic tag-strip then removes the tag itself). Linear because: a
-    successful closer search consumes the span it scanned; a failed closer
-    search is remembered per tag type (no closer after position p means none
-    after any later position); and the first-'>' lookup is cached so
-    repeated unclosed openers never rescan the same region.
-    """
-    out = []
-    pos = 0
-    no_closer = {"script": False, "style": False}
-    gt = -1  # cached result: text.find('>', x) for the last x searched
-    while True:
-        m = _SCRIPT_STYLE_OPEN_HEAD_RE.search(text, pos)
-        if m is None:
-            out.append(text[pos:])
-            return "".join(out)
-        # The opening tag needs a '>' at/after the tag word ([^>]* in the old
-        # pattern). Successive heads start strictly later, so the cached '>'
-        # position stays valid until we pass it.
-        if gt < m.end():
-            gt = text.find('>', m.end())
-            if gt == -1:
-                # No '>' anywhere ahead: no opener (or closer) can complete.
-                out.append(text[pos:])
-                return "".join(out)
-        tag = m.group(1).lower()
-        c = (None if no_closer[tag]
-             else _SCRIPT_STYLE_CLOSE_RES[tag].search(text, gt + 1))
-        if c is None:
-            no_closer[tag] = True
-            # Unclosed block: keep the opener (old behavior) and resume the
-            # scan just past its '<'.
-            out.append(text[pos:m.start() + 1])
-            pos = m.start() + 1
-            continue
-        out.append(text[pos:m.start()])
-        pos = c.end()
-
-
-def html_to_text(html: str) -> str:
-    """Best-effort HTML-to-text for forwarded-email parsing. Converts block
-    tags to newlines, strips remaining tags, decodes entities. Good enough
-    for finding 'From:'/'Subject:' lines in an HTML-only forward; not a
-    faithful renderer.
-
-    Hardened to linear time on adversarial input (see the pattern constants
-    above): the HTML part is attacker-controlled and this now runs on the
-    classification hot path, so quadratic blowup was a DoS surface.
-    """
-    if not html:
-        return ""
-    import html as _html_module
-    # Block-level tags become line breaks so quoted headers stay on their
-    # own lines after tag-stripping.
-    text = _HTML_BR_RE.sub('\n', html)
-    text = _HTML_BLOCK_CLOSE_RE.sub('\n', text)
-    # Strip style/script blocks wholesale so we don't parse their contents.
-    text = _strip_script_style_blocks(text)
-    # Remove remaining tags.
-    text = _strip_tags(text)
-    try:
-        text = _html_module.unescape(text)
-    except Exception:
-        pass
-    return text.strip()
-
-
 def extract_email_data(raw_email: bytes, own_hosts=None) -> dict:
     """Parse raw email bytes into a structured dict for classification."""
     msg = email.message_from_bytes(raw_email, policy=email.policy.compat32)
@@ -5447,7 +5316,6 @@ def extract_email_data(raw_email: bytes, own_hosts=None) -> dict:
     x_spam_score = str(msg.get("X-Spam-Score", "") or "")
     x_spam_flag = str(msg.get("X-Spam-Flag", "") or "")
     x_spam_status = str(msg.get("X-Spam-Status", "") or "")
-    list_unsub = str(msg.get("List-Unsubscribe", "") or "")
 
     plain_body = get_plain_text_body(msg)
     html_body = get_html_body(msg)
@@ -5467,7 +5335,6 @@ def extract_email_data(raw_email: bytes, own_hosts=None) -> dict:
         "x_spam_score": x_spam_score,
         "x_spam_flag": x_spam_flag,
         "x_spam_status": x_spam_status,
-        "list_unsubscribe": list_unsub,
         "plain_text_body": plain_body,
         "html_body": html_body,
         # Retain parsed Message object so parse_forwarded_email can walk MIME
@@ -6195,7 +6062,6 @@ def classify_eml_offline(raw_email: bytes, signals: dict, *,
         "X-Spam-Status": msg_data.get("x_spam_status", ""),
         "Reply-To": msg_data.get("reply_to", ""),
         "From": msg_data.get("from_header_raw", ""),
-        "List-Unsubscribe": msg_data.get("list_unsubscribe", ""),
         "Message-ID": msg_data.get("message_id", ""),
         "Subject": msg_data.get("subject", ""),
     }
@@ -6477,6 +6343,57 @@ def submit_spam_example(fwd_data: dict, config: dict, account: dict,
         return False
 
 
+def _expunge_one(conn, uid, logger: logging.Logger) -> None:
+    """Expunge exactly one already-\\Deleted message WITHOUT purging \\Deleted
+    mail that OTHER clients flagged.
+
+    UIDPLUS (RFC 4315) lets us purge precisely this UID (UID EXPUNGE), touching
+    nothing else — so when the server advertises it we use it and return. A bare
+    EXPUNGE, by contrast, purges EVERY \\Deleted message in the mailbox,
+    including mail another IMAP client (phone, desktop) flagged for deletion but
+    has not yet expunged — silent data loss. So without UIDPLUS we NEVER
+    blind-expunge: we SEARCH DELETED and fall back to a bare EXPUNGE only when
+    the sole \\Deleted message is our own uid. Otherwise we leave the message
+    flagged (it was already copied/junked) and log a warning; a later tick on a
+    quiescent mailbox purges it safely."""
+    caps = getattr(conn, "capabilities", ()) or ()
+    if "UIDPLUS" in caps:
+        conn.uid("EXPUNGE", uid)
+        return
+    try:
+        typ, data = conn.uid("SEARCH", None, "DELETED")
+    except Exception as e:
+        logger.warning(
+            f"[EXPUNGE] DELETED search failed for UID {uid!r}; leaving it "
+            f"flagged for a later safe pass rather than blind-expunging: {e}")
+        return
+    if typ != "OK":
+        # imaplib returns a "NO"/"BAD" status WITHOUT raising. Treat it as no
+        # evidence — a bare EXPUNGE here would purge another client's \\Deleted
+        # mail on a transient failure. Leave the message flagged for a later
+        # safe pass.
+        logger.warning(
+            f"[EXPUNGE] DELETED search returned {typ!r} for UID {uid!r}; "
+            f"leaving it flagged for a later safe pass rather than blind-"
+            f"expunging")
+        return
+    deleted = set()
+    for chunk in (data or []):
+        if not chunk:
+            continue
+        raw = (chunk.decode() if isinstance(chunk, (bytes, bytearray))
+               else str(chunk))
+        deleted.update(raw.split())
+    our = uid.decode() if isinstance(uid, (bytes, bytearray)) else str(uid)
+    if not deleted or deleted <= {our}:
+        conn.expunge()
+    else:
+        logger.warning(
+            f"[EXPUNGE] Server lacks UIDPLUS and {len(deleted)} \\Deleted "
+            f"message(s) from other clients are present; leaving UID {uid!r} "
+            f"flagged rather than purging another client's mail")
+
+
 def scan_train_folder(conn: imaplib.IMAP4_SSL, account: dict, config: dict,
                        logger: logging.Logger) -> int:
     """Scan the account's Train MailWarden folder for dropped spam examples.
@@ -6561,11 +6478,7 @@ def scan_train_folder(conn: imaplib.IMAP4_SSL, account: dict, config: dict,
                 # Message-ID dedup prevents a duplicate .eml save.
                 try:
                     conn.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
-                    try:
-                        conn.uid("EXPUNGE", uid)
-                    except Exception:
-                        logger.warning(f"[TRAIN] UID EXPUNGE not supported for UID {uid}, falling back")
-                        conn.expunge()
+                    _expunge_one(conn, uid, logger)
                     logger.info(
                         f"  [TRAIN] Deleted {subject!r} from Train folder "
                         f"after learner trigger")
@@ -6687,11 +6600,18 @@ def move_to_junk(conn: imaplib.IMAP4_SSL, uid: bytes, junk_folder: str,
         logger.error(f"[JUNK] STORE \\Deleted failed for UID {uid} after COPY to {junk_folder}")
         return False
     # Use UID EXPUNGE if available (UIDPLUS extension) to avoid
-    # expunging other messages flagged as deleted by other clients
+    # expunging other messages flagged as deleted by other clients. Guard the
+    # call so a raised UID EXPUNGE can't abort the account scan: the message is
+    # already COPYed + \\Deleted-flagged, so on error we just log and leave it
+    # flagged (a later safe pass purges it) — we never fall back to a bare
+    # EXPUNGE. The Train / delete call sites already run inside their own
+    # try/except, so this restores parity with the pre-C5a resilience.
     try:
-        conn.uid("EXPUNGE", uid)
-    except Exception:
-        conn.expunge()
+        _expunge_one(conn, uid, logger)
+    except Exception as e:
+        logger.warning(
+            f"[JUNK] EXPUNGE failed for UID {uid} after COPY to {junk_folder}; "
+            f"message left flagged \\Deleted for a later safe pass: {e}")
     return True
 
 
@@ -6745,11 +6665,7 @@ def execute_spam_action(conn: imaplib.IMAP4_SSL, uid: bytes, account: dict,
     if spam_action == "delete":
         try:
             conn.uid("STORE", uid, "+FLAGS", "\\Deleted")
-            try:
-                conn.uid("EXPUNGE", uid)
-            except Exception:
-                logger.warning(f"[DELETE] UID EXPUNGE not supported for UID {uid}, falling back")
-                conn.expunge()
+            _expunge_one(conn, uid, logger)
             return "[DELETED] (spam_action=delete)"
         except Exception as e:
             logger.error(f"  [DELETE] EXPUNGE failed: {e}")
@@ -7083,7 +6999,12 @@ def run_filter(force: bool = False):
         logger.info("*** DRY RUN MODE — no emails will be moved ***")
 
     threshold = config.get("filter", {}).get("confidence_threshold", 0.85)
-    max_per_run = config.get("filter", {}).get("max_emails_per_run", 50)
+    max_per_run = config.get("filter", {}).get("max_emails_per_run", 100)
+    # Product decision (C5b): cap successful junk ACTIONS per run so a
+    # misfiring rule or a flood can never junk an unbounded number of messages
+    # before the owner notices. Applies every run; remaining messages are left
+    # UNSEEN and UNCLASSIFIED (no API spend) once the cap is hit.
+    max_junk_actions = config.get("filter", {}).get("max_junk_actions_per_run", 25)
 
     # Deliver EULA to accounts that haven't received current version.
     # Fires in both live and Dry Run modes (legal requirement).
@@ -7187,6 +7108,8 @@ def run_filter(force: bool = False):
     total_spam = 0
     total_errors = 0
     accounts_checked = 0
+    # C5b: successful, non-dry-run junk actions taken so far this run.
+    junk_actions_this_run = 0
 
     for account in config.get("accounts", []):
         if not account.get("enabled", True):
@@ -7284,6 +7207,16 @@ def run_filter(force: bool = False):
                 for uid in uids:
                     if total_evaluated >= max_per_run:
                         logger.info(f"  Reached max_emails_per_run ({max_per_run}), stopping")
+                        break
+                    # C5b: stop before classifying any further message once the
+                    # per-run junk-action cap is hit. The break is at the loop
+                    # top, before any fetch/classify, so remaining messages stay
+                    # UNSEEN and UNCLASSIFIED with no API spend.
+                    if junk_actions_this_run >= max_junk_actions:
+                        logger.info(
+                            f"  Reached max_junk_actions_per_run "
+                            f"({max_junk_actions}); stopping — remaining "
+                            f"messages left unseen for the next run")
                         break
 
                     # Finding #20: fetch ONLY the Message-ID header first and,
@@ -7499,14 +7432,21 @@ def run_filter(force: bool = False):
 
                             if orig_addr:
                                 addrs = bl_data.get("addresses", [])
-                                new_addrs = [a for a in addrs if a.lower() != orig_addr.lower()]
+                                # _whitelist_addr_value is the generic entry
+                                # value extractor (plain string OR {"value",...}
+                                # dict since a02d7ea) — a raw a.lower() crashes
+                                # on a scoped dict entry. Keep the ORIGINAL entry
+                                # ``a`` in the kept list; never flatten on write.
+                                new_addrs = [a for a in addrs
+                                             if _whitelist_addr_value(a) != orig_addr.lower()]
                                 if len(new_addrs) != len(addrs):
                                     bl_data["addresses"] = new_addrs
                                     addr_removed = True
 
                             if orig_name:
                                 names = bl_data.get("display_names", [])
-                                new_names = [n for n in names if n.strip().lower() != orig_name.strip().lower()]
+                                new_names = [n for n in names
+                                             if _whitelist_addr_value(n) != orig_name.strip().lower()]
                                 if len(new_names) != len(names):
                                     bl_data["display_names"] = new_names
                                     name_removed = True
@@ -7941,10 +7881,43 @@ Conversation ID: {sfid}
                             with file_lock.locked(WHITELIST_PATH):
                                 wl_data = load_whitelist(logger)
                                 existing = wl_data.get("_addresses_set", set())
-                                if orig_addr in existing:
-                                    msg_out = f"The address {orig_addr} is already on the whitelist. No changes made."
-                                else:
+                                approve = wl_data.get("_addresses_approve_set", set())
+                                changed = False
+                                if orig_addr not in existing:
                                     wl_data.setdefault("addresses", []).append(orig_addr)
+                                    changed = True
+                                    msg_out = (
+                                        f"Added to whitelist: {orig_addr}\n\n"
+                                        f"Future emails from this address will bypass the spam classifier "
+                                        f"entirely and land in your inbox."
+                                    )
+                                    logger.info(f"  [WHITELIST] Added address: {orig_addr}")
+                                elif orig_addr in approve:
+                                    # N2: already trusted, but only as an
+                                    # APPROVE-sourced object (a shared-provider
+                                    # rescue that yields to an owner curate rule).
+                                    # A hand-typed Whitelist command is a stronger,
+                                    # deliberate trust, so upgrade it to a plain
+                                    # string (absolute trump). This is the ONE
+                                    # authorized write-flatten of an approve dict.
+                                    wl_data["addresses"] = [
+                                        orig_addr if (_whitelist_addr_is_approve(a)
+                                                      and _whitelist_addr_value(a) == orig_addr)
+                                        else a
+                                        for a in wl_data.get("addresses", [])]
+                                    changed = True
+                                    msg_out = (
+                                        f"Upgraded to full whitelist: {orig_addr}\n\n"
+                                        f"This sender was previously trusted from an Approve reply. "
+                                        f"Your explicit whitelist now takes precedence, so their mail "
+                                        f"will always land in your inbox."
+                                    )
+                                    logger.info(
+                                        f"  [WHITELIST] Upgraded APPROVE entry to full "
+                                        f"whitelist: {orig_addr}")
+                                else:
+                                    msg_out = f"The address {orig_addr} is already on the whitelist. No changes made."
+                                if changed:
                                     # strip in-memory set before saving
                                     to_save = {k: v for k, v in wl_data.items() if not k.startswith("_")}
                                     to_save["last_updated"] = datetime.now().isoformat()
@@ -7959,12 +7932,6 @@ Conversation ID: {sfid}
                                         raise
                                     # Refresh in-memory view for this run
                                     whitelist = load_whitelist(logger)
-                                    msg_out = (
-                                        f"Added to whitelist: {orig_addr}\n\n"
-                                        f"Future emails from this address will bypass the spam classifier "
-                                        f"entirely and land in your inbox."
-                                    )
-                                    logger.info(f"  [WHITELIST] Added address: {orig_addr}")
                             send_email(config, f"Whitelist Confirmed — {orig_addr}",
                                        msg_out + _wl_conflict_note, logger,
                                        to_addr=account.get("username", ""))
@@ -8171,7 +8138,11 @@ Conversation ID: {sfid}
                             skipped_name = None
                             if orig_addr:
                                 orig_addr = orig_addr.lower()
-                                existing_addrs = {a.lower() for a in bl_data.get("addresses", [])}
+                                # _whitelist_addr_value tolerates dict entries
+                                # (a02d7ea scoped block objects); raw a.lower()
+                                # crashes on them. Filter falsy (malformed).
+                                existing_addrs = {v for v in (_whitelist_addr_value(a)
+                                                              for a in bl_data.get("addresses", [])) if v}
                                 if orig_addr not in existing_addrs:
                                     bl_data.setdefault("addresses", []).append(orig_addr)
                                     addr_added = True
@@ -8179,7 +8150,8 @@ Conversation ID: {sfid}
                                 if orig_name.strip().lower() in skip_names_set:
                                     skipped_name = orig_name
                                 else:
-                                    existing_names = {n.strip().lower() for n in bl_data.get("display_names", [])}
+                                    existing_names = {v for v in (_whitelist_addr_value(n)
+                                                                  for n in bl_data.get("display_names", [])) if v}
                                     if orig_name.strip().lower() not in existing_names:
                                         bl_data.setdefault("display_names", []).append(orig_name)
                                         name_added = True
@@ -8293,7 +8265,9 @@ Conversation ID: {sfid}
                             # concurrent command can't lose this addition (G3/R5).
                             with file_lock.locked(BLACKLIST_PATH):
                                 bl_data = load_blacklist(logger)
-                                existing = {a.lower() for a in bl_data.get("addresses", [])}
+                                # Dict-tolerant read (a02d7ea scoped entries).
+                                existing = {v for v in (_whitelist_addr_value(a)
+                                                        for a in bl_data.get("addresses", [])) if v}
                                 if orig_addr in existing:
                                     msg_out = f"The address {orig_addr} is already on the blacklist. No changes made."
                                 else:
@@ -8415,7 +8389,9 @@ Conversation ID: {sfid}
                             # concurrent command can't lose this addition (G3/R5).
                             with file_lock.locked(BLACKLIST_PATH):
                                 bl_data = load_blacklist(logger)
-                                existing = {n.strip().lower() for n in bl_data.get("display_names", [])}
+                                # Dict-tolerant read (a02d7ea scoped entries).
+                                existing = {v for v in (_whitelist_addr_value(n)
+                                                        for n in bl_data.get("display_names", [])) if v}
                                 if orig_name.strip().lower() in existing:
                                     msg_out = f"The display name \"{orig_name}\" is already on the blacklist. No changes made."
                                 else:
@@ -9113,9 +9089,14 @@ USER'S FOLLOW-UP:
 
                     # --- Detection branch 2b: APPROVE reply to a daily report ---
                     # Owner replies "APPROVE <n>" to a daily report whose
-                    # subject carries [MWR-<token>]; each valid number's sender
-                    # domain is added to approved_senders.json. Mirrors the
-                    # SFID branch structure above.
+                    # subject carries [MWR-<token>]. Each valid number is routed
+                    # by what actually junked it (audit 2026-07-06 C4): a sender
+                    # at a SHARED provider trusts just the exact ADDRESS
+                    # (whitelist); a pre-classifier block trusts the DOMAIN
+                    # (whitelist); a subject-keyword block is an honest no-op;
+                    # everything else approves the sender DOMAIN in
+                    # approved_senders.json. Mirrors the SFID branch structure
+                    # above.
                     mwr_match = re.search(r'\[MWR-([A-Za-z0-9-]+)\]',
                                           msg_data.get("subject", ""))
 
@@ -9586,6 +9567,8 @@ USER'S FOLLOW-UP:
                             action = execute_spam_action(conn, uid, account, logger)
                             if "FAILED" in action or "DELETE FAILED" in action:
                                 total_errors += 1
+                            else:
+                                junk_actions_this_run += 1
                         log_decision(account_name, msg_data, bl_result, action)
                         # Finding 1: only mark processed if the move actually
                         # succeeded (dry-run action carries no "FAILED"). A
@@ -9630,6 +9613,7 @@ USER'S FOLLOW-UP:
                             if "FAILED" in action or "DELETE FAILED" in action:
                                 total_errors += 1
                             else:
+                                junk_actions_this_run += 1
                                 action = action + " (subject-keyword)"
                         log_decision(account_name, msg_data, kw_result, action)
                         record_pre_classifier_skip(token_usage, delta=token_delta)
@@ -9695,7 +9679,6 @@ USER'S FOLLOW-UP:
                             "X-Spam-Status": msg_data.get("x_spam_status", ""),
                             "Reply-To": msg_data.get("reply_to", ""),
                             "From": msg_data.get("from_header_raw", ""),
-                            "List-Unsubscribe": msg_data.get("list_unsubscribe", ""),
                             "Message-ID": msg_data.get("message_id", ""),
                             "Subject": msg_data.get("subject", ""),
                         }
@@ -9725,6 +9708,8 @@ USER'S FOLLOW-UP:
                             action = execute_spam_action(conn, uid, account, logger)
                             if "FAILED" in action or "DELETE FAILED" in action:
                                 total_errors += 1
+                            else:
+                                junk_actions_this_run += 1
                             # Append pre-classifier tag to action for log clarity
                             action = action + " (pre-classifier)"
                         log_decision(account_name, msg_data, pre_decision, action)
@@ -9862,6 +9847,7 @@ USER'S FOLLOW-UP:
                                 total_errors += 1
                                 spam_move_failed = True
                             else:
+                                junk_actions_this_run += 1
                                 logger.info(
                                     f"  SPAM (confidence: {confidence:.2f}) "
                                     f"— {action}"

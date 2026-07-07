@@ -3895,7 +3895,9 @@ def test_m1_store_failure_returns_false():
 
 
 def test_m2_train_uses_uid_expunge(monkeypatch):
-    """M2 site 1: train-folder scan must use UID EXPUNGE, not bare expunge."""
+    """M2 site 1 (+C5a): a UIDPLUS server's train-folder scan must use UID
+    EXPUNGE, not bare expunge. UID EXPUNGE is now gated on the server
+    advertising UIDPLUS (C5a), so the fake advertises it."""
     import logging
     import spam_filter
 
@@ -3903,6 +3905,7 @@ def test_m2_train_uses_uid_expunge(monkeypatch):
     calls = []
 
     class MockConn:
+        capabilities = ("IMAP4REV1", "UIDPLUS")
         def select(self, mbox):
             return ("OK", [b"1"])
         def uid(self, cmd, *args, **kwargs):
@@ -3931,7 +3934,9 @@ def test_m2_train_uses_uid_expunge(monkeypatch):
 
 
 def test_m2_delete_uses_uid_expunge():
-    """M2 site 2: execute_spam_action delete path must use UID EXPUNGE."""
+    """M2 site 2 (+C5a): a UIDPLUS server's execute_spam_action delete path must
+    use UID EXPUNGE. UID EXPUNGE is now gated on the server advertising UIDPLUS
+    (C5a), so the fake advertises it."""
     import logging
     from spam_filter import execute_spam_action
 
@@ -3939,6 +3944,7 @@ def test_m2_delete_uses_uid_expunge():
     calls = []
 
     class MockConn:
+        capabilities = ("IMAP4REV1", "UIDPLUS")
         def uid(self, cmd, *args, **kwargs):
             calls.append((cmd,) + args)
             return ("OK", None)

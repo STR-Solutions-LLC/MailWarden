@@ -1123,3 +1123,152 @@ def process_blacklist_entry(eml_bytes: bytes, subfolder_type: str,
         result["warning"] = f"Unknown subfolder_type: {subfolder_type}"
 
     return result
+
+
+# --- html_to_text hardening (availability) ----------------------------------
+# These replace the previous inline regexes, which were quadratic on
+# adversarial input (a run of unmatched '<' made the old tag-strip r'<[^>]+>'
+# rescan to end-of-input from every '<'; the ambiguous r'\s*/?\s*' in the old
+# br pattern backtracked O(m^2) over an unclosed whitespace run; the old
+# script/style pattern's lazy '.*?' rescanned to end-of-input for every
+# unclosed opener). Since the HTML body is attacker-controlled and
+# html_to_text now runs on the hot path of every classification, conversion
+# must be linear-time. Every replacement below is EXACTLY semantics-
+# preserving (verified byte-identical old-vs-new over the full 119-email
+# corpus + all fixtures):
+#   - Greedy quantifiers (\s*) whose neighbours are disjoint keep matching
+#     linear WITHOUT possessive syntax. Each \s* is followed by a NON-
+#     whitespace literal ('b'/'/'/'>'/'(') and no \s* is nested inside another
+#     quantifier, so on a non-match the engine gives back whitespace one char
+#     at a time against a literal that can never be whitespace — O(n), never
+#     O(n^2). (Possessive quantifiers '\s*+' would encode that intent, but the
+#     shipped engine runs under the bundled universal2 /usr/bin/python3 =
+#     CPython 3.9.6, whose 're' raises "multiple repeat" on possessive/atomic
+#     syntax at import — a launch crash. Possessive quantifiers and atomic
+#     groups '(?>...)' are therefore FORBIDDEN in shipped code; the guard in
+#     tests/test_py39_annotation_safety.py enforces it.)
+#   - The generic tag-strip and the script/style block-strip become manual
+#     str.find scans (below) that replicate the old patterns' semantics
+#     exactly — including '<' characters INSIDE a tag span (real mail does
+#     this: MSO conditional comments like '<!--[if !mso]><!-->'), which is
+#     why a narrowed [^<>] character class was NOT usable.
+#   - The br pattern is '<\s*br\s*(?:/\s*)?>', NOT '<\s*br\s*/?\s*>'. The
+#     linearity above requires every \s* to be followed by a MANDATORY
+#     non-whitespace token. The naive '\s*/?\s*' violates that: two \s* runs
+#     separated only by an OPTIONAL '/', so one whitespace run splits O(m) ways
+#     between them and a non-match (a long unterminated '<br…') backtracks
+#     O(m^2) — measured minutes at the 500KB cap, reachable via
+#     parse_forwarded_email. Folding the '/' into '(?:/\s*)?' makes the '/'
+#     mandatory-to-enter the optional group, so the preceding \s* again sees a
+#     non-whitespace neighbour ('/' or '>'). Match set is identical (exhaustive
+#     cross-product proof) and it stays linear. Do NOT "simplify" it back.
+_HTML_BR_RE = re.compile(r'<\s*br\s*(?:/\s*)?>', re.IGNORECASE)
+_HTML_BLOCK_CLOSE_RE = re.compile(
+    r'<\s*/\s*(p|div|tr|li|h[1-6]|blockquote)\s*>', re.IGNORECASE)
+_SCRIPT_STYLE_OPEN_HEAD_RE = re.compile(r'<\s*(script|style)', re.IGNORECASE)
+_SCRIPT_STYLE_CLOSE_RES = {
+    "script": re.compile(r'<\s*/\s*script\s*>', re.IGNORECASE),
+    "style":  re.compile(r'<\s*/\s*style\s*>', re.IGNORECASE),
+}
+
+
+def _strip_tags(text: str) -> str:
+    """Remove every '<'...'>' span with a non-empty interior — the exact
+    semantics of the old r'<[^>]+>' sub (greedy [^>]+ always runs to the
+    first following '>', and may span interior '<' characters), but linear:
+    each str.find consumes the region it scanned, so an adversarial run of
+    unmatched '<' costs O(n) instead of the old O(n^2) rescans."""
+    out = []
+    pos = 0
+    while True:
+        i = text.find('<', pos)
+        if i == -1:
+            out.append(text[pos:])
+            return "".join(out)
+        j = text.find('>', i + 1)
+        if j == -1:
+            # No '>' anywhere ahead: nothing later can match either.
+            out.append(text[pos:])
+            return "".join(out)
+        if j == i + 1:
+            # '<>' — empty interior never matched [^>]+; keep the '<' and
+            # continue scanning after it.
+            out.append(text[pos:i + 1])
+            pos = i + 1
+            continue
+        out.append(text[pos:i])
+        pos = j + 1
+
+
+def _strip_script_style_blocks(text: str) -> str:
+    """Remove <script>...</script> and <style>...</style> blocks wholesale.
+
+    Replaces the old single regex (r'<\\s*(script|style)[^>]*>.*?<\\s*/\\s*\\1\\s*>',
+    DOTALL) with an equivalent linear scan. Old semantics, replicated
+    exactly: the opening tag runs to the first '>' after the tag word
+    ([^>]* may span interior '<'); the earliest same-type closer ends the
+    block; an opener with no same-type closer ahead is left in place (the
+    generic tag-strip then removes the tag itself). Linear because: a
+    successful closer search consumes the span it scanned; a failed closer
+    search is remembered per tag type (no closer after position p means none
+    after any later position); and the first-'>' lookup is cached so
+    repeated unclosed openers never rescan the same region.
+    """
+    out = []
+    pos = 0
+    no_closer = {"script": False, "style": False}
+    gt = -1  # cached result: text.find('>', x) for the last x searched
+    while True:
+        m = _SCRIPT_STYLE_OPEN_HEAD_RE.search(text, pos)
+        if m is None:
+            out.append(text[pos:])
+            return "".join(out)
+        # The opening tag needs a '>' at/after the tag word ([^>]* in the old
+        # pattern). Successive heads start strictly later, so the cached '>'
+        # position stays valid until we pass it.
+        if gt < m.end():
+            gt = text.find('>', m.end())
+            if gt == -1:
+                # No '>' anywhere ahead: no opener (or closer) can complete.
+                out.append(text[pos:])
+                return "".join(out)
+        tag = m.group(1).lower()
+        c = (None if no_closer[tag]
+             else _SCRIPT_STYLE_CLOSE_RES[tag].search(text, gt + 1))
+        if c is None:
+            no_closer[tag] = True
+            # Unclosed block: keep the opener (old behavior) and resume the
+            # scan just past its '<'.
+            out.append(text[pos:m.start() + 1])
+            pos = m.start() + 1
+            continue
+        out.append(text[pos:m.start()])
+        pos = c.end()
+
+
+def html_to_text(html: str) -> str:
+    """Best-effort HTML-to-text for forwarded-email parsing. Converts block
+    tags to newlines, strips remaining tags, decodes entities. Good enough
+    for finding 'From:'/'Subject:' lines in an HTML-only forward; not a
+    faithful renderer.
+
+    Hardened to linear time on adversarial input (see the pattern constants
+    above): the HTML part is attacker-controlled and this now runs on the
+    classification hot path, so quadratic blowup was a DoS surface.
+    """
+    if not html:
+        return ""
+    import html as _html_module
+    # Block-level tags become line breaks so quoted headers stay on their
+    # own lines after tag-stripping.
+    text = _HTML_BR_RE.sub('\n', html)
+    text = _HTML_BLOCK_CLOSE_RE.sub('\n', text)
+    # Strip style/script blocks wholesale so we don't parse their contents.
+    text = _strip_script_style_blocks(text)
+    # Remove remaining tags.
+    text = _strip_tags(text)
+    try:
+        text = _html_module.unescape(text)
+    except Exception:
+        pass
+    return text.strip()

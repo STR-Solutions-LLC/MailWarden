@@ -63,15 +63,6 @@ REFINEMENTS_LOG_PATH = PROJECT_ROOT / "memory" / "signal_refinements.log"
 LOG_PATH = PROJECT_ROOT / "logs" / "spam_filter.log"
 
 
-def get_whitelist_dir(config: dict) -> Path:
-    """Get the whitelist folder path from config, with fallback."""
-    wl_config = config.get("whitelist", {})
-    folder = wl_config.get("folder", "")
-    if folder:
-        return Path(folder)
-    return PROJECT_ROOT / "whitelist"
-
-
 def setup_logging() -> logging.Logger:
     logger = logging.getLogger("daily_report")
     if logger.handlers:
