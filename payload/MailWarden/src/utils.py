@@ -9,13 +9,19 @@ import email
 import email.header
 import email.policy
 import email.utils
+import hashlib
+import hmac
 import html
 import imaplib
 import ipaddress
+import json
+import os
 import re
 import secrets
 import smtplib
 import ssl
+import tempfile
+from pathlib import Path
 
 
 _dnsbl_cache: dict = {}
@@ -122,6 +128,136 @@ def ensure_rfc822_headers(msg, *, from_addr: str = "") -> None:
         msg["Message-ID"] = email.utils.make_msgid(domain=domain or None)
 
 
+# ---------------------------------------------------------------------------
+# HMAC-verified self-mail stamp (Wave-6).
+#
+# MailWarden delivers its own owner-facing mail (reports, FP analyses, acks,
+# EULA/welcome, learner notices) into the owner's inbox, which the engine then
+# scans every tick. The loop-top guard must recognise that mail as ours and
+# skip it. The bare ``X-MailWarden-System: 1`` header used to earn that skip on
+# its own — but a spammer who simply adds that header to real spam got a total
+# filter bypass (skipped, marked processed, left in the inbox forever).
+#
+# Fix: every self-mail also carries
+#   ``X-MailWarden-Auth: v1:HMAC_SHA256(secret, Message-ID)``
+# where ``secret`` is a per-install random value stored in config.json under the
+# top-level ``self_mail_secret`` key (NEVER a shipped default). Only our own
+# senders know the secret, so only our own mail can produce a verifying stamp.
+# The guard trusts the Auth header, not the System header.
+#
+# All logic is fail-OPEN: an unwritable config, a missing/malformed secret, or a
+# garbage header value never crashes a tick and never earns a skip on its own —
+# it just falls back to the header-independent body-marker guard
+# (spam_filter._is_own_outgoing_mail), which still protects genuinely-ours mail.
+#
+# GUI twin: app/mailwarden_app/config_io.py carries a byte-identical copy of
+# get_or_create_self_mail_secret / compute_self_mail_auth / stamp_self_mail_auth
+# (the two package trees never import each other; they share only config.json).
+# If you edit one copy, edit the other. A drift-guard test asserts identical
+# HMAC output for the same (secret, message_id).
+# ---------------------------------------------------------------------------
+
+_SELF_MAIL_SECRET_KEY = "self_mail_secret"
+
+
+def _self_mail_config_path() -> Path:
+    """config.json location — identical to spam_filter.CONFIG_PATH
+    (PROJECT_ROOT/config/config.json). utils.py lives in PROJECT_ROOT/src, so
+    parent.parent is PROJECT_ROOT."""
+    return Path(__file__).resolve().parent.parent / "config" / "config.json"
+
+
+def get_or_create_self_mail_secret(config_path=None) -> "str | None":
+    """Return this install's shared self-mail HMAC secret, generating and
+    persisting it on first use. Per-install (never a shipped default); stored as
+    the top-level ``self_mail_secret`` key in config.json.
+
+    The whole read-modify-write runs under the config file lock so a concurrent
+    engine+GUI generation cannot interleave and mint two different secrets.
+    Returns None (never raises) if config.json is missing or unwritable — the
+    caller then stamps/verifies WITHOUT the HMAC header and the legacy
+    body-marker guard still protects self-mail. Fail-open by construction."""
+    path = Path(config_path) if config_path else _self_mail_config_path()
+    try:
+        # Existence pre-check BEFORE taking the lock: file_lock.locked() mkdirs
+        # the sidecar's parent, so locking a not-yet-existing config path would
+        # create an empty config/ directory. A real install always has
+        # config.json (setup wrote it) before any self-mail is sent, so a missing
+        # file means "no install" -> None (no HMAC). Mirrors the GUI twin.
+        if not path.exists():
+            return None
+        import file_lock
+        with file_lock.locked(path):
+            if not path.exists():
+                return None
+            with open(path, "r") as f:
+                cfg = json.load(f)
+            secret = cfg.get(_SELF_MAIL_SECRET_KEY)
+            if isinstance(secret, str) and secret.strip():
+                return secret.strip()
+            secret = secrets.token_hex(32)
+            cfg[_SELF_MAIL_SECRET_KEY] = secret
+            # Atomic write (mirrors spam_filter.save_config_atomic; duplicated
+            # here so utils stays self-contained and never calls back into the
+            # engine module that imports it).
+            fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(cfg, f, indent=2)
+                os.replace(tmp, str(path))
+            except Exception:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+                raise
+            return secret
+    except Exception:
+        return None
+
+
+def compute_self_mail_auth(secret: str, message_id: str) -> str:
+    """The ``X-MailWarden-Auth`` value: ``v1:`` + hex HMAC-SHA256 over the EXACT
+    Message-ID header value (including angle brackets), keyed by ``secret``."""
+    mac = hmac.new(secret.encode("utf-8"),
+                   (message_id or "").encode("utf-8"),
+                   hashlib.sha256).hexdigest()
+    return "v1:" + mac
+
+
+def stamp_self_mail_auth(msg, secret) -> None:
+    """Add the ``X-MailWarden-Auth`` header to an outgoing self-mail ``msg``.
+    No-op when ``secret`` is falsy (no config / unwritable), when the message has
+    no Message-ID, or when the header is already present (idempotent)."""
+    if not secret:
+        return
+    mid = msg.get("Message-ID", "") or ""
+    if not mid:
+        return
+    if msg.get("X-MailWarden-Auth"):
+        return
+    msg["X-MailWarden-Auth"] = compute_self_mail_auth(secret, str(mid))
+
+
+def verify_self_mail_auth(auth_header, message_id, secret) -> bool:
+    """True IFF ``auth_header`` is a valid ``v1:`` HMAC of ``message_id`` under
+    ``secret`` (constant-time compare). Fail-open: returns False on a missing
+    secret/header/id, a malformed or non-``v1:`` header, or ANY exception — so a
+    bare or forged header earns no skip and a corrupt secret never crashes the
+    tick."""
+    try:
+        if not secret or not auth_header or not message_id:
+            return False
+        auth_header = str(auth_header).strip()
+        if not auth_header.startswith("v1:"):
+            return False
+        got = auth_header[3:].strip()
+        expected = hmac.new(secret.encode("utf-8"),
+                            str(message_id).encode("utf-8"),
+                            hashlib.sha256).hexdigest()
+        return hmac.compare_digest(got, expected)
+    except Exception:
+        return False
+
+
 def deliver_owner_mail(config: dict, msg, to_addr: str, logger,
                        smtp_send) -> tuple:
     """Deliver a system→owner ``msg``. Ensures Date+Message-ID, then PREFERS IMAP
@@ -137,6 +273,16 @@ def deliver_owner_mail(config: dict, msg, to_addr: str, logger,
     gets a real success signal, while callers that ignore the return value (the
     report / send_email / EULA paths) are unaffected."""
     ensure_rfc822_headers(msg, from_addr=msg.get("From", "") or "")
+    # Wave-6: HMAC-stamp this self-mail so the engine's loop-top guard can
+    # recognise it as genuinely ours. This is the SINGLE engine chokepoint —
+    # send_email, the EULA send, daily_report.send_report and learn_signals._send
+    # ALL route here — and it runs AFTER ensure_rfc822_headers, so the Message-ID
+    # the HMAC covers is guaranteed to exist. Fail-open: no secret (unwritable
+    # config) leaves the header off, and the body-marker guard still protects.
+    try:
+        stamp_self_mail_auth(msg, get_or_create_self_mail_secret())
+    except Exception:
+        pass
     subj = (msg.get("Subject", "") or "")[:60]
     account = account_for_recipient(config, to_addr)
     if account is not None:

@@ -628,6 +628,14 @@ class SetupAssistant(tk.Tk):
             msg["Date"] = email.utils.formatdate(localtime=True)
             _dom = from_addr.rsplit("@", 1)[1] if "@" in from_addr else None
             msg["Message-ID"] = email.utils.make_msgid(domain=_dom or None)
+            # Wave-6: HMAC-stamp so the engine's loop-top guard recognises this
+            # welcome email as genuinely ours (the bare X-MailWarden-System
+            # header is no longer trusted alone). Config exists by now (setup
+            # saved it just before this send); get_or_create returns None only if
+            # config is unreadable, in which case the body-marker guard still
+            # protects ("Welcome to MailWarden." is a registered own-mail marker).
+            config_io.stamp_self_mail_auth(
+                msg, config_io.get_or_create_self_mail_secret())
             msg.set_content(help_content.welcome_email_body(to_addr))
 
             # Route through validators.safe_smtp_connect so the welcome email

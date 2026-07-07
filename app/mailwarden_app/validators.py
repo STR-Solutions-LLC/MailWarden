@@ -275,6 +275,18 @@ def send_test_email(smtp_host: str, smtp_port: int, smtp_user: str, smtp_pass: s
     msg["Date"] = email.utils.formatdate(localtime=True)
     _dom = from_addr.rsplit("@", 1)[1] if "@" in from_addr else None
     msg["Message-ID"] = email.utils.make_msgid(domain=_dom or None)
+    # Wave-6: HMAC-stamp so the engine's loop-top guard recognises this as our
+    # own mail (the bare X-MailWarden-System header is no longer trusted alone).
+    # Fail-open: if config.json doesn't exist yet (a test sent before setup saves
+    # it) get_or_create returns None and no header is added — the benign "test
+    # message" then simply gets classified (NOT_SPAM) instead of skipped, which
+    # is harmless. Lazy import keeps validators a light leaf module.
+    try:
+        from . import config_io
+        config_io.stamp_self_mail_auth(
+            msg, config_io.get_or_create_self_mail_secret())
+    except Exception:
+        pass
     msg.set_content(
         "This is a test message from MailWarden Setup Assistant.\n\n"
         "If you received this, your SMTP settings are working correctly.\n"

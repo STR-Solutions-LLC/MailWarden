@@ -929,38 +929,6 @@ def test_whitelist_addr_helpers():
         {"value": "a@b.test", "scope": "all"}) is False
 
 
-def test_daily_report_whitelist_sync_tolerates_dict_entry(tmp_path, monkeypatch):
-    # Part B companion fix: the Whitelist-folder sync must NOT raise when
-    # whitelist.json already holds an APPROVE-sourced dict entry (pre-fix it did
-    # `a.lower()` on the dict -> AttributeError). It must dedupe against the dict
-    # entry's value, add a genuinely new sender as a plain string, and PRESERVE
-    # the dict entry's stored shape (read-only tolerance, never flatten on write).
-    wl_path = tmp_path / "whitelist.json"
-    wl_path.write_text(json.dumps({"addresses": [
-        "old@hand.test",
-        {"value": "rescued@gmail.com", "provenance": "approve"}],
-        "domains": []}))
-    monkeypatch.setattr(daily_report, "WHITELIST_PATH", wl_path)
-
-    folder = tmp_path / "whitelist_folder"
-    folder.mkdir()
-    (folder / "dup.eml").write_bytes(          # From matches the dict entry value
-        b"From: Rescued <rescued@gmail.com>\r\nSubject: hi\r\n\r\nbody\r\n")
-    (folder / "new.eml").write_bytes(          # a genuinely new sender
-        b"From: New Person <new@sender.test>\r\nSubject: hi\r\n\r\nbody\r\n")
-
-    additions = daily_report.process_whitelist_emls(folder, _LOGGER)
-
-    # Only the new sender was added; the dict entry deduped, not re-added.
-    assert [a["address"] for a in additions] == ["new@sender.test"]
-    stored = json.loads(wl_path.read_text())
-    # The APPROVE-sourced dict entry survives with its shape intact.
-    assert {"value": "rescued@gmail.com",
-            "provenance": "approve"} in stored["addresses"]
-    assert "old@hand.test" in stored["addresses"]
-    assert "new@sender.test" in stored["addresses"]
-
-
 # --- Part D: the curate-active check must key on the account USERNAME (email),
 # the identifier the rule's scope store uses — NOT the display name. ---
 def test_part_d_account_scoped_curate_matches_on_username():

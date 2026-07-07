@@ -8,6 +8,8 @@ leave a corrupt file. Matches the pattern used in src/spam_filter.py
 (`save_config_atomic`, `save_processed_ids`, etc.) so files written by the
 UI are interchangeable with files written by the filter.
 """
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -254,6 +256,81 @@ def update_config(mutator) -> dict:
         mutator(config)
         save_config(config)
         return config
+
+
+# ---------------------------------------------------------------------------
+# HMAC-verified self-mail stamp (Wave-6) — GUI twin.
+#
+# Byte-identical logic to utils.get_or_create_self_mail_secret /
+# compute_self_mail_auth / stamp_self_mail_auth in the ENGINE tree
+# (payload/MailWarden/src/utils.py). The GUI senders (Setup Assistant's welcome
+# email, validators.send_test_email) stamp their outgoing self-mail with the
+# same X-MailWarden-Auth header the engine's loop-top guard verifies, so those
+# messages are recognised as ours instead of being classified on re-ingestion.
+#
+# The two package trees never import each other; they share ONLY config.json,
+# where the per-install "self_mail_secret" lives — so this logic is duplicated
+# verbatim. If you edit one copy, edit the other. A drift-guard test asserts
+# identical HMAC output for the same (secret, message_id).
+# ---------------------------------------------------------------------------
+
+SELF_MAIL_SECRET_KEY = "self_mail_secret"
+
+
+def get_or_create_self_mail_secret() -> "str | None":
+    """Return this install's shared self-mail HMAC secret from config.json,
+    generating+persisting it on first use, under the config file lock (so a
+    concurrent engine+GUI generation can't mint two secrets). Reads/writes the
+    SAME config.json (paths.CONFIG_PATH) the engine uses, so both share ONE
+    per-install secret.
+
+    Returns None (never raises) when config.json does not yet exist or is
+    unwritable — the caller then stamps without the HMAC header. Deliberately
+    does NOT create config.json: during first-run setup a test email may be sent
+    before config is saved, and minting a defaults-only config here would
+    interfere with the setup flow (and the engine copy is likewise read-if-
+    present)."""
+    try:
+        if not paths.CONFIG_PATH.exists():
+            return None
+        with file_lock.locked(paths.CONFIG_PATH):
+            if not paths.CONFIG_PATH.exists():
+                return None
+            cfg = load_config()
+            secret = cfg.get(SELF_MAIL_SECRET_KEY)
+            if isinstance(secret, str) and secret.strip():
+                return secret.strip()
+            secret = secrets.token_hex(32)
+            cfg[SELF_MAIL_SECRET_KEY] = secret
+            save_config(cfg)
+            return secret
+    except Exception:
+        return None
+
+
+def compute_self_mail_auth(secret: str, message_id: str) -> str:
+    """The X-MailWarden-Auth value: 'v1:' + hex HMAC-SHA256 over the EXACT
+    Message-ID header value (including angle brackets), keyed by ``secret``.
+    Byte-identical to utils.compute_self_mail_auth (engine tree)."""
+    mac = hmac.new(secret.encode("utf-8"),
+                   (message_id or "").encode("utf-8"),
+                   hashlib.sha256).hexdigest()
+    return "v1:" + mac
+
+
+def stamp_self_mail_auth(msg, secret) -> None:
+    """Add the X-MailWarden-Auth header to an outgoing self-mail ``msg``. No-op
+    when ``secret`` is falsy, the message has no Message-ID, or the header is
+    already present. Byte-identical to utils.stamp_self_mail_auth (engine
+    tree)."""
+    if not secret:
+        return
+    mid = msg.get("Message-ID", "") or ""
+    if not mid:
+        return
+    if msg.get("X-MailWarden-Auth"):
+        return
+    msg["X-MailWarden-Auth"] = compute_self_mail_auth(secret, str(mid))
 
 
 # ---------------------------------------------------------------------------

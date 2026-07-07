@@ -36,6 +36,7 @@ from utils import (
     random_token, select_trusted_auth_results,
     clear_dnsbl_cache, verify_dkim_locally,
     make_tls_context, html_to_text,
+    get_or_create_self_mail_secret, verify_self_mail_auth,
 )
 from learn_signals import save_signals, is_shared_mail_domain
 
@@ -7445,6 +7446,17 @@ def run_filter(force: bool = False):
     # (results are cached only within a single run to dedupe repeated IPs).
     clear_dnsbl_cache()
 
+    # Wave-6: ensure this install's shared self-mail HMAC secret exists and load
+    # it ONCE for the whole run. Used by the loop-top guard below to verify our
+    # own outgoing mail's X-MailWarden-Auth stamp (the bare X-MailWarden-System
+    # header is no longer trusted alone — a spammer could forge it). Calling the
+    # get-or-create here (rather than reading config.get) guarantees the same
+    # value the send path (utils.deliver_owner_mail) stamps with, even on the
+    # very first run that mints it. None (unwritable config) → every stamp fails
+    # to verify and the body-marker guard carries the load. No per-message file
+    # reads: this is one locked read/create for the whole tick.
+    self_mail_secret = get_or_create_self_mail_secret()
+
     # Interval gate (scheduled runs only). The plist wakes us every 5 min as
     # a floor; the user's actual cadence (filter.interval_minutes) is enforced
     # here, before any IMAP login or API call. Only an actual run updates the
@@ -7621,6 +7633,19 @@ def run_filter(force: bool = False):
             continue
 
         account_name = account.get("name", "Unknown")
+        # account_key keys the persistent per-account stores: processed_ids (the
+        # Message-ID dedup ledger) and command_scan_state (the reply-corridor UID
+        # watermarks). It is the account USERNAME (falling back to the display
+        # name only for a nameless account). CONSEQUENCE OF A USERNAME CHANGE: if
+        # the owner edits an account's username, these stores re-key to the new
+        # value, so the old bucket's history is no longer consulted. The
+        # processed_ids bucket is rescued by the one-time display-name→username
+        # migration a few lines down, but command_scan_state is not — its
+        # watermark resets, so the next tick re-scans the last ~7 days of that
+        # folder and may re-emit already-sent command acks. Both stores are
+        # idempotent (Message-ID dedup / at-most-once precommit), so this is at
+        # worst a bounded batch of DUPLICATE ACKS on a rename — never lost mail,
+        # a wrong action, or data corruption. Documented, not guarded.
         account_key = account.get("username") or account_name
         logger.info(f"Processing account: {account_name}")
         accounts_checked += 1
@@ -7825,40 +7850,53 @@ def run_filter(force: bool = False):
                         logger.debug(f"  Skipping already-processed: {msg_id}")
                         continue
 
-                    # --- Self-loop guard: skip MailWarden's own outgoing mail ---
-                    # Every email sent by send_email() carries X-MailWarden-System: 1.
-                    # If one of those lands back in the monitored inbox (e.g. a
-                    # "Whitelist — Could Not Parse" reply whose subject starts with
-                    # "Whitelist"), command detection would fire on it, produce
-                    # another error reply, and loop indefinitely. Guard against this
-                    # by recording it processed (so the already-processed skip at
-                    # the top of the loop cheaply drops it on every later tick, and
-                    # finding #20's header-first check skips the download) and
-                    # skipping it here — but do NOT mark it \\Seen (finding #13):
-                    # leave it UNSEEN so the owner still sees our proposals/
-                    # analyses/acks/notices in their unread badge. Mirrors the
-                    # daily-report (~8371) and SFID own-prefix (~7813) own-mail
-                    # skips, which also record-without-mark-seen.
-                    _mw_system_hdr = str(
-                        msg_data.get("_mime_msg", {}) and
-                        msg_data["_mime_msg"].get("X-MailWarden-System", "") or ""
-                    ) if msg_data.get("_mime_msg") is not None else ""
-                    if not _mw_system_hdr and msg_data.get("_mime_msg") is not None:
-                        _mw_system_hdr = str(
-                            msg_data["_mime_msg"].get("X-MailWarden-System", "") or ""
-                        )
-                    if _mw_system_hdr.strip() == "1":
+                    # --- Self-loop guard (a): HMAC-VERIFIED self-mail stamp ---
+                    # MailWarden's own outgoing mail (learner proposals, FP
+                    # analyses, acks, EULA/notices, the daily report) lands back in
+                    # the monitored inbox; without a skip, command detection could
+                    # fire on it, produce another reply, and loop indefinitely.
+                    #
+                    # Wave-6: the bare X-MailWarden-System header ALONE no longer
+                    # earns a skip — a spammer who copied that header onto real
+                    # spam got a total filter bypass (skipped, marked processed,
+                    # left in the inbox forever). We now require
+                    # X-MailWarden-Auth = v1:HMAC_SHA256(self_mail_secret,
+                    # Message-ID), a per-install secret only our own senders know
+                    # (stamped at the utils.deliver_owner_mail chokepoint). Order:
+                    #   (a) valid Auth stamp  -> this IS our mail: record processed
+                    #       and skip (below), leaving it UNSEEN (finding #13) so the
+                    #       owner still sees it in their unread badge.
+                    #   (b) else -> fall through to the header-INDEPENDENT
+                    #       _is_own_outgoing_mail body-marker guard (the grace path
+                    #       for mail from an older version, or after the secret was
+                    #       regenerated, or if the stamp was stripped in transit).
+                    #   (c) else -> normal classification. A bare or forged
+                    #       X-MailWarden-System gives NOTHING here — and is NOT
+                    #       penalized either (no new spam signal, just no skip).
+                    # All verify logic fails OPEN to classification, never closed to
+                    # a skip: a missing/malformed secret or garbage header value
+                    # simply doesn't verify. Mirrors the daily-report (~8371) and
+                    # SFID own-prefix (~7813) skips, which also record-without-seen.
+                    _auth_hdr = ""
+                    _mime = msg_data.get("_mime_msg")
+                    if _mime is not None:
+                        _auth_hdr = str(_mime.get("X-MailWarden-Auth", "") or "")
+                    if verify_self_mail_auth(_auth_hdr, msg_id, self_mail_secret):
                         logger.debug(
-                            f"  Skipping own MailWarden system email "
-                            f"(X-MailWarden-System: 1): {msg_data.get('subject','')[:60]}"
+                            f"  Skipping own MailWarden mail "
+                            f"(verified X-MailWarden-Auth): "
+                            f"{msg_data.get('subject','')[:60]}"
                         )
                         _record_processed(processed, account_key,
                                           account_processed, msg_id)
                         continue
 
-                    # Defense-in-depth (own-mail self-junk guard, task #10):
-                    # even if the X-MailWarden-System stamp above was stripped in
-                    # transit, NEVER classify/junk our OWN outgoing mail — the
+                    # Self-loop guard (b): header-INDEPENDENT own-mail body-marker
+                    # guard (own-mail self-junk guard, task #10). The grace path
+                    # for our own mail that carries NO verifying X-MailWarden-Auth
+                    # (sent by an older version, after the secret was regenerated,
+                    # or if the stamp was stripped in transit): NEVER classify/junk
+                    # our OWN outgoing mail — the
                     # daily report (which quotes junked spam), the FP-analysis
                     # email (whose subject embeds the original spam subject and
                     # would trip the subject-keyword gate), or any ack. This runs
