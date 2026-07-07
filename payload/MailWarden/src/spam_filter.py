@@ -314,6 +314,48 @@ def save_command_scan_state(data: dict) -> None:
         raise
 
 
+# E8: our OWN \Deleted UIDs that _expunge_one had to DEFER (server lacks UIDPLUS
+# and a \Deleted message we didn't recognise was present). Persisted per
+# (account, folder) — a per-run set is not enough because the self-reinforcement
+# spans ticks: without a memory of which \Deleted messages are ours, every tick
+# sees its own prior deferrals as "foreign" and defers again forever.
+EXPUNGE_DEFERRED_PATH = PROJECT_ROOT / "memory" / "expunge_deferred.json"
+
+
+def load_expunge_deferred() -> dict:
+    """Load the deferred-expunge store (memory/expunge_deferred.json).
+
+    Shape: {"version","last_updated","folders": {<account_key>: {<folder>:
+    {"uidvalidity": int|None, "uids": [int, ...]}}}}. Missing/malformed returns
+    the safe empty default (no remembered deferrals)."""
+    try:
+        with open(EXPUNGE_DEFERRED_PATH, "r") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {"version": "1.0", "last_updated": "", "folders": {}}
+    if not isinstance(data.get("folders"), dict):
+        data["folders"] = {}
+    return data
+
+
+def save_expunge_deferred(data: dict) -> None:
+    """Atomic write (mkstemp + os.replace), same pattern as
+    save_command_scan_state. spam_filter is the only writer; the run-flock
+    guarantees a single instance."""
+    data["last_updated"] = datetime.now().isoformat()
+    EXPUNGE_DEFERRED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=EXPUNGE_DEFERRED_PATH.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, EXPUNGE_DEFERRED_PATH)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
 # Retired shipped-default signals (fix a-1). Stripped in-memory on every load so
 # existing installs whose memory/signals.json inherited them stop surfacing them
 # without a forced disk rewrite. EXACT-match only — never substring — so a
@@ -1056,34 +1098,107 @@ _TEACH_LEGIT_BL_WARNING_TYPED = (
 _TEACH_LEGIT_BL_WARNING_RULE = (
     "Heads up: your Unwanted Categories rule is still blocking this sender. To "
     "let it through, edit or delete that rule in the Unwanted Categories tab.")
+# E7: warning when no standing blacklist entry matches but an ACTIVE curate
+# rule's own sender markers still cover the taught sender — names the rule so
+# the contradiction isn't silent. Twin-tone with _TEACH_LEGIT_BL_WARNING_RULE.
+_TEACH_LEGIT_CURATE_WARNING = (
+    "Heads up: your Unwanted Categories rule \"{headline}\" still covers this "
+    "sender, so its mail can keep going to Junk. To let it through, open Signal "
+    "History (Unwanted Categories) and edit or delete that rule.")
 
 
-def _teach_legit_blacklist_warning(from_header, blacklist, account_name=None) -> str:
-    """If the taught-legitimate sender is STILL blacklisted, return the honesty
-    warning (branched by the matched entry's provenance); "" otherwise. Matching
-    is delegated to check_blacklist — never re-implemented. Only sender-based
-    blocks (address/domain/display name) are reachable here; a subject-keyword
-    block can't be judged from the sender alone, so it is out of scope."""
+# E6: honest ack when a "Remove from Blacklist" reply targets a sender that is
+# blocked by an authored Unwanted-Categories RULE (not a hand-typed/approve
+# entry). Removing the rule's stored entry by value would orphan the rule — its
+# AI half keeps junking the sender and a later rule edit silently re-adds the
+# entry — so the entry is kept and the owner is pointed at the rule's home.
+# Reuses the _TEACH_LEGIT_BL_WARNING_RULE tone; MUST NOT claim the sender is now
+# evaluated by the classifier. Opening is registered in
+# _OWN_OUTGOING_BODY_MARKERS.
+_BLACKLIST_REMOVE_RULE_SKIPPED_BODY = (
+    "MailWarden kept this sender blocked. It is blocked by one of your Unwanted "
+    "Categories rules, not by a hand-added blacklist entry, so removing it here "
+    "would leave that rule half-applied — its AI half would keep filtering this "
+    "sender, and editing the rule later would re-add it.\n\n"
+    "To let this sender through, open the Unwanted Categories tab and edit or "
+    "delete the rule that covers it.")
+
+
+def _teach_legit_blacklist_warning(from_header, blacklist, account_name=None,
+                                   signals=None) -> str:
+    """If the taught-legitimate sender is STILL blocked, return the honesty
+    warning; "" otherwise. Matching against the blacklist is delegated to
+    check_blacklist — never re-implemented. Only sender-based blocks
+    (address/domain/display name) are reachable via the blacklist; a
+    subject-keyword block can't be judged from the sender alone.
+
+    E7: when ``signals`` is provided, ALSO scan active, in-scope CURATE
+    refinements whose deterministic sender markers (address/domain) match
+    ``from_header``. Such a rule keeps junking the taught sender via the
+    classifier even when no standing blacklist entry does — without this the
+    teach reports a clean "success" while the rule silently contradicts it. The
+    curate warning names the offending rule's headline and points at its home.
+    The BLACKLIST branch takes precedence when both match. Fail-open: any error
+    scanning refinements yields "" (never blocks the teach)."""
     match_type, match_value = check_blacklist(
         from_header, blacklist, account_name=account_name)
-    if not match_type:
-        return ""
-    field = {"address": "addresses", "domain": "domains",
-             "display_name": "display_names"}.get(match_type)
-    strip_at = field == "domains"
-    mv = (match_value or "").strip().lower()
-    if strip_at:
-        mv = mv.lstrip("@")
-    entry = None
-    for e in blacklist.get(field, []) or []:
-        ev = _blocklist_value_of(e, strip_at=strip_at)
-        # Exact match, or (domains) the sender is a subdomain of a blocked parent.
-        if ev and (ev == mv or (strip_at and mv.endswith("." + ev))):
-            entry = e
-            break
-    kind = _entry_provenance_kind(entry)
-    return (_TEACH_LEGIT_BL_WARNING_RULE if kind == "rule"
-            else _TEACH_LEGIT_BL_WARNING_TYPED)
+    if match_type:
+        field = {"address": "addresses", "domain": "domains",
+                 "display_name": "display_names"}.get(match_type)
+        strip_at = field == "domains"
+        mv = (match_value or "").strip().lower()
+        if strip_at:
+            mv = mv.lstrip("@")
+        entry = None
+        for e in blacklist.get(field, []) or []:
+            ev = _blocklist_value_of(e, strip_at=strip_at)
+            # Exact match, or (domains) the sender is a subdomain of a blocked
+            # parent.
+            if ev and (ev == mv or (strip_at and mv.endswith("." + ev))):
+                entry = e
+                break
+        kind = _entry_provenance_kind(entry)
+        return (_TEACH_LEGIT_BL_WARNING_RULE if kind == "rule"
+                else _TEACH_LEGIT_BL_WARNING_TYPED)
+
+    # E7: no standing blacklist entry — but an active in-scope curate rule may
+    # still junk this sender. Reuse the same scope/active logic the classifier
+    # uses (_refinement_in_scope); match only the rule's DETERMINISTIC sender
+    # markers (address/domain) against from_header (a purely-AI rule is semantic
+    # and cannot be matched from the sender alone, so it is out of scope here).
+    if isinstance(signals, dict):
+        try:
+            parsed = parse_from_address(from_header)
+            addr = (parsed.get("address") or "").strip().lower()
+            dom = (extract_domain(addr) if addr else "").lower().lstrip("@")
+            for r in signals.get("ai_refinements", []) or []:
+                if not isinstance(r, dict):
+                    continue
+                if r.get("status", "active") != "active":
+                    continue
+                if (r.get("rule_class") or "").strip().lower() != "curate":
+                    continue
+                if not _refinement_in_scope(r, account_name):
+                    continue
+                for de in r.get("deterministic_entries", []) or []:
+                    if not isinstance(de, dict):
+                        continue
+                    de_kind = (de.get("kind") or "").strip().lower()
+                    de_val = (de.get("value") or "").strip().lower()
+                    if not de_val:
+                        continue
+                    if de_kind == "address" and addr and de_val == addr:
+                        return _TEACH_LEGIT_CURATE_WARNING.format(
+                            headline=r.get("headline", "") or "(your rule)")
+                    if de_kind == "domain":
+                        de_dom = de_val.lstrip("@")
+                        if dom and (dom == de_dom
+                                    or dom.endswith("." + de_dom)):
+                            return _TEACH_LEGIT_CURATE_WARNING.format(
+                                headline=r.get("headline", "") or "(your rule)")
+        except Exception:
+            return ""
+    return ""
 
 
 def check_subject_keywords(subject: str, blacklist: dict,
@@ -2215,9 +2330,10 @@ def send_email(config: dict, subject: str, body: str, logger: logging.Logger,
     to_addr controls where the reply is delivered. Every Fwd: handler passes
     the forwarding account's own username so the reply lands back in the
     inbox the user sent the command from — not the primary account. When
-    to_addr is None, falls back to summary.recipient_address or the SMTP
-    username, which keeps the filter's own notifications (errors, EULA
-    delivery, etc.) routed to the configured owner.
+    to_addr is None, falls back to summary.recipient (the key actually
+    written) then legacy summary.recipient_address, then the SMTP username —
+    mirroring daily_report.send_report — which keeps the filter's own
+    notifications (errors, EULA delivery, etc.) routed to the configured owner.
     """
     smtp_config = config.get("smtp", {})
     summary_config = config.get("summary", {})
@@ -2227,7 +2343,11 @@ def send_email(config: dict, subject: str, body: str, logger: logging.Logger,
     password = smtp_config.get("password", "")
     from_addr = smtp_config.get("from_address", username)
     if not to_addr:
-        to_addr = summary_config.get("recipient_address", username)
+        # E10d: read summary.recipient FIRST (the key config actually writes);
+        # summary.recipient_address is a legacy fallback nothing populates.
+        to_addr = (summary_config.get("recipient")
+                   or summary_config.get("recipient_address")
+                   or username)
     use_starttls = smtp_config.get("use_starttls", True)
 
     msg = MIMEText(body, "plain")
@@ -3258,6 +3378,28 @@ _OWN_OUTGOING_BODY_MARKERS = (
     "MailWarden could not apply this signal change",
     "MailWarden received your reply but couldn't read any instruction in it.",
     "MailWarden couldn't answer your question right now.",
+    # E5: self-mail types that were previously protected by the
+    # X-MailWarden-System header stamp ALONE. Registering their (prefix-stable)
+    # openings gives the header-independent _is_own_outgoing_mail guard a second
+    # line of defense if that stamp is stripped in transit. Each opening is a
+    # MailWarden-specific phrase an owner reply never starts with, and the guard
+    # additionally requires an owner-identity From, so none of these can be
+    # abused by third-party mail to dodge junking.
+    "MailWarden follow-up answer:",                                    # FP follow-up answer
+    "MailWarden couldn't finish analyzing that false positive right now.",  # FP-analysis-failed ack
+    "You forwarded one of MailWarden's own analysis emails",           # own-analysis-forward redirect
+    "MailWarden couldn't extract a sender address from your forwarded email.",  # wl/bl could-not-parse acks
+    "Saved as a new training example:",                                # SPAM-example confirmation
+    "MailWarden could not save this example.",                         # SPAM-example failure ack
+    "We received a command (or approval reply) that appeared to come from",  # command-not-verified notice
+    "MailWarden has been in Dry Run (preview) mode for",               # dry-run reminder
+    "Welcome to MailWarden.",                                          # EULA / welcome email
+    "MailWarden guessed that the email you dropped into Train",        # Train-drop unchanged notice (learn_signals)
+    "You dropped an email into Train.",                                # Train-drop strengthened notice (learn_signals)
+    "MailWarden could not block that sender.",                         # block-apply-failed ack
+    "MailWarden did not turn that rule back on.",                      # refinement-retired ack
+    "MailWarden received your reply to the daily report but couldn't read",  # MWR could-not-read ack
+    "MailWarden kept this sender blocked.",                            # E6 blacklist-remove rule-skipped ack
 )
 
 
@@ -3408,6 +3550,38 @@ def _notify_unverified_command(config, account, logger):
         "your email (not forwarded through another service).",
         logger,
         to_addr=account.get("username", ""))
+
+
+def _reply_targets_pending_conversation(subject: str, pending: dict,
+                                        logger: logging.Logger) -> bool:
+    """E4: True when *subject* carries an [SFID-...] / [MWR-...] token that names
+    an ACTUAL conversation of ours — an SFID whose id appears in
+    pending['conversations'] regardless of status (resolved/expired entries are
+    retained there for up to ~90 days and still count: the token proves the mail
+    is a reply to something WE sent), or an MWR token present in
+    report_approvals.json. Used by the auth-fail branches so a genuine owner
+    reply whose authentication we couldn't verify is LEFT IN THE INBOX rather
+    than falling through to classification (where an inherited spam subject, per
+    E3, could junk the owner's own YES).
+
+    An attacker who mints a fake token finds no matching conversation and gets
+    today's classify behavior — the tokens are unguessable (generate_sfid), so a
+    match is proof this is a reply to one of our own conversation emails."""
+    subj = subject or ""
+    m_sfid = re.search(r'\[SFID-([A-Za-z0-9-]+)\]', subj)
+    if m_sfid and isinstance(pending, dict):
+        sfid = f"SFID-{m_sfid.group(1)}"
+        for c in pending.get("conversations", []):
+            if isinstance(c, dict) and c.get("id") == sfid:
+                return True
+    m_mwr = re.search(r'\[MWR-([A-Za-z0-9-]+)\]', subj)
+    if m_mwr:
+        try:
+            if m_mwr.group(1) in load_report_approvals_store(logger):
+                return True
+        except Exception:
+            pass
+    return False
 
 
 def _resolved_sfid_reply(conv, sfid):
@@ -5076,29 +5250,6 @@ def _match_approved_domain(auth: dict, approved_domains) -> str:
     return ""
 
 
-def _owner_approved_authenticated_domain(msg_data: dict, approved_domains) -> str:
-    """The owner-approved + cryptographically-authenticated domain for this
-    message, or "" — computed straight from msg_data using the SAME
-    summarize_authentication + local-DKIM path build_user_message uses. Returns
-    "" on any doubt, so the Feature-2 caller fails toward the normal AI path.
-
-    The security bar is exactly RULE 1 / the OWNER-APPROVED block: DKIM=pass OR
-    DMARC=pass AND an authenticated domain aligned to the From domain AND to an
-    owner-approved domain. An UNverified From that merely CLAIMS an approved
-    domain never matches (spoof-proof)."""
-    if not approved_domains:
-        return ""
-    raw_from_email = msg_data.get('from_email', '') or ''
-    from_domain = raw_from_email.split('@', 1)[1] if '@' in raw_from_email else ''
-    auth = summarize_authentication({
-        "Authentication-Results": msg_data.get("auth_results", ""),
-        "Received-SPF":           msg_data.get("received_spf", ""),
-        "DKIM-Signature":         msg_data.get("dkim_signature", ""),
-    }, from_domain=from_domain,
-        locally_verified=_locally_verified_dkim(msg_data))
-    return _match_approved_domain(auth, approved_domains)
-
-
 def build_user_message(msg_data: dict, approved_domains: set = None,
                        sender_history_index: dict = None,
                        whitelisted_sender: str = "") -> str:
@@ -6427,6 +6578,13 @@ def fetch_command_scan_uids(conn: imaplib.IMAP4_SSL, folder: str,
         # anything not strictly newer than the watermark.
         uids = [u for u in raw_uids if u.isdigit() and int(u) > watermark]
 
+        # E10a: on a first-run / UIDVALIDITY-reset SINCE scan where UIDNEXT was
+        # unavailable AND nothing matched, storing watermark 0 would force a
+        # full "UID 1:*" scan next tick. Skip the state update (leave the folder
+        # unwatermarked) so the bounded SINCE fallback simply runs again.
+        if not incremental and uidnext is None and not uids:
+            return uids, None
+
         highest_seen = max((int(u) for u in uids), default=watermark)
         new_watermark = max(
             watermark,
@@ -6544,7 +6702,18 @@ def submit_spam_example(fwd_data: dict, config: dict, account: dict,
         return False
 
 
-def _expunge_one(conn, uid, logger: logging.Logger) -> None:
+# E8: the SOURCE mailbox _expunge_one is currently purging, set by run_filter at
+# the top of each folder iteration (each iteration overwrites the previous
+# values; nothing clears it — when unset, both values are None and _expunge_one
+# falls back to the legacy single-uid behavior). Read by _expunge_one so
+# move_to_junk / execute_spam_action keep their original signatures (existing
+# test stubs replace them with 4-arg callables). The scan is single-instance
+# (run-flock) and single-threaded, so a module global is safe.
+_ACTIVE_EXPUNGE_CTX = {"account_key": None, "folder": None}
+
+
+def _expunge_one(conn, uid, logger: logging.Logger,
+                 account_key=None, folder=None) -> None:
     """Expunge exactly one already-\\Deleted message WITHOUT purging \\Deleted
     mail that OTHER clients flagged.
 
@@ -6554,9 +6723,18 @@ def _expunge_one(conn, uid, logger: logging.Logger) -> None:
     including mail another IMAP client (phone, desktop) flagged for deletion but
     has not yet expunged — silent data loss. So without UIDPLUS we NEVER
     blind-expunge: we SEARCH DELETED and fall back to a bare EXPUNGE only when
-    the sole \\Deleted message is our own uid. Otherwise we leave the message
-    flagged (it was already copied/junked) and log a warning; a later tick on a
-    quiescent mailbox purges it safely."""
+    every \\Deleted message is one we recognise as our own.
+
+    E8: "our own" is not just this uid. When we DEFER (a \\Deleted message we
+    don't recognise is present) we remember this uid in a per-(account, folder)
+    store that PERSISTS across ticks. Without that memory our own deferred
+    \\Deleted mail accumulates and every later tick treats it as foreign,
+    deferring forever (self-reinforcing) — so the docstring's promise that "a
+    later tick purges safely" was false. We now purge as soon as every \\Deleted
+    message is one of ours (the remembered set ∪ the uid we just flagged), and
+    reset the memory when the purge succeeds or UIDVALIDITY changes. When
+    account_key/folder are not supplied (legacy callers / tests) we fall back to
+    the old single-uid behavior."""
     caps = getattr(conn, "capabilities", ()) or ()
     if "UIDPLUS" in caps:
         conn.uid("EXPUNGE", uid)
@@ -6586,13 +6764,80 @@ def _expunge_one(conn, uid, logger: logging.Logger) -> None:
                else str(chunk))
         deleted.update(raw.split())
     our = uid.decode() if isinstance(uid, (bytes, bytearray)) else str(uid)
-    if not deleted or deleted <= {our}:
+
+    # E8: identify the source mailbox. Explicit args win (scan_train_folder
+    # passes them directly); otherwise fall back to the context run_filter set
+    # for the folder currently being scanned.
+    if account_key is None and folder is None:
+        account_key = _ACTIVE_EXPUNGE_CTX.get("account_key")
+        folder = _ACTIVE_EXPUNGE_CTX.get("folder")
+
+    # Load our remembered deferrals for this (account, folder). On any failure
+    # we degrade to the legacy single-uid behavior (ours = {}).
+    use_state = account_key is not None and folder is not None
+    ours = set()
+    store = None
+    uidvalidity = None
+    if use_state:
+        try:
+            uidvalidity = _imap_status_value(conn, folder, "UIDVALIDITY")
+            store = load_expunge_deferred()
+            entry = (store.get("folders", {}).get(account_key, {}) or {}).get(folder)
+            if isinstance(entry, dict):
+                # A UIDVALIDITY change means the mailbox was rebuilt — old UIDs
+                # refer to different (or gone) messages, so forget them.
+                if (uidvalidity is not None
+                        and entry.get("uidvalidity") not in (None, uidvalidity)):
+                    ours = set()
+                else:
+                    ours = {str(u) for u in entry.get("uids", [])
+                            if str(u).isdigit()}
+        except Exception as e:
+            logger.debug(f"[EXPUNGE] deferred-state read failed: {e}")
+            store = None
+
+    allowed = ours | {our}
+    if not deleted or deleted <= allowed:
         conn.expunge()
+        # The purge removed every \\Deleted message (all ours) — clear the
+        # remembered set for this (account, folder) so it doesn't grow stale.
+        if use_state and store is not None and ours:
+            try:
+                acc = store.get("folders", {}).get(account_key)
+                if isinstance(acc, dict) and folder in acc:
+                    del acc[folder]
+                    if not acc:
+                        store["folders"].pop(account_key, None)
+                    save_expunge_deferred(store)
+            except Exception as e:
+                logger.debug(f"[EXPUNGE] deferred-state prune failed: {e}")
     else:
         logger.warning(
-            f"[EXPUNGE] Server lacks UIDPLUS and {len(deleted)} \\Deleted "
-            f"message(s) from other clients are present; leaving UID {uid!r} "
-            f"flagged rather than purging another client's mail")
+            f"[EXPUNGE] Server lacks UIDPLUS and "
+            f"{len(deleted - allowed)} \\Deleted message(s) from other clients "
+            f"are present; leaving UID {uid!r} flagged rather than purging "
+            f"another client's mail")
+        # Remember OUR uid so a later tick that sees only our own deferred mail
+        # (plus its current uid) can finally purge.
+        if use_state and store is not None:
+            try:
+                folders = store.setdefault("folders", {})
+                acc = folders.setdefault(account_key, {})
+                entry = acc.get(folder)
+                if (not isinstance(entry, dict)
+                        or (uidvalidity is not None
+                            and entry.get("uidvalidity") not in (None, uidvalidity))):
+                    entry = {"uidvalidity": uidvalidity, "uids": []}
+                    acc[folder] = entry
+                if uidvalidity is not None:
+                    entry["uidvalidity"] = uidvalidity
+                remembered = {str(u) for u in entry.get("uids", [])
+                              if str(u).isdigit()}
+                remembered.add(our)
+                entry["uids"] = sorted(int(u) for u in remembered)
+                save_expunge_deferred(store)
+            except Exception as e:
+                logger.debug(f"[EXPUNGE] deferred-state write failed: {e}")
 
 
 def scan_train_folder(conn: imaplib.IMAP4_SSL, account: dict, config: dict,
@@ -6657,13 +6902,26 @@ def scan_train_folder(conn: imaplib.IMAP4_SSL, account: dict, config: dict,
             if raw is None:
                 continue
             msg_data = extract_email_data(raw, own_hosts=own_hosts)
+            # E2: derive the training body with the SAME plain-vs-HTML
+            # precedence the classifier uses (build_user_message ~5160): prefer
+            # the HTML-derived visible text when the HTML part yields any, else
+            # the plain part. Otherwise a spam whose real payload lives only in
+            # the HTML (with an innocuous text/plain decoy) would teach the
+            # learner from the decoy — the "learner reads HTML bodies" fix never
+            # reached this Train-folder path. Reuse html_to_text (no re-impl).
+            _plain_body = msg_data.get("plain_text_body", "") or ""
+            _html_body_raw = msg_data.get("html_body", "") or ""
+            _html_visible = (
+                html_to_text(_html_body_raw[:_HTML_CONVERSION_INPUT_CAP])
+                if _html_body_raw else "")
+            _train_body = _html_visible if _html_visible.strip() else _plain_body
             fwd_data = {
                 "user_explanation": "[No explanation — dropped into "
                                       "Train MailWarden folder]",
                 "original_from": msg_data.get("from_header_raw", ""),
                 "original_subject": msg_data.get("subject", ""),
                 "original_date": "",
-                "original_body": msg_data.get("plain_text_body", "")[:1000],
+                "original_body": _train_body[:1000],
             }
             if submit_spam_example(fwd_data, config, account, logger):
                 processed += 1
@@ -6679,7 +6937,10 @@ def scan_train_folder(conn: imaplib.IMAP4_SSL, account: dict, config: dict,
                 # Message-ID dedup prevents a duplicate .eml save.
                 try:
                     conn.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
-                    _expunge_one(conn, uid, logger)
+                    _expunge_one(conn, uid, logger,
+                                 account_key=(account.get("username")
+                                              or account.get("name", "")),
+                                 folder=TRAIN_FOLDER_NAME)
                     logger.info(
                         f"  [TRAIN] Deleted {subject!r} from Train folder "
                         f"after learner trigger")
@@ -6776,7 +7037,12 @@ def ensure_train_folder(conn, logger=None) -> tuple[bool, str]:
 
 def move_to_junk(conn: imaplib.IMAP4_SSL, uid: bytes, junk_folder: str,
                  logger: logging.Logger) -> bool:
-    """Move email to junk folder using UID COPY + DELETE."""
+    """Move email to junk folder using UID COPY + DELETE.
+
+    The SOURCE mailbox identity _expunge_one needs to track its own deferred
+    \\Deleted UIDs across ticks (E8) is read from the module-level
+    _ACTIVE_EXPUNGE_CTX that run_filter sets per folder — so this signature (and
+    execute_spam_action's) is unchanged and existing stubs keep working."""
     # Quote the destination folder name. Some providers use junk folders
     # with spaces ("Junk E-mail", "Bulk Mail") and bare MOVE/COPY would
     # be parsed as multiple arguments and rejected — same root cause as
@@ -6859,6 +7125,10 @@ def execute_spam_action(conn: imaplib.IMAP4_SSL, uid: bytes, account: dict,
     "junk"   — existing move_to_junk behaviour (default / safe)
     "trash"  — move to provider's Trash folder; falls back to junk if not found
     "delete" — permanent \\Deleted + EXPUNGE; no recovery
+
+    The SOURCE mailbox identity _expunge_one uses for its cross-tick deferred-UID
+    tracking (E8) comes from the module-level _ACTIVE_EXPUNGE_CTX set by
+    run_filter, so this signature is unchanged (existing stubs keep working).
     """
     spam_action = account.get("spam_action", "junk")
     junk_folder = account["junk_folder"]
@@ -7216,6 +7486,36 @@ def run_filter(force: bool = False):
     # mark). Drives the read/unread-agnostic command scan below; advanced +
     # persisted per folder after each folder's scan completes.
     command_scan_state = load_command_scan_state()
+    # E10c: drop watermark entries for accounts/folders that are no longer in
+    # the config so the store doesn't accumulate stale keys forever. Keyed the
+    # same way run_filter keys them (username, else name). A disabled-but-present
+    # account is still "configured" and keeps its watermark.
+    _cs_configured = {}
+    for _a in config.get("accounts", []):
+        _ak = _a.get("username") or _a.get("name", "")
+        if _ak:
+            _cs_configured[_ak] = set(_a.get("folders_to_scan", ["INBOX"]))
+    _cs_folders = command_scan_state.get("folders", {})
+    _cs_pruned = False
+    for _ak in list(_cs_folders.keys()):
+        if _ak not in _cs_configured:
+            del _cs_folders[_ak]
+            _cs_pruned = True
+            continue
+        _acc_folders = _cs_folders[_ak]
+        if isinstance(_acc_folders, dict):
+            for _f in list(_acc_folders.keys()):
+                if _f not in _cs_configured[_ak]:
+                    del _acc_folders[_f]
+                    _cs_pruned = True
+    # E1/S4 purity: Dry Run must not write command_scan_state.json at all, so
+    # the prune write is live-run only (the in-memory prune above is harmless;
+    # a live run re-prunes and persists).
+    if _cs_pruned and not dry_run:
+        try:
+            save_command_scan_state(command_scan_state)
+        except Exception as e:
+            logger.warning(f"Could not persist command-scan state prune: {e}")
     # Finding #12: the dry-run sidecar of already-classified messages. Loaded
     # (and later consulted/flushed) ONLY in Dry Run — a real run ignores it
     # entirely, so every sidecar'd message gets one fresh classification and
@@ -7406,6 +7706,12 @@ def run_filter(force: bool = False):
 
             for folder in account.get("folders_to_scan", ["INBOX"]):
                 logger.info(f"  Scanning folder: {folder}")
+                # E8: publish the source mailbox so _expunge_one (reached via
+                # move_to_junk / execute_spam_action, whose signatures are
+                # unchanged) can track its own cross-tick deferred \\Deleted UIDs
+                # for this exact (account, folder).
+                _ACTIVE_EXPUNGE_CTX["account_key"] = account_key
+                _ACTIVE_EXPUNGE_CTX["folder"] = folder
                 unseen_uids = fetch_unseen_uids(conn, folder, logger)
                 logger.info(f"  Found {len(unseen_uids)} UNSEEN messages")
 
@@ -7420,6 +7726,18 @@ def run_filter(force: bool = False):
                                .get(account_key, {}).get(folder))
                 command_uids, _cmd_state_update = fetch_command_scan_uids(
                     conn, folder, logger, _cmd_stored)
+                # E1: Dry Run must never advance or persist the command-scan
+                # watermark. A preview tick may READ a reply (dropping it below
+                # the watermark AND clearing UNSEEN), so persisting a new
+                # watermark here would strand that reply forever. Force the
+                # folder's update to None — matching the fetch-failure
+                # suppression at ~7493 — so the stored watermark is left
+                # untouched and the first LIVE tick rescans the range
+                # (Message-ID dedup makes the rescan safe). This also keeps
+                # command_scan_state.json write-free in Dry Run (S4 purity):
+                # the only writer is the gated persist at the folder-loop tail.
+                if dry_run:
+                    _cmd_state_update = None
                 if command_uids:
                     logger.info(
                         f"  Command scan: {len(command_uids)} message(s) in "
@@ -7620,6 +7938,20 @@ def run_filter(force: bool = False):
                         mark_uid_seen(conn, uid, logger)
                         _record_processed(processed, account_key,
                                           account_processed, msg_id)
+                        # E4: if this auth-failed reply carries a token naming a
+                        # REAL open conversation, it is a genuine owner reply we
+                        # simply couldn't authenticate — leave it in the inbox
+                        # (already recorded above) instead of letting it fall
+                        # into classification, where an inherited spam subject
+                        # (E3) could junk it. Unmatched/forged tokens keep
+                        # today's classify behavior.
+                        if _reply_targets_pending_conversation(
+                                msg_data.get("subject", ""), pending, logger):
+                            logger.info(
+                                "  Auth-failed reply names a real pending "
+                                "conversation — left in inbox, not classified "
+                                "(E4).")
+                            continue
                         command = None
 
                     # Wave-4 at-most-once execution. The command scan now finds
@@ -7689,27 +8021,51 @@ def run_filter(force: bool = False):
                             bl_data = load_blacklist(logger)
                             addr_removed = False
                             name_removed = False
+                            # E6: set when a matching entry is RULE-owned (an
+                            # authored Unwanted-Categories rule wrote it). Such
+                            # entries are NOT deleted by value here — doing so
+                            # orphans the rule (its AI half keeps junking the
+                            # sender, and a later rule edit silently re-adds the
+                            # entry). We keep the entry and point the owner at
+                            # the Unwanted Categories tab instead.
+                            rule_skipped = False
 
                             if orig_addr:
                                 addrs = bl_data.get("addresses", [])
+                                target = orig_addr.lower()
                                 # _whitelist_addr_value is the generic entry
                                 # value extractor (plain string OR {"value",...}
                                 # dict since a02d7ea) — a raw a.lower() crashes
                                 # on a scoped dict entry. Keep the ORIGINAL entry
                                 # ``a`` in the kept list; never flatten on write.
-                                new_addrs = [a for a in addrs
-                                             if _whitelist_addr_value(a) != orig_addr.lower()]
-                                if len(new_addrs) != len(addrs):
+                                new_addrs = []
+                                for a in addrs:
+                                    if _whitelist_addr_value(a) == target:
+                                        if _entry_provenance_kind(a) == "rule":
+                                            rule_skipped = True
+                                            new_addrs.append(a)  # E6: keep it
+                                        else:
+                                            addr_removed = True
+                                    else:
+                                        new_addrs.append(a)
+                                if addr_removed:
                                     bl_data["addresses"] = new_addrs
-                                    addr_removed = True
 
                             if orig_name:
                                 names = bl_data.get("display_names", [])
-                                new_names = [n for n in names
-                                             if _whitelist_addr_value(n) != orig_name.strip().lower()]
-                                if len(new_names) != len(names):
+                                target_n = orig_name.strip().lower()
+                                new_names = []
+                                for n in names:
+                                    if _whitelist_addr_value(n) == target_n:
+                                        if _entry_provenance_kind(n) == "rule":
+                                            rule_skipped = True
+                                            new_names.append(n)  # E6: keep it
+                                        else:
+                                            name_removed = True
+                                    else:
+                                        new_names.append(n)
+                                if name_removed:
                                     bl_data["display_names"] = new_names
-                                    name_removed = True
 
                             if addr_removed or name_removed:
                                 save_blacklist(bl_data)
@@ -7723,15 +8079,40 @@ def run_filter(force: bool = False):
                                     lines_out.append(f"Display name removed: {orig_name}")
                                     logger.info(f"  [BLACKLIST] Removed display name: {orig_name}")
                                 removed_text = "\n".join(lines_out)
+                                # E6 (review fix): if a rule-owned entry for the
+                                # SAME sender was also matched (and kept), the
+                                # unconditional "will be evaluated by the spam
+                                # classifier" claim is false — the surviving
+                                # rule entry still blocks pre-classifier. Swap
+                                # in the honest rule note instead.
+                                if rule_skipped:
+                                    _bl_rm_status = _BLACKLIST_REMOVE_RULE_SKIPPED_BODY
+                                else:
+                                    _bl_rm_status = ("Future emails from this "
+                                                     "sender will be evaluated "
+                                                     "by the spam classifier.")
                                 send_email(
                                     config,
                                     f"Blacklist Removal Confirmed — {orig_name or orig_addr}",
                                     f"The following entries have been removed from the blacklist:\n\n"
                                     f"{removed_text}\n\n"
-                                    f"Future emails from this sender will be evaluated by the spam classifier.\n\n"
+                                    f"{_bl_rm_status}\n\n"
                                     f"To re-add: forward any email from this sender to yourself with\n"
                                     f"the subject line \"Fwd: Blacklist All\" (or \"Blacklist Address\"\n"
                                     f"or \"Blacklist Name\" for narrower blocking)."
+                                    + _conflict_note,
+                                    logger,
+                                    to_addr=account.get("username", ""),
+                                )
+                            elif rule_skipped:
+                                # E6: only a rule-owned entry matched — nothing
+                                # was removed by value. Do NOT claim the sender
+                                # is now evaluated by the classifier; point at
+                                # the rule's real home instead.
+                                send_email(
+                                    config,
+                                    f"Blacklist Removal — Managed by a Rule",
+                                    _BLACKLIST_REMOVE_RULE_SKIPPED_BODY
                                     + _conflict_note,
                                     logger,
                                     to_addr=account.get("username", ""),
@@ -7907,8 +8288,14 @@ CURRENT SIGNAL DEFINITIONS:
                             pending["conversations"].append(conv)
                             persist_pending_merge(pending, created_ids={sfid})
 
-                            # Send analysis email
+                            # Send analysis email. E3: name the original spam
+                            # subject in the BODY, never the subject line — an
+                            # owner subject-keyword rule matching the quoted spam
+                            # subject would otherwise junk this very mail (and
+                            # the owner's replies, which inherit the subject).
                             email_body = f"""Your false positive has been analyzed.
+
+About: "{fwd_data['original_subject']}"
 
 {analysis}
 
@@ -7937,13 +8324,17 @@ Conversation ID: {sfid}
                             # this sender, the legitimate refinement (once applied)
                             # can't override it at gate 2 — say so honestly and
                             # point at the right undo for what kind of block it is.
+                            # E7: pass signals so an active curate rule that
+                            # still covers this sender is also surfaced (the
+                            # function is fail-open on a bad signals dict).
                             _fp_bl_warn = _teach_legit_blacklist_warning(
                                 fwd_data.get("original_from", ""), blacklist,
-                                account_name=account.get("username", ""))
+                                account_name=account.get("username", ""),
+                                signals=signals)
                             if _fp_bl_warn:
                                 email_body += "\n\n" + _fp_bl_warn
 
-                            email_subject = f"Re: False Positive Analysis [{sfid}] — {fwd_data['original_subject'][:50]}"
+                            email_subject = f"Re: False Positive Analysis [{sfid}]"
                             send_email(config, email_subject, email_body, logger,
                                        to_addr=account.get("username", ""))
 
@@ -8816,11 +9207,21 @@ Conversation ID: {sfid}
                         mark_uid_seen(conn, uid, logger)
                         _record_processed(processed, account_key,
                                           account_processed, msg_id)
+                        # E4: a genuine owner reply to a real open SFID
+                        # conversation that we couldn't authenticate stays in
+                        # the inbox (already recorded) — never fall into
+                        # classification where an inherited spam subject (E3)
+                        # could junk it. A forged token finds no conversation
+                        # and keeps today's classify behavior.
+                        if _reply_targets_pending_conversation(
+                                msg_data.get("subject", ""), pending, logger):
+                            logger.info(
+                                "  Auth-failed [SFID] reply names a real "
+                                "pending conversation — left in inbox, not "
+                                "classified (E4).")
+                            continue
                         sfid_match = None
                     if sfid_match:
-                        # Persist-before-execute (at-most-once): record + flush
-                        # this reply's Message-ID before any handler side effect.
-                        _precommit_command()
                         sfid = f"SFID-{sfid_match.group(1)}"
 
                         # Check if this is our own outgoing analysis (not a user reply).
@@ -8851,6 +9252,13 @@ Conversation ID: {sfid}
                             _record_processed(processed, account_key,
                                               account_processed, msg_id)
                             continue
+                        # E9: past the own-mail guard this SFID reply WILL be
+                        # handled — every path below executes a handler and
+                        # continues (none falls through to classification), so
+                        # persist-before-execute exactly once here rather than on
+                        # bare token match. (An own-mail message returned above
+                        # without ever precommitting.)
+                        _precommit_command()
                         if not reply_text_check:
                             # Finding #11: an auth-gated OWNER reply we could
                             # not read — HTML with no visible text, a bottom-
@@ -9330,8 +9738,14 @@ USER'S FOLLOW-UP:
                                 })
                                 persist_pending_merge(pending, {sfid})
 
+                                # E3: keep the spam subject OUT of the subject
+                                # line; name it in the body. E5: fixed opening
+                                # ("MailWarden follow-up answer:") so this reply
+                                # is body-marker protected, not header-only.
                                 send_email(config,
-                                    f"Re: False Positive Analysis [{sfid}] — {conv.get('original_subject', '')[:40]}",
+                                    f"Re: False Positive Analysis [{sfid}]",
+                                    f"MailWarden follow-up answer:\n\n"
+                                    f"About: \"{conv.get('original_subject', '')}\"\n\n"
                                     f"{followup_reply}\n\n"
                                     f"========================================\n"
                                     f"Reply YES to apply, NO to reject, or ask another question.\n"
@@ -9350,7 +9764,7 @@ USER'S FOLLOW-UP:
                                 # registered in _own_prefixes (defense-in-depth).
                                 send_email(
                                     config,
-                                    f"Re: False Positive Analysis [{sfid}] — {conv.get('original_subject', '')[:40]}",
+                                    f"Re: False Positive Analysis [{sfid}]",
                                     _FP_FOLLOWUP_FAILED_BODY.format(sfid=sfid),
                                     logger,
                                     to_addr=account.get("username", ""))
@@ -9407,11 +9821,28 @@ USER'S FOLLOW-UP:
                         mark_uid_seen(conn, uid, logger)
                         _record_processed(processed, account_key,
                                           account_processed, msg_id)
+                        # E4: a genuine owner APPROVE/rule-review reply to a real
+                        # open [MWR-...] report that we couldn't authenticate
+                        # stays in the inbox (already recorded) rather than
+                        # falling into classification (inherited spam subject,
+                        # E3). A forged token finds no report and keeps today's
+                        # classify behavior.
+                        if _reply_targets_pending_conversation(
+                                msg_data.get("subject", ""), pending, logger):
+                            logger.info(
+                                "  Auth-failed [MWR] reply names a real "
+                                "pending report — left in inbox, not "
+                                "classified (E4).")
+                            continue
                         mwr_match = None
                     if mwr_match:
-                        # Persist-before-execute (at-most-once): record + flush
-                        # this reply's Message-ID before any handler side effect.
-                        _precommit_command()
+                        # E9: do NOT precommit on bare token match. An [MWR-...]
+                        # message whose reply parses to neither APPROVE nor a
+                        # rule-review verb is NOT a command — it must fall
+                        # through to classification WITHOUT its Message-ID
+                        # recorded, so a later failed junk move is retried. Each
+                        # genuine execution path below persists-before-execute
+                        # itself (exactly once).
                         mwr_token = mwr_match.group(1)
 
                         # Skip our own outgoing mail. The daily report ITSELF
@@ -9443,6 +9874,7 @@ USER'S FOLLOW-UP:
                             logger.info(
                                 f"  Unreadable MWR reply MWR-{mwr_token} — "
                                 f"sending could-not-read ack")
+                            _precommit_command()  # E9: persist before the ack send
                             send_email(config,
                                 f"Re: [MWR-{mwr_token}] — couldn't read your reply",
                                 _MWR_UNREADABLE_REPLY_BODY,
@@ -9454,6 +9886,7 @@ USER'S FOLLOW-UP:
 
                         approve_nums = parse_approve_command(reply_text)
                         if approve_nums:
+                            _precommit_command()  # E9: persist before executing approvals
                             logger.info(
                                 f"  APPROVE reply detected: MWR-{mwr_token} "
                                 f"items {approve_nums}")
@@ -9659,6 +10092,7 @@ USER'S FOLLOW-UP:
                         # review command (item (b)) before falling through.
                         review_cmd = parse_rule_review_command(reply_text)
                         if review_cmd:
+                            _precommit_command()  # E9: persist before executing the review
                             verb, review_nums = review_cmd
                             logger.info(
                                 f"  {verb} reply detected: MWR-{mwr_token} "

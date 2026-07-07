@@ -431,8 +431,12 @@ def test_branch_auth_failure_writes_nothing_and_notifies(monkeypatch):
                              approvals_store=_fresh_token_store())
     assert calls["add_approved_domain"] == []
     assert calls["notify_unverified"] == 1
-    # Falls through to normal classification (message judged as ordinary mail).
-    assert calls["classify_email"] == 1
+    # E4: the [MWR-abc123] token names a REAL open report (_fresh_token_store),
+    # so this is a genuine owner reply we merely couldn't authenticate. It is
+    # left in the inbox and NOT classified (an inherited spam subject, E3, could
+    # otherwise junk it). A forged/unknown token still falls through to
+    # classification — see test_e4_* in tests/test_wave5_fixes.py.
+    assert calls["classify_email"] == 0
 
 
 def test_branch_non_owner_ignored(monkeypatch):

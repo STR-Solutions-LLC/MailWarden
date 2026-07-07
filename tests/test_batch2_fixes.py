@@ -206,7 +206,10 @@ def test_fp_followup_api_failure_acks_owner(monkeypatch):
     acks = [(s, b) for (s, b) in calls["send_email_args"]
             if b == spam_filter._FP_FOLLOWUP_FAILED_BODY.format(sfid="SFID-FPX1")]
     assert len(acks) == 1, "exactly one honest follow-up failure ack"
-    assert acks[0][0] == "Re: False Positive Analysis [SFID-FPX1] — Receipt"
+    # E3: the original spam subject is no longer embedded in the subject line
+    # (an owner subject-keyword rule matching the quoted spam subject would junk
+    # our own mail); the token alone identifies the conversation.
+    assert acks[0][0] == "Re: False Positive Analysis [SFID-FPX1]"
 
 
 def test_followup_failed_ack_opening_in_own_prefixes():

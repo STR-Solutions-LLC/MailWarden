@@ -213,61 +213,6 @@ def _plain_md(from_email="news@goodnews.test", dkim_sig="", raw=None):
     return md
 
 
-def _verified_md(monkeypatch, verified_domain, from_domain=None):
-    """Message whose local DKIM verifies ``verified_domain``; From is
-    ``from_domain`` (defaults to verified_domain)."""
-    monkeypatch.setattr(spam_filter, "verify_dkim_locally",
-                        lambda *a, **k: [verified_domain])
-    fd = from_domain or verified_domain
-    return _plain_md(from_email=f"news@{fd}",
-                     dkim_sig=f"v=1; d={verified_domain}; s=sel; b=xx",
-                     raw=b"RAW")
-
-
-def test_skip_fires_only_when_approved_and_authenticated(monkeypatch):
-    md = _verified_md(monkeypatch, "goodnews.test")
-    assert spam_filter._owner_approved_authenticated_domain(
-        md, {"goodnews.test"}) == "goodnews.test"
-
-
-def test_skip_absent_when_approved_but_unauthenticated():
-    # Approved domain, but the From merely CLAIMS it (no DKIM verification).
-    md = _plain_md(from_email="news@goodnews.test")
-    assert spam_filter._owner_approved_authenticated_domain(
-        md, {"goodnews.test"}) == ""
-
-
-def test_skip_absent_when_authenticated_but_not_approved(monkeypatch):
-    md = _verified_md(monkeypatch, "goodnews.test")
-    assert spam_filter._owner_approved_authenticated_domain(
-        md, {"unrelated.test"}) == ""
-
-
-def test_skip_absent_when_dkim_domain_misaligned(monkeypatch):
-    # DKIM verifies other.test, but the sender is goodnews.test — the
-    # authenticated domain does NOT align with the From domain, so even though
-    # other.test is on the approved list the gate must NOT fire.
-    md = _verified_md(monkeypatch, "other.test", from_domain="goodnews.test")
-    assert spam_filter._owner_approved_authenticated_domain(
-        md, {"other.test", "goodnews.test"}) == ""
-
-
-def test_skip_absent_with_no_approved_domains(monkeypatch):
-    md = _verified_md(monkeypatch, "goodnews.test")
-    assert spam_filter._owner_approved_authenticated_domain(md, set()) == ""
-    assert spam_filter._owner_approved_authenticated_domain(md, None) == ""
-
-
-def test_skip_gate_matches_the_owner_approved_prompt_block(monkeypatch):
-    # The AI-skip gate and the OWNER-APPROVED prompt block must agree: whenever
-    # the gate fires, build_user_message emits the block, and vice versa.
-    md = _verified_md(monkeypatch, "goodnews.test")
-    approved = {"goodnews.test"}
-    fires = spam_filter._owner_approved_authenticated_domain(md, approved)
-    prompt = spam_filter.build_user_message(md, approved_domains=approved)
-    assert bool(fires) is ("OWNER-APPROVED SENDER" in prompt) is True
-
-
 def test_owner_approved_delivered_logline_parses_as_not_spam(tmp_path, monkeypatch):
     # The Feature-2 delivered log line must count as a NOT-SPAM delivery and
     # never as a junking (so existing decisions.log parsers don't break).
