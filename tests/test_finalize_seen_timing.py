@@ -14,13 +14,17 @@ was already \\Seen. Since the IMAP fetch only searches UNSEEN messages, a
 \\Seen-but-unrecorded message is never refetched: the owner's YES/NO/
 APPROVE/KEEP/DROP reply is silently and permanently lost.
 
-The fix (mirroring the existing W4 `_finalize_command` discipline used by
-the subject-line command handlers) removes the up-front mark and instead
-calls the same `_finalize_command()` closure at each branch's genuine
-success exit, right before its `continue`. These tests assert the crash
-contract directly: a mid-handler exception must leave the message UNSEEN
-and unrecorded (retryable next tick), while the happy path must still
-finalize exactly once (no regression).
+The fix removes the up-front \\Seen mark and instead calls `_finalize_command()`
+at each branch's genuine success exit. The \\Seen mark is now purely cosmetic.
+
+Wave-4 update: the reply corridor finds commands by UID watermark (read/unread
+agnostic), not by an UNSEEN search, so the OLD "leave UNSEEN + unrecorded on a
+crash so it's retried" contract became unsafe (a crash leaves the watermark
+un-advanced, so an execute-then-persist retry would RE-EXECUTE the command).
+Each command now persists its Message-ID to processed_ids BEFORE the handler
+runs (`_precommit_command`), so the loop-top dedup gives AT-MOST-ONCE: these
+crash tests assert the reply IS recorded (can't re-execute) but NOT \\Seen,
+while the happy path still finalizes exactly once (no regression).
 
 Harness style mirrors tests/test_rule_review.py's `_rr_harness` /
 tests/test_cascade.py's `_run_filter_cascade_harness` — a full
@@ -210,10 +214,13 @@ def _block_sender_conv(expires_days=1):
 # SFID reply branch
 # ═════════════════════════════════════════════════════════════════════════
 
-def test_sfid_reply_crash_leaves_message_retryable(monkeypatch):
-    """A mid-handler exception (persist_pending_merge raising, e.g. a
-    signals.json I/O error) must leave the reply UNSEEN and unrecorded so
-    the next tick retries it, instead of losing the owner's YES forever."""
+def test_sfid_reply_crash_records_at_most_once_not_seen(monkeypatch):
+    """Wave-4 at-most-once: a mid-handler exception (persist_pending_merge
+    raising) has ALREADY recorded the reply's Message-ID (persist-before-
+    execute), so the loop-top dedup suppresses it next tick — the corridor now
+    finds replies by UID watermark, so an execute-then-persist retry would
+    RE-EXECUTE the YES. The cosmetic \\Seen mark is not set (finalize only runs
+    at the success exit)."""
     def _boom(pending, touched_ids=(), **k):
         raise RuntimeError("disk full")
     msg = _base_msg("Re: [SFID-TEST1] Block sender?", "YES")
@@ -222,8 +229,9 @@ def test_sfid_reply_crash_leaves_message_retryable(monkeypatch):
         patches={"persist_pending_merge": _boom})
     assert calls["mark_uid_seen"] == 0, (
         "crash must NOT mark the message Seen")
-    assert msg["message_id"] not in _msg_ids_recorded(calls), (
-        "crash must NOT record the message processed")
+    assert msg["message_id"] in _msg_ids_recorded(calls), (
+        "Wave-4: the reply's Message-ID is persisted BEFORE the handler runs "
+        "(at-most-once), so a crash can't re-execute the command next tick")
 
 
 def test_sfid_reply_happy_path_finalizes_once(monkeypatch):
@@ -304,9 +312,10 @@ def _approve_store(token="tok1"):
     }}
 
 
-def test_mwr_approve_crash_leaves_message_retryable(monkeypatch):
-    """A mid-handler exception (add_approved_domain raising, e.g. memory/
-    missing) must leave the APPROVE reply UNSEEN and unrecorded."""
+def test_mwr_approve_crash_records_at_most_once_not_seen(monkeypatch):
+    """Wave-4 at-most-once: a mid-handler exception (add_approved_domain
+    raising) has ALREADY recorded the APPROVE reply's Message-ID (persist-
+    before-execute), so it can't re-execute next tick; \\Seen stays unset."""
     def _boom(domain, logger):
         raise RuntimeError("memory/ missing")
     msg = _base_msg("Re: MailWarden Report — July 03 [MWR-tok1]",
@@ -315,7 +324,7 @@ def test_mwr_approve_crash_leaves_message_retryable(monkeypatch):
         monkeypatch, msg_data=msg, approvals_store=_approve_store(),
         patches={"add_approved_domain": _boom})
     assert calls["mark_uid_seen"] == 0
-    assert msg["message_id"] not in _msg_ids_recorded(calls)
+    assert msg["message_id"] in _msg_ids_recorded(calls)
 
 
 def test_mwr_approve_happy_path_finalizes_once(monkeypatch):
@@ -342,9 +351,10 @@ def _review_store(token="tok1"):
     }}
 
 
-def test_mwr_keepdrop_crash_leaves_message_retryable(monkeypatch):
-    """A mid-handler exception (retire_ai_refinement raising) must leave the
-    DROP reply UNSEEN and unrecorded."""
+def test_mwr_keepdrop_crash_records_at_most_once_not_seen(monkeypatch):
+    """Wave-4 at-most-once: a mid-handler exception (retire_ai_refinement
+    raising) has ALREADY recorded the DROP reply's Message-ID (persist-before-
+    execute), so it can't re-execute next tick; \\Seen stays unset."""
     def _boom(rid, logger):
         raise RuntimeError("signals.json locked")
     msg = _base_msg("Re: MailWarden Report — July 03 [MWR-tok1]", "DROP 1")
@@ -352,7 +362,7 @@ def test_mwr_keepdrop_crash_leaves_message_retryable(monkeypatch):
         monkeypatch, msg_data=msg, approvals_store=_review_store(),
         patches={"retire_ai_refinement": _boom})
     assert calls["mark_uid_seen"] == 0
-    assert msg["message_id"] not in _msg_ids_recorded(calls)
+    assert msg["message_id"] in _msg_ids_recorded(calls)
 
 
 def test_mwr_keepdrop_happy_path_finalizes_once(monkeypatch):

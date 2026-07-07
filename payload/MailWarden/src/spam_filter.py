@@ -87,6 +87,16 @@ PARSE_FAILURES_DIR = PROJECT_ROOT / "memory" / "classify_parse_failures"
 # signal-history totals) never reset to zero. There is exactly ONE such store.
 LIFETIME_STATS_PATH = PROJECT_ROOT / "memory" / "lifetime_stats.json"
 
+# Wave-4 reply-corridor state. Per (account, folder, UIDVALIDITY) high-UID
+# watermark so the owner's YES/APPROVE/numbered command replies are picked up
+# by a UID-range scan (watermark+1:*) instead of an UNSEEN search — the reply
+# is honored whether or not the owner's mail client has already marked it read.
+COMMAND_SCAN_STATE_PATH = PROJECT_ROOT / "memory" / "command_scan_state.json"
+# First run (no stored watermark) or a UIDVALIDITY reset falls back to a
+# bounded SINCE lookback instead of a full-mailbox scan, so upgrading an
+# existing install can never re-execute months of already-read old replies.
+COMMAND_SCAN_LOOKBACK_DAYS = 7
+
 # F1 sender-history evidence. Surface an established sender's DELIVERED track
 # record (this filter's own past NOT_SPAM verdicts) to the classifier, since
 # "DKIM proves identity, not reputation". Strictly ASYMMETRIC: the line only
@@ -262,6 +272,42 @@ def save_last_filter_run(when: datetime) -> None:
         with os.fdopen(fd, "w") as f:
             json.dump({"last_run": when.astimezone(timezone.utc).isoformat()}, f, indent=2)
         os.replace(tmp_path, LAST_FILTER_RUN_PATH)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+def load_command_scan_state() -> dict:
+    """Load the reply-corridor watermark store (memory/command_scan_state.json).
+
+    Shape: {"version","last_updated","folders": {<account_key>: {<folder>:
+    {"uidvalidity": int, "uid_watermark": int}}}}. A missing/malformed file
+    returns the safe empty default so a first run falls back to the bounded
+    SINCE lookback per folder."""
+    try:
+        with open(COMMAND_SCAN_STATE_PATH, "r") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {"version": "1.0", "last_updated": "", "folders": {}}
+    if not isinstance(data.get("folders"), dict):
+        data["folders"] = {}
+    return data
+
+
+def save_command_scan_state(data: dict) -> None:
+    """Atomic write (mkstemp + os.replace), same pattern as
+    save_last_filter_run. spam_filter is the only writer; the run-flock
+    guarantees a single instance."""
+    data["last_updated"] = datetime.now().isoformat()
+    COMMAND_SCAN_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=COMMAND_SCAN_STATE_PATH.parent, suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, COMMAND_SCAN_STATE_PATH)
     except Exception:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -6308,6 +6354,91 @@ def fetch_unseen_uids(conn: imaplib.IMAP4_SSL, folder: str,
     return uids
 
 
+def _imap_status_value(conn: imaplib.IMAP4_SSL, folder: str, key: str):
+    """Return the integer STATUS value for *key* (e.g. "UIDVALIDITY",
+    "UIDNEXT") of *folder*, or None if it can't be read/parsed. Used by the
+    reply-corridor command scan; any failure disables the incremental scan
+    (the caller falls back to the SINCE lookback) rather than dropping mail."""
+    try:
+        status, data = conn.status(folder, f"({key})")
+    except Exception:
+        return None
+    if status != "OK" or not data or not data[0]:
+        return None
+    raw = data[0]
+    if isinstance(raw, bytes):
+        raw = raw.decode("ascii", "replace")
+    m = re.search(rf"{key}\s+(\d+)", raw)
+    return int(m.group(1)) if m else None
+
+
+def fetch_command_scan_uids(conn: imaplib.IMAP4_SSL, folder: str,
+                            logger: logging.Logger, stored_entry):
+    """Reply-corridor command scan for one folder — read/unread agnostic.
+
+    Returns ``(uids, new_entry)`` where ``uids`` is the list of UID bytes to
+    inspect for owner commands this tick and ``new_entry`` is the watermark
+    state to persist AFTER processing ({"uidvalidity": int, "uid_watermark":
+    int}), or ``([], None)`` if the folder can't be selected/searched (the
+    caller then leaves the stored entry untouched and scans nothing).
+
+    - Incremental: when *stored_entry* exists and its UIDVALIDITY still matches,
+      search ``UID (watermark+1):*`` so ONLY messages newer than the last
+      watermark are inspected — read state is irrelevant.
+    - First run (no stored entry) OR a UIDVALIDITY mismatch (mailbox rebuilt):
+      fall back to a bounded ``SINCE`` lookback so an upgrade never re-executes
+      months of already-read old replies; the new UIDVALIDITY is stored.
+    The new watermark is UIDNEXT-1 (the highest UID that can currently exist),
+    so the next tick resumes cleanly from genuinely new mail.
+    """
+    try:
+        status, _ = conn.select(folder)
+        if status != "OK":
+            return [], None
+        uidvalidity = _imap_status_value(conn, folder, "UIDVALIDITY")
+        if uidvalidity is None:
+            return [], None
+        uidnext = _imap_status_value(conn, folder, "UIDNEXT")
+
+        incremental = (
+            isinstance(stored_entry, dict)
+            and stored_entry.get("uidvalidity") == uidvalidity
+            and isinstance(stored_entry.get("uid_watermark"), int))
+
+        if incremental:
+            watermark = int(stored_entry["uid_watermark"])
+            # The explicit "UID" search KEY is required: in a SEARCH command a
+            # bare number set means message SEQUENCE numbers (RFC 3501/9051
+            # §6.4.8), even inside UID SEARCH — which would collapse to only
+            # the highest message on any mailbox where watermark+1 > EXISTS.
+            status_s, data = conn.uid(
+                "SEARCH", None, "UID", f"{watermark + 1}:*")
+        else:
+            since = (datetime.now() - timedelta(days=COMMAND_SCAN_LOOKBACK_DAYS)
+                     ).strftime("%d-%b-%Y")
+            watermark = 0
+            status_s, data = conn.uid("SEARCH", None, "SINCE", since)
+
+        if status_s != "OK":
+            return [], None
+        raw_uids = data[0].split() if (data and data[0]) else []
+        # Filter the incremental range's boundary re-match: IMAP treats
+        # "N:*" as "the highest message" even when N exceeds it, so drop
+        # anything not strictly newer than the watermark.
+        uids = [u for u in raw_uids if u.isdigit() and int(u) > watermark]
+
+        highest_seen = max((int(u) for u in uids), default=watermark)
+        new_watermark = max(
+            watermark,
+            (uidnext - 1) if uidnext else highest_seen,
+            highest_seen)
+        return uids, {"uidvalidity": uidvalidity,
+                      "uid_watermark": new_watermark}
+    except Exception as e:
+        logger.debug(f"  Command scan setup failed for {folder}: {e}")
+        return [], None
+
+
 def fetch_raw_email(conn: imaplib.IMAP4_SSL, uid: bytes,
                     logger: logging.Logger) -> bytes:
     """Fetch the full raw email for a given UID using PEEK to avoid marking as read."""
@@ -7081,6 +7212,10 @@ def run_filter(force: bool = False):
     deliver_eula_if_needed(config, logger)
 
     processed = load_processed_ids()
+    # Wave-4 reply-corridor watermark store (per account+folder UID high-water
+    # mark). Drives the read/unread-agnostic command scan below; advanced +
+    # persisted per folder after each folder's scan completes.
+    command_scan_state = load_command_scan_state()
     # Finding #12: the dry-run sidecar of already-classified messages. Loaded
     # (and later consulted/flushed) ONLY in Dry Run — a real run ignores it
     # entirely, so every sidecar'd message gets one fresh classification and
@@ -7271,23 +7406,52 @@ def run_filter(force: bool = False):
 
             for folder in account.get("folders_to_scan", ["INBOX"]):
                 logger.info(f"  Scanning folder: {folder}")
-                uids = fetch_unseen_uids(conn, folder, logger)
-                logger.info(f"  Found {len(uids)} UNSEEN messages")
+                unseen_uids = fetch_unseen_uids(conn, folder, logger)
+                logger.info(f"  Found {len(unseen_uids)} UNSEEN messages")
 
-                for uid in uids:
-                    if total_evaluated >= max_per_run:
-                        logger.info(f"  Reached max_emails_per_run ({max_per_run}), stopping")
-                        break
-                    # C5b: stop before classifying any further message once the
-                    # per-run junk-action cap is hit. The break is at the loop
-                    # top, before any fetch/classify, so remaining messages stay
-                    # UNSEEN and UNCLASSIFIED with no API spend.
-                    if junk_actions_this_run >= max_junk_actions:
-                        logger.info(
-                            f"  Reached max_junk_actions_per_run "
-                            f"({max_junk_actions}); stopping — remaining "
-                            f"messages left unseen for the next run")
-                        break
+                # Wave-4 reply corridor: scan for owner command replies by UID
+                # watermark (or a bounded SINCE lookback on first run /
+                # UIDVALIDITY reset), NOT by UNSEEN — so a YES/APPROVE/numbered
+                # reply is honored whether or not the owner's mail client has
+                # already marked it read. This set is processed FIRST and is
+                # exempt from the per-run caps below (commands are cheap and
+                # owner-initiated; a junk backlog must never starve them).
+                _cmd_stored = (command_scan_state.get("folders", {})
+                               .get(account_key, {}).get(folder))
+                command_uids, _cmd_state_update = fetch_command_scan_uids(
+                    conn, folder, logger, _cmd_stored)
+                if command_uids:
+                    logger.info(
+                        f"  Command scan: {len(command_uids)} message(s) in "
+                        f"the reply window")
+                unseen_set = set(unseen_uids)
+                command_set = set(command_uids)
+                # Command-scan UIDs first (uncapped), then the UNSEEN classify
+                # tail (deduped so a message in both is visited once).
+                ordered_uids = command_uids + [u for u in unseen_uids
+                                               if u not in command_set]
+
+                for uid in ordered_uids:
+                    is_command_scan = uid in command_set
+                    classify_eligible = uid in unseen_set
+                    # Caps gate ONLY classification-bound (UNSEEN) messages.
+                    # Command-scan UIDs are ordered first and never break the
+                    # loop, so once we reach the classify tail and a cap is hit
+                    # we can stop — remaining messages stay UNSEEN + UNCLASSIFIED
+                    # (no API spend) exactly as before, but pending owner
+                    # commands were already handled above.
+                    if not is_command_scan:
+                        if total_evaluated >= max_per_run:
+                            logger.info(f"  Reached max_emails_per_run ({max_per_run}), stopping")
+                            break
+                        # C5b: stop before classifying any further message once
+                        # the per-run junk-action cap is hit.
+                        if junk_actions_this_run >= max_junk_actions:
+                            logger.info(
+                                f"  Reached max_junk_actions_per_run "
+                                f"({max_junk_actions}); stopping — remaining "
+                                f"messages left unseen for the next run")
+                            break
 
                     # Finding #20: fetch ONLY the Message-ID header first and,
                     # if we have already handled this exact message, skip the
@@ -7316,6 +7480,17 @@ def run_filter(force: bool = False):
                     raw = fetch_raw_email(conn, uid, logger)
                     if raw is None:
                         total_errors += 1
+                        # Wave-4: a failed fetch of a COMMAND-SCAN UID must not
+                        # be lost — its Message-ID was never recorded, so
+                        # advancing the watermark past it would permanently skip
+                        # the command (outside the approved at-most-once trade,
+                        # which only drops a command after precommit). Suppress
+                        # this folder's watermark persist for this tick; the
+                        # next tick rescans the same range, and Message-ID
+                        # dedup makes the rescan safe for everything else. (An
+                        # expunged message being rescanned once is harmless.)
+                        if is_command_scan:
+                            _cmd_state_update = None
                         continue
 
                     msg_data = extract_email_data(raw, own_hosts=own_hosts)
@@ -7447,25 +7622,40 @@ def run_filter(force: bool = False):
                                           account_processed, msg_id)
                         command = None
 
-                    # W4: a command handler is only finalized (marked \\Seen +
-                    # recorded in processed_ids) AFTER it has run to completion.
-                    # Each handler's success exit point calls _finalize_command()
-                    # right before its `continue`. If a handler raises mid-way,
-                    # the message is left UNSEEN and unrecorded, so the next tick
-                    # retries it instead of silently dropping the command.
-                    # Also shared (finding #4, audit 2026-07-03) by every genuine
-                    # success exit in the SFID reply branch (`if sfid_match:`
-                    # below) and the MWR reply branch (`if mwr_match:`, APPROVE
-                    # and KEEP/DROP sub-cases) — those branches used to mark
-                    # \\Seen up front, before the reply was actually processed,
-                    # so a mid-handler exception left the owner's YES/NO/APPROVE/
-                    # KEEP/DROP reply \\Seen but never recorded, and the UNSEEN-
-                    # only IMAP search would never refetch it. They now call
-                    # this same closure only at their success exits.
+                    # Wave-4 at-most-once execution. The command scan now finds
+                    # replies by UID watermark (read/unread agnostic), so the
+                    # old W4 "leave UNSEEN + unrecorded on a mid-handler crash so
+                    # the UNSEEN search retries it" contract is UNSAFE: after a
+                    # crash the watermark never advances, so an execute-then-
+                    # persist handler would RE-EXECUTE the command on the next
+                    # tick (double-approve / double-block). Instead we persist
+                    # this command's Message-ID to processed_ids and FLUSH it to
+                    # disk BEFORE running the handler (_precommit_command). The
+                    # loop-top Message-ID dedup then suppresses it next tick even
+                    # if the process crashed mid-handler — at-most-once. Matt-
+                    # approved trade: a crash mid-execution drops that one command
+                    # and the owner re-sends it (a fresh Message-ID).
+                    #
+                    # _finalize_command() still runs at each handler's genuine
+                    # success exit; its \\Seen mark is now purely cosmetic (no
+                    # logic depends on it), and its _record_processed is an
+                    # idempotent no-op after the precommit.
+                    def _precommit_command():
+                        _record_processed(processed, account_key,
+                                          account_processed, msg_id)
+                        persist_progress(processed, token_usage, token_delta)
+
                     def _finalize_command():
                         mark_uid_seen(conn, uid, logger)
                         _record_processed(processed, account_key,
                                           account_processed, msg_id)
+
+                    # Persist-before-execute for authorized subject commands
+                    # (dry-run + non-owner + auth-fail already set command=None
+                    # above, so this fires only for a genuine, authorized,
+                    # live-run command).
+                    if command:
+                        _precommit_command()
 
                     # --- Command: Remove from Blacklist ---
                     if command == "Remove from Blacklist":
@@ -7727,10 +7917,9 @@ Reply YES to apply the proposed signal change.
 Reply NO to keep signals unchanged.
 Reply with any question to continue this conversation.
 
-IMPORTANT: MailWarden only reads UNREAD emails in your inbox. After
-you reply, if your mail client marks your sent reply as read, please
-mark it unread again so MailWarden can pick up your answer on its
-next 15-minute tick. (The reply is the one MailWarden itself will
+Just reply normally. MailWarden picks up your answer on its next
+15-minute tick whether or not the reply has been read -- you don't
+need to keep it unread. (The reply is the one MailWarden itself will
 see arriving back in your inbox -- not this message.)
 
 This proposal expires in 7 days.
@@ -8629,6 +8818,9 @@ Conversation ID: {sfid}
                                           account_processed, msg_id)
                         sfid_match = None
                     if sfid_match:
+                        # Persist-before-execute (at-most-once): record + flush
+                        # this reply's Message-ID before any handler side effect.
+                        _precommit_command()
                         sfid = f"SFID-{sfid_match.group(1)}"
 
                         # Check if this is our own outgoing analysis (not a user reply).
@@ -9217,6 +9409,9 @@ USER'S FOLLOW-UP:
                                           account_processed, msg_id)
                         mwr_match = None
                     if mwr_match:
+                        # Persist-before-execute (at-most-once): record + flush
+                        # this reply's Message-ID before any handler side effect.
+                        _precommit_command()
                         mwr_token = mwr_match.group(1)
 
                         # Skip our own outgoing mail. The daily report ITSELF
@@ -9585,6 +9780,21 @@ USER'S FOLLOW-UP:
                         # Empty parse => not a command: fall through to normal
                         # classification below.
 
+                    # Wave-4 reply corridor: a message reaches classification
+                    # only because it was NOT a command. The command scan is
+                    # read/unread agnostic and must NEVER classify already-read
+                    # mail — a UID pulled in ONLY by the command scan (not also
+                    # UNSEEN) is left untouched here. And an UNSEEN message that
+                    # ALSO appeared in the command scan still honors the per-run
+                    # caps (which the command-scan ordering deliberately bypassed
+                    # at the top of the loop).
+                    if not classify_eligible:
+                        continue
+                    if is_command_scan and (
+                            total_evaluated >= max_per_run
+                            or junk_actions_this_run >= max_junk_actions):
+                        continue
+
                     # Audit 2026-07-06 Part A/B: when set, this message is a
                     # whitelisted sender being ROUTED to the AI (not instantly
                     # delivered) because the account has an active curate rule
@@ -9807,49 +10017,16 @@ USER'S FOLLOW-UP:
                         total_evaluated += 1
                         continue
 
-                    # --- Owner-approved + authenticated: deliver without AI ---
-                    # Cost optimization ONLY: if the sender's from-domain is one
-                    # the owner explicitly approved AND the message is
-                    # cryptographically verified+aligned to that domain (the SAME
-                    # bar RULE 1 / the OWNER-APPROVED prompt block enforce, via the
-                    # shared _match_approved_domain logic), deliver without any AI
-                    # call. Any doubt about auth alignment -> "" -> fall through to
-                    # the normal AI path. Runs AFTER the list + pre-classifier
-                    # gates, so a hard-signal junk still wins.
-                    approved_domain = _owner_approved_authenticated_domain(
-                        msg_data, approved_domains)
-                    # Audit 2026-07-06 C2: the owner's OWN category (curate) rule
-                    # OUTRANKS a prior approval of the sender. If this account has
-                    # an active, in-scope AI-enforced curate rule, do NOT skip the
-                    # AI here — route the message through the classifier (which
-                    # carries RULE 0's curate override) so a clear match can still
-                    # be junked. Deterministic curate rules already fired earlier.
-                    # Part D fix: account_curate_active is keyed on the account
-                    # USERNAME (email) — the identifier the curate rule's scope
-                    # store uses — so an inbox-scoped curate rule actually fires
-                    # (the prior code passed the display name and silently missed).
-                    if approved_domain and account_curate_active:
-                        approved_domain = ""
-                    if approved_domain:
-                        total_evaluated += 1
-                        logger.info(
-                            "  OWNER-APPROVED + AUTHENTICATED "
-                            f"({approved_domain}) — delivering without AI review")
-                        approved_result = {
-                            "decision": "NOT_SPAM",
-                            "confidence": 0.0,
-                            "signals_hit": [],
-                        }
-                        approved_action = (
-                            "No action taken — owner-approved + authenticated "
-                            f"sender ({approved_domain}), delivered without AI "
-                            "review")
-                        log_decision(account_name, msg_data, approved_result,
-                                     approved_action)
-                        record_pre_classifier_skip(token_usage, delta=token_delta)
-                        _record_processed(processed, account_key,
-                                          account_processed, msg_id)
-                        continue
+                    # --- Owner-approved + authenticated: ALWAYS screened by AI ---
+                    # Wave-4 (Matt option b): approved-sender mail is no longer
+                    # delivered without AI review. Every approved + authenticated
+                    # message routes to the classifier below, which carries the
+                    # OWNER-APPROVED prompt block (build_classifier_prompt with
+                    # approvals_active) and RULE 0's phishing/curate overrides —
+                    # so RULE 0's protections are live in production for approved
+                    # senders. The list + pre-classifier gates above still run
+                    # first, so a hard-signal junk still wins. (The old cost-skip
+                    # gate that short-circuited to a no-AI delivery was removed.)
 
                     # Finding #12: in Dry Run, a message already classified in
                     # a prior tick is recorded in the dry-run sidecar. Skip it
@@ -9988,6 +10165,21 @@ USER'S FOLLOW-UP:
                         # messages deliberately left out of processed_ids.
                         _record_processed(dry_verdicts, account_key,
                                           account_dry_seen, msg_id)
+
+                # Wave-4: advance + persist this folder's command-scan watermark
+                # now that its command replies have all been processed (they are
+                # ordered first and never break the uid loop, so an inner cap
+                # break cannot skip them). A None update means the folder could
+                # not be scanned this tick — leave the stored watermark untouched.
+                if _cmd_state_update is not None:
+                    command_scan_state.setdefault("folders", {}).setdefault(
+                        account_key, {})[folder] = _cmd_state_update
+                    try:
+                        save_command_scan_state(command_scan_state)
+                    except Exception as e:
+                        logger.warning(
+                            f"  Could not persist command-scan watermark for "
+                            f"{folder}: {e}")
 
                 # Break out of folder loop if max reached
                 if total_evaluated >= max_per_run:

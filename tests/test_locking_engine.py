@@ -299,12 +299,15 @@ def test_t5b_persist_progress_is_called_per_account_in_source():
     assert the wiring is present rather than building a fragile mega-mock."""
     import inspect
     src = inspect.getsource(spam_filter.run_filter)
-    # Two call sites: one per-account, one final flush.
+    # Call sites: the Wave-4 persist-before-execute precommit (inside the uid
+    # loop), one per-account flush, and one final flush.
     assert src.count("persist_progress(processed, token_usage, token_delta)") >= 2
     # The per-account call sits after conn.logout()'s finally and before the
-    # break that honors max_emails_per_run.
+    # break that honors max_emails_per_run. Search AFTER the finally so the
+    # earlier in-loop precommit call is not what we anchor on.
     finally_idx = src.index("conn.logout()")
-    persist_idx = src.index("persist_progress(processed, token_usage, token_delta)")
+    persist_idx = src.index(
+        "persist_progress(processed, token_usage, token_delta)", finally_idx)
     break_idx = src.index("if total_evaluated >= max_per_run:\n            break")
     assert finally_idx < persist_idx < break_idx
 

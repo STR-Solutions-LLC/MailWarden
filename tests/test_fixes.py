@@ -4260,15 +4260,19 @@ def test_w4_successful_command_marks_seen_and_records(monkeypatch):
     assert "<cmd-1@example.com>" in recorded, "Successful command must be recorded"
 
 
-def test_w4_handler_failure_leaves_unseen_and_unrecorded(monkeypatch):
-    """W4: if a handler raises mid-execution, message must NOT be \\Seen / recorded."""
+def test_w4_handler_failure_records_at_most_once_not_seen(monkeypatch):
+    """Wave-4 at-most-once: persist-before-execute means a handler that raises
+    mid-execution has ALREADY recorded the command's Message-ID (so the loop-top
+    dedup suppresses it next tick — no double-execution), but the cosmetic
+    \\Seen mark, which runs only at the handler's success exit, is NOT set."""
     import spam_filter
     conn_calls, recorded = _w4_harness(monkeypatch, handler_raises=True)
     spam_filter.run_filter(force=True)
     assert not _seen_store_calls(conn_calls), \
         "A handler that raises before finalize must NOT mark \\Seen"
-    assert "<cmd-1@example.com>" not in recorded, \
-        "A handler that raises before finalize must NOT record the command"
+    assert "<cmd-1@example.com>" in recorded, \
+        ("Wave-4: the command's Message-ID must be recorded BEFORE the handler "
+         "runs (at-most-once), so a crash can't re-execute it next tick")
 
 
 def test_w4_auth_rejection_still_marks_seen(monkeypatch):
