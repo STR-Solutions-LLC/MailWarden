@@ -250,7 +250,8 @@ def _approve_harness(monkeypatch, *, msg_data, dry_run=False,
                         lambda processed, tu, td: None)
     monkeypatch.setattr(spam_filter, "build_classifier_prompt",
                         lambda signals, username=None,
-                        approvals_active=False: "PROMPT")
+                        approvals_active=False,
+                        whitelist_curate_active=False: "PROMPT")
     monkeypatch.setattr(spam_filter, "_maybe_send_dry_run_reminder",
                         lambda config, accounts, logger: None)
     monkeypatch.setattr(spam_filter, "prune_decisions_log", lambda: None)
@@ -810,6 +811,165 @@ def test_build_classifier_prompt_default_byte_identical_to_no_flag():
 
 
 # ═════════════════════════════════════════════════════════════════════════
+# Audit 2026-07-06 Part A/B: the owner's own curate rule outranks a whitelist
+# (domain at gate 4, APPROVE-sourced address at gate 1). RULE 0 (WHITELIST) +
+# OWNER-WHITELISTED block; whitelist store address provenance.
+# ═════════════════════════════════════════════════════════════════════════
+
+def test_rule0w_curate_only_override_no_forgery_or_money():
+    # The whitelist twin protects the sender from EVERYTHING except a clear
+    # curate match — it must NOT carry RULE 0's forgery / money / unrelated-link
+    # overrides (the whitelist is not auth-gated and today delivers outright).
+    t = spam_filter.RULE_0W_TEXT
+    assert "OWNER-WHITELISTED SENDER" in t
+    assert "USER PREFERENCE (curate) rule" in t  # matches the prompt's wording
+    assert "outranks the whitelist" in t
+    assert "forged" not in t and "impersonated" not in t
+    assert "money" not in t and "credentials" not in t
+    assert "unrelated" not in t
+
+
+def test_build_classifier_prompt_whitelist_curate_splices_rule0w():
+    p = spam_filter.build_classifier_prompt(
+        {"signals": {}}, whitelist_curate_active=True)
+    assert spam_filter.RULE_0W_TEXT in p
+    assert spam_filter.RULE_0W_SUBORDINATION_LINE in p
+    assert p.index("RULE 0 (WHITELIST)") < p.index("RULE 1 —")
+
+
+def test_build_classifier_prompt_whitelist_curate_default_byte_identical():
+    sig = {"signals": {}}
+    assert (spam_filter.build_classifier_prompt(sig)
+            == spam_filter.build_classifier_prompt(
+                sig, whitelist_curate_active=False))
+    assert "RULE 0 (WHITELIST)" not in spam_filter.build_classifier_prompt(sig)
+
+
+def test_build_user_message_emits_owner_whitelisted_block():
+    msg = {"from_email": "promo@shop.test", "from_display_name": "Shop",
+           "subject": "Sale", "plain_text_body": "Big sale today"}
+    with_block = spam_filter.build_user_message(msg, whitelisted_sender="shop.test")
+    assert "OWNER-WHITELISTED SENDER" in with_block
+    assert "shop.test" in with_block
+    assert "USER PREFERENCE (curate) rules" in with_block
+
+
+def test_build_user_message_no_whitelisted_sender_byte_identical():
+    msg = {"from_email": "promo@shop.test", "from_display_name": "Shop",
+           "subject": "Sale", "plain_text_body": "Big sale today"}
+    assert (spam_filter.build_user_message(msg)
+            == spam_filter.build_user_message(msg, whitelisted_sender=""))
+    assert "OWNER-WHITELISTED" not in spam_filter.build_user_message(msg)
+
+
+def test_classify_email_forwards_whitelisted_sender(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(spam_filter, "build_user_message",
+                        lambda *a, **k: (seen.update(k) or "MSG"))
+    monkeypatch.setattr(spam_filter, "_classify_once",
+                        lambda *a, **k: ({"decision": "NOT_SPAM"}, None))
+    spam_filter.classify_email(None, "SYS", {"from_email": "a@b.test"},
+                               "model", 500, _LOGGER,
+                               whitelisted_sender="b.test")
+    assert seen.get("whitelisted_sender") == "b.test"
+
+
+def test_classify_email_cascade_forwards_whitelisted_sender(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(spam_filter, "build_user_message",
+                        lambda *a, **k: (seen.update(k) or "MSG"))
+    monkeypatch.setattr(spam_filter, "_classify_once",
+                        lambda *a, **k: ({"decision": "NOT_SPAM",
+                                          "confidence": 0.0}, None))
+    spam_filter.classify_email_cascade(
+        None, "SYS", {"from_email": "a@b.test"}, "screen", "confirm", 500,
+        0.85, _LOGGER, whitelisted_sender="b.test")
+    assert seen.get("whitelisted_sender") == "b.test"
+
+
+# --- Part B: whitelist address provenance (APPROVE-sourced vs hand-typed) ---
+def test_add_whitelist_address_writes_provenance_dict(tmp_path, monkeypatch):
+    p = tmp_path / "whitelist.json"
+    p.write_text(json.dumps({"addresses": [], "domains": []}))
+    monkeypatch.setattr(spam_filter, "WHITELIST_PATH", p)
+    assert spam_filter.add_whitelist_address("Foo@Gmail.com", _LOGGER) is True
+    stored = json.loads(p.read_text())
+    assert stored["addresses"] == [{"value": "foo@gmail.com",
+                                    "provenance": "approve"}]
+    # dedupe against the dict entry's value
+    assert spam_filter.add_whitelist_address("foo@gmail.com", _LOGGER) is False
+
+
+def test_load_whitelist_tolerates_dicts_and_builds_approve_set(tmp_path, monkeypatch):
+    p = tmp_path / "whitelist.json"
+    p.write_text(json.dumps({"addresses": [
+        "typed@hand.test",                                   # legacy/hand-typed
+        {"value": "rescued@gmail.com", "provenance": "approve"}]}))
+    monkeypatch.setattr(spam_filter, "WHITELIST_PATH", p)
+    wl = spam_filter.load_whitelist(_LOGGER)
+    assert wl["_addresses_set"] == {"typed@hand.test", "rescued@gmail.com"}
+    # Only the APPROVE-sourced value is in the approve set — the hand-typed
+    # string keeps absolute trump (never routed).
+    assert wl["_addresses_approve_set"] == {"rescued@gmail.com"}
+
+
+def test_whitelist_addr_helpers():
+    assert spam_filter._whitelist_addr_value("A@B.test") == "a@b.test"
+    assert spam_filter._whitelist_addr_value(
+        {"value": "A@B.test", "provenance": "approve"}) == "a@b.test"
+    assert spam_filter._whitelist_addr_value({"nope": 1}) == ""
+    assert spam_filter._whitelist_addr_is_approve(
+        {"value": "a@b.test", "provenance": "approve"}) is True
+    assert spam_filter._whitelist_addr_is_approve("a@b.test") is False
+    assert spam_filter._whitelist_addr_is_approve(
+        {"value": "a@b.test", "scope": "all"}) is False
+
+
+def test_daily_report_whitelist_sync_tolerates_dict_entry(tmp_path, monkeypatch):
+    # Part B companion fix: the Whitelist-folder sync must NOT raise when
+    # whitelist.json already holds an APPROVE-sourced dict entry (pre-fix it did
+    # `a.lower()` on the dict -> AttributeError). It must dedupe against the dict
+    # entry's value, add a genuinely new sender as a plain string, and PRESERVE
+    # the dict entry's stored shape (read-only tolerance, never flatten on write).
+    wl_path = tmp_path / "whitelist.json"
+    wl_path.write_text(json.dumps({"addresses": [
+        "old@hand.test",
+        {"value": "rescued@gmail.com", "provenance": "approve"}],
+        "domains": []}))
+    monkeypatch.setattr(daily_report, "WHITELIST_PATH", wl_path)
+
+    folder = tmp_path / "whitelist_folder"
+    folder.mkdir()
+    (folder / "dup.eml").write_bytes(          # From matches the dict entry value
+        b"From: Rescued <rescued@gmail.com>\r\nSubject: hi\r\n\r\nbody\r\n")
+    (folder / "new.eml").write_bytes(          # a genuinely new sender
+        b"From: New Person <new@sender.test>\r\nSubject: hi\r\n\r\nbody\r\n")
+
+    additions = daily_report.process_whitelist_emls(folder, _LOGGER)
+
+    # Only the new sender was added; the dict entry deduped, not re-added.
+    assert [a["address"] for a in additions] == ["new@sender.test"]
+    stored = json.loads(wl_path.read_text())
+    # The APPROVE-sourced dict entry survives with its shape intact.
+    assert {"value": "rescued@gmail.com",
+            "provenance": "approve"} in stored["addresses"]
+    assert "old@hand.test" in stored["addresses"]
+    assert "new@sender.test" in stored["addresses"]
+
+
+# --- Part D: the curate-active check must key on the account USERNAME (email),
+# the identifier the rule's scope store uses — NOT the display name. ---
+def test_part_d_account_scoped_curate_matches_on_username():
+    inbox = "work@example.com"
+    sig = {"ai_refinements": [{"status": "active", "rule_class": "curate",
+                               "enforcement": "ai", "scope": [inbox]}]}
+    # The username (email) the scope lists -> match.
+    assert spam_filter._account_has_active_ai_curate(sig, inbox) is True
+    # The display name is NOT what scope stores -> no match (the bug this fixes).
+    assert spam_filter._account_has_active_ai_curate(sig, "Work Inbox") is False
+
+
+# ═════════════════════════════════════════════════════════════════════════
 # 6. Behavioral wiring
 # ═════════════════════════════════════════════════════════════════════════
 
@@ -883,7 +1043,9 @@ def test_precedence_whitelist_blocks_unchanged():
     # still present, verbatim call shapes.
     assert ("wl_addr_match = check_whitelist_address_only(from_header_raw, "
             "whitelist)") in src
-    assert "wl_match = check_whitelist(from_header_raw, whitelist)" in src
+    # Gate 4 now short-circuits when gate 1 already routed the sender to the AI
+    # (Part A/B), so the check is guarded — but the call itself is unchanged.
+    assert "check_whitelist(from_header_raw, whitelist)" in src
     assert "# --- Precedence check 1: Whitelist specific address ---" in src
     assert "# --- Precedence check 4: Whitelist domain ---" in src
     # Finding #6: the APPROVE branch may WRITE the whitelist's domain tier

@@ -134,7 +134,8 @@ def _run(monkeypatch, *, uid_to_msg, processed_seed=None, dry_seen_seed=None,
 
     monkeypatch.setattr(spam_filter, "build_classifier_prompt",
                         lambda signals, username=None,
-                        approvals_active=False: "PROMPT")
+                        approvals_active=False,
+                        whitelist_curate_active=False: "PROMPT")
     monkeypatch.setattr(spam_filter, "_maybe_send_dry_run_reminder",
                         lambda config, accounts, logger: None)
     monkeypatch.setattr(spam_filter, "prune_decisions_log", lambda: None)

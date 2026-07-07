@@ -145,6 +145,114 @@ def test_raw_list_dicts_need_no_precomputed_sets():
 
 
 # ---------------------------------------------------------------------------
+# 1b. Audit 2026-07-06 Part A/B: an active curate rule routes a whitelisted
+#     sender to the AI (with OWNER-WHITELISTED protection) instead of instant
+#     delivery — only a clear curate match may junk it.
+# ---------------------------------------------------------------------------
+
+def _curate_signals(scope="all"):
+    return {"signals": {}, "ai_refinements": [
+        {"id": "R-1", "status": "active", "rule_class": "curate",
+         "enforcement": "ai", "scope": scope,
+         "headline": "no more sale blasts from this retailer"}]}
+
+
+def test_domain_whitelist_no_curate_still_instant_pass():
+    # (a) No curate rule -> byte-identical: delivered at the list gate, no AI.
+    res = spam_filter.classify_eml_offline(
+        RAW_NORMAL, SIGNALS, api_key="k",
+        whitelist=_wl(domains=["evil.com"]), blacklist=_bl())
+    assert res["decided_by"] == "lists"
+    assert res["final_decision"] == "PASS"
+    assert res["list_match"]["kind"] == "whitelist_domain"
+
+
+def test_domain_whitelist_curate_routes_to_ai(monkeypatch):
+    # (b) Curate active -> routed to the AI; the exact domain is passed for the
+    #     OWNER-WHITELISTED block and the prompt carries RULE 0 (WHITELIST).
+    seen = {}
+
+    def _classify(client, system_prompt, msg_data, *a, **k):
+        seen["whitelisted_sender"] = k.get("whitelisted_sender")
+        seen["system_prompt"] = system_prompt
+        return ({"decision": "NOT_SPAM", "confidence": 0.0, "signals_hit": []}, None)
+
+    monkeypatch.setattr(spam_filter, "classify_email", _classify)
+    res = spam_filter.classify_eml_offline(
+        RAW_NORMAL, _curate_signals(), api_key="k",
+        whitelist=_wl(domains=["evil.com"]), blacklist=_bl())
+    assert res["decided_by"] == "ai"
+    assert res["final_decision"] == "PASS"     # NOT_SPAM delivered
+    assert res.get("list_match") is None       # NOT short-circuited by the list gate
+    # check_whitelist returns the matched domain rule ("@evil.com").
+    assert "evil.com" in seen["whitelisted_sender"]
+    assert "RULE 0 (WHITELIST)" in seen["system_prompt"]
+
+
+def test_domain_whitelist_curate_ai_may_junk(monkeypatch):
+    # (c) The curate match is the ONE thing that can junk a whitelisted sender.
+    monkeypatch.setattr(spam_filter, "classify_email",
+                        lambda *a, **k: ({"decision": "SPAM", "confidence": 0.99,
+                                          "signals_hit": []}, None))
+    res = spam_filter.classify_eml_offline(
+        RAW_NORMAL, _curate_signals(), api_key="k",
+        whitelist=_wl(domains=["evil.com"]), blacklist=_bl())
+    assert res["decided_by"] == "ai"
+    assert res["final_decision"] == "JUNK"
+
+
+def test_whitelist_curate_beats_pre_classifier(monkeypatch):
+    # (d) Whitelist out-ranks the pre-classifier (gate 4 < gate 5): a hard-signal
+    #     SPAM verdict must NOT junk a routed whitelisted sender — only the AI's
+    #     curate check may. Control: without the whitelist the same mail junks
+    #     at the pre-classifier.
+    monkeypatch.setattr(spam_filter, "check_header_signals",
+                        lambda *a, **k: {"pre_classifier_verdict": "SPAM",
+                                         "pre_classifier_confidence": 0.9,
+                                         "hard_signals": ["X_HARD"],
+                                         "soft_signals": [], "signal_details": {}})
+    monkeypatch.setattr(spam_filter, "classify_email",
+                        lambda *a, **k: ({"decision": "NOT_SPAM", "confidence": 0.0,
+                                          "signals_hit": []}, None))
+    routed = spam_filter.classify_eml_offline(
+        RAW_NORMAL, _curate_signals(), api_key="k",
+        whitelist=_wl(domains=["evil.com"]), blacklist=_bl())
+    assert routed["decided_by"] == "ai"
+    assert routed["final_decision"] == "PASS"
+
+    control = spam_filter.classify_eml_offline(
+        RAW_NORMAL, _curate_signals(), api_key="k",
+        whitelist=_wl(), blacklist=_bl())
+    assert control["decided_by"] == "pre-classifier"
+    assert control["final_decision"] == "JUNK"
+
+
+def test_approve_sourced_address_curate_routes_but_handtyped_trumps(monkeypatch):
+    # Part B: an APPROVE-sourced exact address yields to an active curate rule
+    # (routed to AI); a hand-typed string keeps absolute trump (instant PASS).
+    seen = {}
+    monkeypatch.setattr(spam_filter, "classify_email",
+                        lambda *a, **k: (seen.update(k)
+                                         or ({"decision": "NOT_SPAM",
+                                              "confidence": 0.0,
+                                              "signals_hit": []}, None)))
+    approve_wl = {"addresses": [{"value": "promo@evil.com",
+                                 "provenance": "approve"}]}
+    routed = spam_filter.classify_eml_offline(
+        RAW_NORMAL, _curate_signals(), api_key="k",
+        whitelist=approve_wl, blacklist=_bl())
+    assert routed["decided_by"] == "ai"
+    assert seen.get("whitelisted_sender") == "promo@evil.com"
+
+    handtyped = spam_filter.classify_eml_offline(
+        RAW_NORMAL, _curate_signals(), api_key="k",
+        whitelist=_wl(addresses=["promo@evil.com"]), blacklist=_bl())
+    assert handtyped["decided_by"] == "lists"
+    assert handtyped["final_decision"] == "PASS"
+    assert handtyped["list_match"]["kind"] == "whitelist_address"
+
+
+# ---------------------------------------------------------------------------
 # 2. explain_text — plain-English library (owner-approved wording)
 # ---------------------------------------------------------------------------
 

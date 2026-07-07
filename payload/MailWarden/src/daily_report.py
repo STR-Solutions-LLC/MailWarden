@@ -135,6 +135,19 @@ def load_signals() -> dict:
         return {}
 
 
+def _list_entry_value(entry) -> str:
+    """Read the value from a whitelist/blacklist entry that may be a plain
+    string (legacy/hand-typed) OR an object — ``{"value": <addr>, "provenance":
+    "approve"}`` for an APPROVE-sourced whitelist address, or ``{"value","scope"}``
+    for a scoped block-list entry (audit 2026-07-06). Engine twin of
+    spam_filter._whitelist_addr_value; kept local so daily_report imports no
+    engine module. READ-ONLY tolerance — used only for set-build/compare, never
+    on a write path, so the stored shape is preserved. The RAW string is returned
+    (callers apply their own casing) and a malformed entry yields ""."""
+    v = entry.get("value") if isinstance(entry, dict) else entry
+    return v if isinstance(v, str) else ""
+
+
 def load_whitelist() -> dict:
     try:
         with open(WHITELIST_PATH, "r") as f:
@@ -175,7 +188,8 @@ def process_whitelist_emls(whitelist_dir: Path, logger: logging.Logger) -> list:
     # The load is fresh-under-lock and the save stays inside the same hold.
     with file_lock.locked(WHITELIST_PATH):
         whitelist = load_whitelist()
-        existing = {a.lower() for a in whitelist.get("addresses", [])}
+        existing = {v.lower() for v in (_list_entry_value(a)
+                    for a in whitelist.get("addresses", [])) if v}
 
         if not whitelist_dir.is_dir():
             logger.warning(f"[WHITELIST] Folder does not exist: {whitelist_dir}")
@@ -287,7 +301,8 @@ def sync_domains_txt(whitelist_dir: Path, logger: logging.Logger) -> dict:
     # handler / Dashboard edit is not clobbered by this domains.txt sync (C7).
     with file_lock.locked(WHITELIST_PATH):
         whitelist = load_whitelist()
-        old_domains = set(d.lower() for d in whitelist.get("domains", []))
+        old_domains = {v.lower() for v in (_list_entry_value(d)
+                       for d in whitelist.get("domains", [])) if v}
         new_domains_set = set(new_domains)
 
         result["added"] = sorted(new_domains_set - old_domains)

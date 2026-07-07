@@ -437,7 +437,8 @@ def _rr_harness(monkeypatch, *, msg_data, dry_run=False, sender_is_owner=True,
                         lambda processed, tu, td: None)
     monkeypatch.setattr(spam_filter, "build_classifier_prompt",
                         lambda signals, username=None,
-                        approvals_active=False: "PROMPT")
+                        approvals_active=False,
+                        whitelist_curate_active=False: "PROMPT")
     monkeypatch.setattr(spam_filter, "_maybe_send_dry_run_reminder",
                         lambda config, accounts, logger: None)
     monkeypatch.setattr(spam_filter, "prune_decisions_log", lambda: None)
@@ -842,8 +843,10 @@ def _snapshot_harness(monkeypatch, *, store, uids, msg_map):
     # REAL build_classifier_prompt, wrapped only to count/record results.
     _real_bcp = spam_filter.build_classifier_prompt
 
-    def _bcp(signals, username=None, approvals_active=False):
-        p = _real_bcp(signals, username, approvals_active=approvals_active)
+    def _bcp(signals, username=None, approvals_active=False,
+             whitelist_curate_active=False):
+        p = _real_bcp(signals, username, approvals_active=approvals_active,
+                      whitelist_curate_active=whitelist_curate_active)
         calls["build_results"].append(p)
         return p
     monkeypatch.setattr(spam_filter, "build_classifier_prompt", _bcp)
