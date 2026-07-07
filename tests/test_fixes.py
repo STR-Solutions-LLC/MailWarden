@@ -2875,7 +2875,7 @@ from datetime import datetime, timezone, timedelta  # noqa: E402
 
 def _dry_run_filter_harness(monkeypatch, *, uids=None, msg_data=None,
                             dry_run=True, pending=None, analysis_text=None,
-                            api_raises=False):
+                            api_raises=False, blacklist=None):
     """Drive spam_filter.run_filter(force=True) with all IO/network mocked.
 
     Returns a dict of call-recording spies so a test can assert which
@@ -2933,10 +2933,10 @@ def _dry_run_filter_harness(monkeypatch, *, uids=None, msg_data=None,
     monkeypatch.setattr(spam_filter, "load_signals", lambda: {"signals": {}})
     monkeypatch.setattr(spam_filter, "load_whitelist",
                         lambda logger: {"domains": [], "addresses": []})
-    monkeypatch.setattr(spam_filter, "load_blacklist",
-                        lambda logger: {"addresses": [], "domains": [],
-                                        "display_names": [],
-                                        "subject_keywords": []})
+    _bl = blacklist if blacklist is not None else {
+        "addresses": [], "domains": [], "display_names": [],
+        "subject_keywords": []}
+    monkeypatch.setattr(spam_filter, "load_blacklist", lambda logger: _bl)
     monkeypatch.setattr(spam_filter, "detect_conflicts",
                         lambda wl, bl, logger: [])
     monkeypatch.setattr(spam_filter, "load_token_usage", lambda: {})

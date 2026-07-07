@@ -173,6 +173,51 @@ def _entry_value(item) -> str:
     return raw if isinstance(raw, str) else ""
 
 
+def _entry_provenance_kind(entry) -> str:
+    """Where a whitelist/blacklist entry came from, so the UI points the owner at
+    the right undo. "rule" = an authored Unwanted-Categories rule entry (its
+    ``provenance`` is a list of owner records, or a legacy single rule-id string —
+    delete the RULE, not the entry); "approve" = an APPROVE-sourced whitelist
+    address; "typed" = a hand-typed string or a plain scoped block-sender dict.
+    Twin of spam_filter._entry_provenance_kind (separate process)."""
+    if not isinstance(entry, dict):
+        return "typed"
+    prov = entry.get("provenance")
+    if prov == "approve":
+        return "approve"
+    if isinstance(prov, list) and prov:
+        return "rule"
+    if isinstance(prov, str) and prov.strip():  # legacy single rule-id
+        return "rule"
+    return "typed"
+
+
+def _whitelist_apply_add(items: list, val: str) -> str:
+    """Hand-add ``val`` to a whitelist list, honoring entry provenance. Mutates
+    ``items`` in place and returns one of:
+
+      "added"     — no existing entry with this value; ``val`` appended.
+      "upgraded"  — ``val`` existed ONLY as an APPROVE-sourced dict (conditional,
+                    verification-gated trust); replaced in place with the bare
+                    string so it becomes full, unconditional trust. Item 5: a
+                    hand add trumps a prior APPROVE (mirrors the engine's
+                    Fwd-Whitelist upgrade).
+      "duplicate" — ``val`` is already present as a bare hand-typed string, or as
+                    a rule-owned dict that must never be flattened here; items
+                    left unchanged.
+    """
+    low = val.strip().lower()
+    idx = next((i for i, x in enumerate(items)
+                if _entry_value(x).lower() == low), None)
+    if idx is None:
+        items.append(val)
+        return "added"
+    if _entry_provenance_kind(items[idx]) == "approve":
+        items[idx] = val
+        return "upgraded"
+    return "duplicate"
+
+
 # =============================================================================
 # Main window
 # =============================================================================
@@ -1675,9 +1720,17 @@ class ListsTab(ttk.Frame):
             with file_lock.locked(paths.WHITELIST_PATH):
                 data = config_io.load_whitelist()
                 key = "addresses" if kind == "address" else "domains"
-                if val.lower() not in {_entry_value(x).lower() for x in data[key]}:
-                    data[key].append(val)
+                result = _whitelist_apply_add(data.setdefault(key, []), val)
+                if result != "duplicate":
                     config_io.save_whitelist(data)
+            if result == "upgraded":
+                messagebox.showinfo(
+                    "Upgraded to full whitelist",
+                    f"'{val}' was trusted only for messages MailWarden could "
+                    f"verify as genuinely from that sender (added when you "
+                    f"approved it from a report). Adding it by hand now trusts "
+                    f"this sender's mail unconditionally.",
+                    parent=self.app)
         else:
             val = val.strip()
             # C7: dedup-load + append + save under one lock.
@@ -2608,6 +2661,23 @@ class CheckEmailTab(ttk.Frame):
                 api_config={"api_key": api_key, "model": model}, logger=log,
                 rule_class=rule_class, curate_mechanism=curate_mechanism,
                 block_kind=block_kind, apply_scope=scope)
+            # Item 3: teaching a sender "legitimate" is a soft/AI steer that a
+            # standing blacklist entry still overrides at gate 2 — so on its own
+            # it silently does nothing. Warn honestly (via the engine's own
+            # loader + matcher, never re-implemented here) and point at the right
+            # undo for the kind of block it is.
+            if direction == "legitimate":
+                try:
+                    import spam_filter as _sf
+                    import email as _email
+                    _from = (_email.message_from_bytes(raw or b"")
+                             .get("From", "") or "")
+                    _warn = _sf._teach_legit_blacklist_warning(
+                        _from, _sf.load_blacklist(log))
+                    if _warn and isinstance(out, dict):
+                        out["blacklist_warning"] = _warn
+                except Exception:
+                    pass
             self.app.after(0, self._render_teach_outcome, out)
         except Exception as e:  # noqa: BLE001
             self.app.after(0, self._render_teach_outcome,
@@ -2621,6 +2691,11 @@ class CheckEmailTab(ttk.Frame):
         except Exception:
             pass
         status = (out or {}).get("status")
+        # Item 3: honesty warning when a standing blacklist entry still blocks a
+        # sender the owner just taught as legitimate (set in _do_teach). Appended
+        # only to the "teach succeeded" outcomes below.
+        warn = (out or {}).get("blacklist_warning") or ""
+        warn_suffix = ("\n\n" + warn) if warn else ""
         if status == "proposed":
             # Block-sender proposals carry a blocklist_entry, not a refinement.
             entry = out.get("blocklist_entry") or {}
@@ -2637,7 +2712,7 @@ class CheckEmailTab(ttk.Frame):
                 self._teach_status.config(
                     text=f"MailWarden learned a rule: “{hl}”. It's waiting "
                          f"for your OK in Signal History → Pending — nothing "
-                         f"changes until you approve it.")
+                         f"changes until you approve it." + warn_suffix)
             try:
                 self.app.signals_tab.refresh()
             except Exception:
@@ -2649,7 +2724,7 @@ class CheckEmailTab(ttk.Frame):
         elif status == "already_known":
             self._teach_status.config(
                 text="MailWarden already has a rule that covers this — nothing to "
-                     "add.")
+                     "add." + warn_suffix)
         else:
             self._teach_status.config(
                 text="MailWarden couldn't analyze this email right now. "

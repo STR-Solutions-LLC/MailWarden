@@ -1464,7 +1464,7 @@ def build_report_body(config: dict, decisions: dict, last_run: datetime,
                     lines.append(f"    \"{b['subject'][:60]}\" [matched: {b['match_type']}]")
             # Finding #6: blacklist blocks are the owner's own rules, so they
             # are not APPROVE-able above — point to the real undo per type.
-            lines.append("To unblock one of these senders: for an address or name, forward a message from that sender with the subject \"Fwd: Remove from Blacklist\". For a domain or subject keyword, open the Dashboard's Blacklist tab, select the entry, and click Remove.")
+            lines.append("To unblock one of these senders: for an address or name, forward a message from that sender with the subject \"Fwd: Remove from Blacklist\". For a domain or subject keyword, open the Whitelist / Blacklist tab, select the entry, and click Remove. If a block came from an Unwanted Categories rule, edit or delete that rule in the Unwanted Categories tab instead - its blocks are removed automatically.")
             lines.append("")
 
         lines.append(f"Blacklist totals: {bl_total_addrs} addresses | {bl_total_names} display names")

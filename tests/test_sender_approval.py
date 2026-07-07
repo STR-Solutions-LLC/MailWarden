@@ -1188,8 +1188,11 @@ def test_blacklisted_mail_counted_once_listed_once(decisions_log):
     assert ("To unblock one of these senders: for an address or name, "
             "forward a message from that sender with the subject "
             "\"Fwd: Remove from Blacklist\". For a domain or subject "
-            "keyword, open the Dashboard's Blacklist tab, select the "
-            "entry, and click Remove.") in body
+            "keyword, open the Whitelist / Blacklist tab, select the "
+            "entry, and click Remove. If a block came from an Unwanted "
+            "Categories rule, edit or delete that rule in the Unwanted "
+            "Categories tab instead - its blocks are removed "
+            "automatically.") in body
 
 
 def test_unblock_hint_absent_without_blacklist_activity():
@@ -1261,10 +1264,11 @@ def test_branch_keyword_item_honest_noop(monkeypatch):
     assert calls["classify_email"] == 0
     subject, body, to_addr = calls["send_email"][0]
     assert body == ("Item 1 was blocked by a subject-keyword rule you set "
-                    "up, so approving the sender won't stop it. To remove "
-                    "the keyword, open the Dashboard, go to the Blacklist "
-                    "tab, select the keyword, and click Remove. No change "
-                    "was made.")
+                    "up, so approving the sender won't stop it. To remove the "
+                    "keyword, open the Whitelist / Blacklist tab, select it, "
+                    "and click Remove. If you set it up through Unwanted "
+                    "Categories, edit or delete that rule in the Unwanted "
+                    "Categories tab instead. No change was made.")
 
 
 def test_branch_pre_classifier_item_whitelists_domain(monkeypatch):

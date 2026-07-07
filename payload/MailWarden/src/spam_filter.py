@@ -371,6 +371,34 @@ def _whitelist_addr_is_approve(entry) -> bool:
     return isinstance(entry, dict) and entry.get("provenance") == "approve"
 
 
+def _entry_provenance_kind(entry) -> str:
+    """Classify a whitelist/blacklist store entry by where it came from, so acks
+    can point the owner at the RIGHT place to undo it. Returns:
+
+      "rule"    — a dict written by an authored Unwanted-Categories rule: its
+                  ``provenance`` is a list of owner records (or a legacy single
+                  rule-id string). Deleting the rule cascades removal, so the
+                  owner must NOT be told to remove the entry by hand.
+      "approve" — an APPROVE-sourced whitelist address ({"provenance":"approve"}).
+      "typed"   — everything else: a plain hand-typed string, or a dict with no
+                  provenance (a block-sender / list-command scoped entry). These
+                  are removed directly in the Whitelist / Blacklist tab.
+
+    Mirrors _provenance_owners' shape reading (twin logic lives in the dashboard
+    and — where needed — daily_report; the three run in separate processes and
+    cannot share an import)."""
+    if not isinstance(entry, dict):
+        return "typed"
+    prov = entry.get("provenance")
+    if prov == "approve":
+        return "approve"
+    if isinstance(prov, list) and prov:
+        return "rule"
+    if isinstance(prov, str) and prov.strip():  # legacy single rule-id
+        return "rule"
+    return "typed"
+
+
 def load_whitelist(logger: logging.Logger) -> dict:
     """Load whitelist.json. Returns empty whitelist if file missing."""
     try:
@@ -968,6 +996,48 @@ def check_blacklist(from_header: str, blacklist: dict, account_name=None) -> tup
             return ("display_name", display_name)
 
     return (None, None)
+
+
+# Honesty warning appended to a teach-legitimate acknowledgment when a standing
+# blacklist entry would still junk the taught sender at gate 2. The legitimate
+# teaching is a soft/AI steer subordinate to a deterministic block, so on its own
+# it silently does nothing — say so, and point at the right undo (branched on the
+# matched entry's provenance). Twin copy lives in the dashboard (separate process).
+_TEACH_LEGIT_BL_WARNING_TYPED = (
+    "Heads up: a blacklist entry for this sender is still in place, so its mail "
+    "will keep going to Junk. To let it through, open the Whitelist / Blacklist "
+    "tab and remove that entry.")
+_TEACH_LEGIT_BL_WARNING_RULE = (
+    "Heads up: your Unwanted Categories rule is still blocking this sender. To "
+    "let it through, edit or delete that rule in the Unwanted Categories tab.")
+
+
+def _teach_legit_blacklist_warning(from_header, blacklist, account_name=None) -> str:
+    """If the taught-legitimate sender is STILL blacklisted, return the honesty
+    warning (branched by the matched entry's provenance); "" otherwise. Matching
+    is delegated to check_blacklist — never re-implemented. Only sender-based
+    blocks (address/domain/display name) are reachable here; a subject-keyword
+    block can't be judged from the sender alone, so it is out of scope."""
+    match_type, match_value = check_blacklist(
+        from_header, blacklist, account_name=account_name)
+    if not match_type:
+        return ""
+    field = {"address": "addresses", "domain": "domains",
+             "display_name": "display_names"}.get(match_type)
+    strip_at = field == "domains"
+    mv = (match_value or "").strip().lower()
+    if strip_at:
+        mv = mv.lstrip("@")
+    entry = None
+    for e in blacklist.get(field, []) or []:
+        ev = _blocklist_value_of(e, strip_at=strip_at)
+        # Exact match, or (domains) the sender is a subdomain of a blocked parent.
+        if ev and (ev == mv or (strip_at and mv.endswith("." + ev))):
+            entry = e
+            break
+    kind = _entry_provenance_kind(entry)
+    return (_TEACH_LEGIT_BL_WARNING_RULE if kind == "rule"
+            else _TEACH_LEGIT_BL_WARNING_TYPED)
 
 
 def check_subject_keywords(subject: str, blacklist: dict,
@@ -7674,6 +7744,16 @@ Conversation ID: {sfid}
                                 email_body += _sender_conflict_warning(
                                     _fp_conflict, with_undo=False)
 
+                            # Item 3: if a standing blacklist entry still blocks
+                            # this sender, the legitimate refinement (once applied)
+                            # can't override it at gate 2 — say so honestly and
+                            # point at the right undo for what kind of block it is.
+                            _fp_bl_warn = _teach_legit_blacklist_warning(
+                                fwd_data.get("original_from", ""), blacklist,
+                                account_name=account.get("username", ""))
+                            if _fp_bl_warn:
+                                email_body += "\n\n" + _fp_bl_warn
+
                             email_subject = f"Re: False Positive Analysis [{sfid}] — {fwd_data['original_subject'][:50]}"
                             send_email(config, email_subject, email_body, logger,
                                        to_addr=account.get("username", ""))
@@ -9270,10 +9350,13 @@ USER'S FOLLOW-UP:
                                         f"Item {n} was blocked by a "
                                         f"subject-keyword rule you set up, "
                                         f"so approving the sender won't stop "
-                                        f"it. To remove the keyword, open "
-                                        f"the Dashboard, go to the Blacklist "
-                                        f"tab, select the keyword, and click "
-                                        f"Remove. No change was made.")
+                                        f"it. To remove the keyword, open the "
+                                        f"Whitelist / Blacklist tab, select "
+                                        f"it, and click Remove. If you set it "
+                                        f"up through Unwanted Categories, edit "
+                                        f"or delete that rule in the Unwanted "
+                                        f"Categories tab instead. No change "
+                                        f"was made.")
                                 elif source == "pre_classifier":
                                     # Case B: built-in hard signals / DNSBL.
                                     # The domain whitelist runs BEFORE the

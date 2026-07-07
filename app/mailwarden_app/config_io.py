@@ -86,6 +86,11 @@ DEFAULT_CONFIG: dict = {
         # a sane range (5–360 minutes).
         "interval_minutes": 15,
         "confidence_threshold": 0.85,
+        # Per-tick ceiling on Junk moves. A first run against a big backlog cleans
+        # up gradually instead of one mass-move burst; overflow stays unseen and
+        # unclassified for the next tick. The engine reads this with a fallback of
+        # 25 (spam_filter.run_filter); this default keeps the two in lockstep.
+        "max_junk_actions_per_run": 25,
     },
     "smtp": {
         "host": "",
