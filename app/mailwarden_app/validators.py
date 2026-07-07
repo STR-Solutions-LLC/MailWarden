@@ -262,11 +262,19 @@ def check_billing(api_key: str) -> dict:
 def send_test_email(smtp_host: str, smtp_port: int, smtp_user: str, smtp_pass: str,
                     from_addr: str, to_addr: str) -> tuple[bool, str]:
     """Send a plain-text test email so the user can confirm SMTP works end-to-end."""
+    import email.utils
     from email.message import EmailMessage
     msg = EmailMessage()
     msg["Subject"] = "MailWarden test message"
     msg["From"] = from_addr
     msg["To"] = to_addr
+    # Stamp as MailWarden system mail + supply Date/Message-ID. EmailMessage adds
+    # none of these; without them the test message is not recognised as our own
+    # and is malformed in the mailbox (mirrors setup_assistant's welcome email).
+    msg["X-MailWarden-System"] = "1"
+    msg["Date"] = email.utils.formatdate(localtime=True)
+    _dom = from_addr.rsplit("@", 1)[1] if "@" in from_addr else None
+    msg["Message-ID"] = email.utils.make_msgid(domain=_dom or None)
     msg.set_content(
         "This is a test message from MailWarden Setup Assistant.\n\n"
         "If you received this, your SMTP settings are working correctly.\n"

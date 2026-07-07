@@ -51,9 +51,15 @@ BREADTH_CHECK_SYSTEM_PROMPT = (
     "  - subject_tokens: exact literal strings the user says ALWAYS appear in the "
     "subject line (for example a list tag like \"[PSIAN]\" or a word they put in "
     "quotes). Copy them verbatim, including any brackets. Empty list if none.\n"
-    "  - sender_addresses: full email addresses the rule names. Empty if none.\n"
-    "  - sender_domains: bare sending domains the rule names (for example "
-    "\"example.com\"). Empty if none.\n"
+    "  - sender_addresses: full email addresses the rule names as a TARGET to "
+    "junk. Empty if none.\n"
+    "  - sender_domains: bare sending domains the rule names as a TARGET to junk "
+    "(for example \"example.com\"). Empty if none.\n"
+    "  - exception_senders: addresses or domains the rule EXEMPTS — senders it "
+    "says should still get through (the part after \"unless\", \"except\", \"but "
+    "not\", \"other than\"). These must NOT be junked. Classify EVERY sender the "
+    "rule names as either a TARGET (sender_addresses / sender_domains) or an "
+    "EXCEPTION (here) — never both. Empty if none.\n"
     "  - residual_text: the part of the rule that STILL needs judgment after the "
     "markers above are handled (for example \"from vendors I don't know\"). Use "
     "an empty string when the markers fully capture the rule and nothing is left "
@@ -68,8 +74,8 @@ BREADTH_CHECK_SYSTEM_PROMPT = (
     "mail it might catch, empty string if not broad>\", \"suggestion\": \"<a "
     "tighter rewording of the rule, empty string if not broad>\", "
     "\"subject_tokens\": [\"...\"], \"sender_addresses\": [\"...\"], "
-    "\"sender_domains\": [\"...\"], \"residual_text\": \"...\", "
-    "\"list_like\": true or false}"
+    "\"sender_domains\": [\"...\"], \"exception_senders\": [\"...\"], "
+    "\"residual_text\": \"...\", \"list_like\": true or false}"
 )
 
 # Cap the response: a boolean + a couple of short sentences + one rewrite.
@@ -125,10 +131,11 @@ def _as_str_list(value) -> list[str]:
 def _parse_markers(text: str) -> dict:
     """PURE. Parse the deterministic-marker fields out of the SAME JSON verdict
     _parse_breadth_verdict reads (one API response, two focused parsers). Returns
-    {subject_tokens, sender_addresses, sender_domains, residual_text, list_like}
-    with safe defaults, or an all-empty dict when the JSON can't be read."""
+    {subject_tokens, sender_addresses, sender_domains, exception_senders,
+    residual_text, list_like} with safe defaults, or an all-empty dict when the
+    JSON can't be read."""
     empty = {"subject_tokens": [], "sender_addresses": [], "sender_domains": [],
-             "residual_text": "", "list_like": False}
+             "exception_senders": [], "residual_text": "", "list_like": False}
     if not text or not text.strip():
         return dict(empty)
     raw = text.strip()
@@ -150,6 +157,7 @@ def _parse_markers(text: str) -> dict:
         "subject_tokens": _as_str_list(obj.get("subject_tokens")),
         "sender_addresses": _as_str_list(obj.get("sender_addresses")),
         "sender_domains": _as_str_list(obj.get("sender_domains")),
+        "exception_senders": _as_str_list(obj.get("exception_senders")),
         "residual_text": str(obj.get("residual_text") or "").strip(),
         "list_like": bool(obj.get("list_like")),
     }
@@ -244,6 +252,20 @@ _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 _LISTLIKE_RE = re.compile(
     r"\b(list[\- ]?serv(?:e|er)?|mailing[\- ]?list|newsletter|digest|"
     r"subscrib\w*|unsubscrib\w*)\b", re.IGNORECASE)
+# Exception phrasing: the rule carves out a sender it wants to KEEP ("junk X
+# unless it's from Y"). Deterministic markers can't honor a carve-out — gate 2/3
+# outrank the whitelist, so a wrongly-extracted target is unrescuable — so any
+# rule with exception phrasing is routed to the AI classifier instead, which CAN
+# honor the exception. Strictly the safe direction (refusing determinism only
+# ever loses precision, never protection).
+_EXCEPTION_RE = re.compile(
+    r"\bunless\b|\bexcept(?:ing)?\b|\bbut not\b|\bother than\b", re.I)
+
+
+def has_exception_phrasing(description: str) -> bool:
+    """PURE. True when the rule text contains a carve-out phrase (unless / except
+    / but not / other than) — a sender the rule wants to EXEMPT from junking."""
+    return bool(_EXCEPTION_RE.search(description or ""))
 
 
 def extract_markers_local(description: str) -> dict:
@@ -308,6 +330,34 @@ def extract_enforcement(description: str, verdict: dict | None = None) -> dict:
     desc = (description or "").strip()
     adv_ok = bool(verdict) and verdict.get("reason") == "ok"
 
+    # Exception carve-out short-circuit (D1). If the advisor named any
+    # exception_senders, OR the rule text uses exception phrasing, the rule
+    # EXEMPTS a sender it wants to keep. Deterministic gates 2/3 outrank the
+    # whitelist gate 4, so a wrongly-extracted target can't be rescued — refuse
+    # determinism entirely and route the WHOLE rule to the AI, which can honor
+    # the exception. The heuristic runs ALWAYS (not just when the advisor is
+    # down): the only cost is precision, never protection.
+    exception_senders = (
+        _dedupe_lower(list(verdict.get("exception_senders") or []))
+        if adv_ok else [])
+    has_exception = bool(exception_senders) or has_exception_phrasing(desc)
+    if has_exception:
+        return {
+            "enforcement": "ai",
+            "residual_text": desc,
+            "subject_tokens": [],
+            "sender_addresses": [],
+            "sender_domains": [],
+            "deterministic_entries": [],
+            "exception_senders": exception_senders,
+            "has_exception": True,
+            # Force AI judgment: never offer the mailing-list tag prompt, which
+            # would turn this into a deterministic subject-keyword block and junk
+            # the exempted sender too.
+            "list_like": False,
+            "source": "advisor" if adv_ok else "local",
+        }
+
     local = extract_markers_local(desc)
     if adv_ok:
         subject_tokens = _dedupe_lower(
@@ -348,6 +398,8 @@ def extract_enforcement(description: str, verdict: dict | None = None) -> dict:
         "sender_addresses": addresses,
         "sender_domains": domains,
         "deterministic_entries": entries,
+        "exception_senders": [],   # no carve-out (else short-circuited above)
+        "has_exception": False,
         "list_like": list_like,
         "source": source,
     }

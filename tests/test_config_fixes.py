@@ -98,9 +98,9 @@ def test_load_config_deep_merges_missing_keys(patched_config_path):
     minimal = {"accounts": [], "anthropic": {"api_key": "sk-test"}}
     patched_config_path.write_text(json.dumps(minimal))
     result = load_config()
-    # signal_learner was removed from DEFAULT_CONFIG as a dead key, so it is no
-    # longer back-filled onto minimal configs (nothing reads it).
-    assert "signal_learner" not in result
+    # Wave-5-D: signal_learner is a live default again — the learner reads
+    # signal_learner.examples_folder — so it IS back-filled onto minimal configs.
+    assert result["signal_learner"] == {"examples_folder": "spam_examples"}
     assert "eula" in result
     assert "ui" in result
     assert result["filter"]["dry_run"] is True

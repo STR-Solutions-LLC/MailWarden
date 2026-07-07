@@ -74,6 +74,11 @@ DEFAULT_CONFIG: dict = {
         "model": "claude-haiku-4-5-20251001",
         "screen_model": "claude-haiku-4-5-20251001",
         "confirm_model": "claude-sonnet-4-6",
+        # Cap on the classifier's completion tokens. The engine reads this via
+        # api_config with a fallback of 500 (spam_filter.run_filter, the
+        # api_config.get("max_tokens", 500) read); this default keeps the two in
+        # lockstep.
+        "max_tokens": 500,
     },
     "filter": {
         "dry_run": True,
@@ -106,6 +111,13 @@ DEFAULT_CONFIG: dict = {
         # summary.hour / summary.minute — nothing reads them, so they are
         # silently ignored (never crash).
         "recipient": "",
+    },
+    # The signal learner scans this folder (under the MailWarden root) for new
+    # .eml examples. The engine reads it via signal_learner.examples_folder with
+    # a fallback of "spam_examples" (learn_signals); this keeps the two in
+    # lockstep.
+    "signal_learner": {
+        "examples_folder": "spam_examples",
     },
     # Legacy configs may still carry whitelist.folder / blacklist.folder /
     # signal_learner.enabled — nothing reads them, so they are silently ignored.

@@ -77,7 +77,11 @@ def test_7e_github_check_is_dashboard_triggered_both_sites():
 def test_default_config_drops_dead_keys():
     assert "whitelist" not in DEFAULT_CONFIG
     assert "blacklist" not in DEFAULT_CONFIG
-    assert "signal_learner" not in DEFAULT_CONFIG
+    # Wave-5-D: signal_learner is a LIVE default again — the learner reads
+    # signal_learner.examples_folder (learn_signals). Only the legacy .enabled
+    # sub-key stays dead/ignored.
+    assert DEFAULT_CONFIG["signal_learner"] == {"examples_folder": "spam_examples"}
+    assert "enabled" not in DEFAULT_CONFIG["signal_learner"]
 
 
 @pytest.fixture()

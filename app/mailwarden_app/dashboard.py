@@ -1726,10 +1726,9 @@ class ListsTab(ttk.Frame):
             if result == "upgraded":
                 messagebox.showinfo(
                     "Upgraded to full whitelist",
-                    f"'{val}' was trusted only for messages MailWarden could "
-                    f"verify as genuinely from that sender (added when you "
-                    f"approved it from a report). Adding it by hand now trusts "
-                    f"this sender's mail unconditionally.",
+                    f"'{val}' was approved from a report, so your own Unwanted "
+                    f"Categories rules still applied to its mail. Adding it by "
+                    f"hand now delivers this sender's mail unconditionally.",
                     parent=self.app)
         else:
             val = val.strip()
@@ -1743,6 +1742,15 @@ class ListsTab(ttk.Frame):
                     data[key].append(val)
                     config_io.save_blacklist(data)
         self.refresh()
+
+    @staticmethod
+    def _blacklist_remove_decision(entry) -> str:
+        """PURE. 'rule_managed' when a blacklist entry was written by an authored
+        Unwanted-Categories rule (its provenance belongs to the rule, so a hand
+        delete here won't stick — a later rule edit rewrites it). 'delete' for a
+        hand-typed or APPROVE-sourced entry, which the owner may remove here."""
+        return ("rule_managed"
+                if _entry_provenance_kind(entry) == "rule" else "delete")
 
     def _remove_entry(self, which: str):
         tree = self._wl_tree if which == "whitelist" else self._bl_tree
@@ -1760,6 +1768,10 @@ class ListsTab(ttk.Frame):
                 config_io.save_whitelist(data)
         else:
             # C7: load + filter + save under one lock (fresh read under lock).
+            # D2: an entry an Unwanted-Categories rule owns is NOT deleted here —
+            # the rule would re-add it. Detect under the lock, show the pointer
+            # AFTER releasing it (never hold the lock across a modal).
+            blocked_by_rule = False
             with file_lock.locked(paths.BLACKLIST_PATH):
                 data = config_io.load_blacklist()
                 if kind == "address":
@@ -1770,9 +1782,25 @@ class ListsTab(ttk.Frame):
                     key = "subject_keywords"
                 else:
                     key = "display_names"
-                data[key] = [x for x in data.get(key, [])
-                             if _entry_value(x).lower() != value.lower()]
-                config_io.save_blacklist(data)
+                entries = data.get(key, [])
+                matches = [x for x in entries
+                           if _entry_value(x).lower() == value.lower()]
+                if any(self._blacklist_remove_decision(x) == "rule_managed"
+                       for x in matches):
+                    blocked_by_rule = True
+                else:
+                    data[key] = [x for x in entries
+                                 if _entry_value(x).lower() != value.lower()]
+                    config_io.save_blacklist(data)
+            if blocked_by_rule:
+                messagebox.showinfo(
+                    "Managed by a rule",
+                    f"'{value}' is blocked by one of your Unwanted Categories "
+                    f"rules, so removing it here won't stick — the rule would "
+                    f"add it back. Open the Unwanted Categories tab and edit or "
+                    f"delete that rule instead.",
+                    parent=self.app)
+                return
         self.refresh()
 
     def _on_import_csv(self):
@@ -2115,6 +2143,16 @@ class CheckEmailTab(ttk.Frame):
         threading.Thread(target=self._do_check, args=(raw_bytes,),
                          daemon=True).start()
 
+    @staticmethod
+    def _single_account_name(config) -> str | None:
+        """If EXACTLY one account is configured, return its username so this
+        screen can honor that account's per-account rules the way the live
+        filter would. None for zero or multiple accounts — this screen has no
+        account selector, so with more than one we can't know which applies."""
+        accounts = (config or {}).get("accounts", []) or []
+        usernames = [a.get("username", "") for a in accounts if a.get("username")]
+        return usernames[0] if len(usernames) == 1 else None
+
     def _do_check(self, raw_bytes: bytes):
         try:
             import sys as _sys
@@ -2152,7 +2190,8 @@ class CheckEmailTab(ttk.Frame):
             res = spam_filter.classify_eml_offline(
                 raw_bytes, signals, api_key=api_key, model=model,
                 classify_mode=classify_mode, confirm_model=confirm_model,
-                threshold=threshold, account_name=None,
+                threshold=threshold,
+                account_name=CheckEmailTab._single_account_name(cfg),
                 whitelist=whitelist, blacklist=blacklist,
                 approved_domains=approved.get("_domains_set", set()))
             self.app.after(0, self._render_result, res, threshold)
@@ -2672,8 +2711,15 @@ class CheckEmailTab(ttk.Frame):
                     import email as _email
                     _from = (_email.message_from_bytes(raw or b"")
                              .get("From", "") or "")
+                    # D5: pass signals so the warning ALSO catches an active
+                    # curate rule whose sender markers still junk this sender
+                    # (E7), and resolve a single-account scope so the warning
+                    # honors per-account rules the same way the live filter does.
                     _warn = _sf._teach_legit_blacklist_warning(
-                        _from, _sf.load_blacklist(log))
+                        _from, _sf.load_blacklist(log),
+                        account_name=CheckEmailTab._single_account_name(
+                            config_io.load_config()),
+                        signals=_sf.load_signals())
                     if _warn and isinstance(out, dict):
                         out["blacklist_warning"] = _warn
                 except Exception:
@@ -3627,7 +3673,45 @@ class UnwantedCategoriesTab(ttk.Frame):
             note = "Added. It takes effect on the next check."
         self._create_rule(desc, scope, enforcement, status_note=note)
 
+    @staticmethod
+    def _presave_disclosure(enforcement) -> tuple[bool, str]:
+        """PURE. Decide whether to confirm before saving an authored rule, and
+        build the plain-language message. A confirmation is shown ONLY when the
+        rule will block senders/subjects OUTRIGHT — deterministic_entries is
+        non-empty. Those entries are enforced at gates 2/3, which run before the
+        AI and OUTRANK the allow list, so a wrong one can't be rescued; the owner
+        should see exactly what goes on the block list first. Returns
+        (should_confirm, message)."""
+        enforcement = enforcement or {}
+        entries = enforcement.get("deterministic_entries") or []
+        if not entries:
+            return False, ""
+        senders = [e.get("value") for e in entries
+                   if e.get("kind") in ("address", "domain") and e.get("value")]
+        tokens = [e.get("value") for e in entries
+                  if e.get("kind") == "subject_keyword" and e.get("value")]
+        lines = ["This rule sends matching mail straight to Junk on its own — "
+                 "without asking the AI, and even for senders on your allow "
+                 "list."]
+        if senders:
+            lines.append("")
+            lines.append("Blocked outright: " + ", ".join(senders))
+        if tokens:
+            lines.append("")
+            lines.append("Any subject containing: " + ", ".join(tokens))
+        lines.append("")
+        lines.append("Add this rule?")
+        return True, "\n".join(lines)
+
     def _create_rule(self, desc, scope, enforcement, status_note):
+        # D1(c): if this rule blocks mail OUTRIGHT (deterministic entries),
+        # disclose exactly what goes on the block list and require an explicit OK
+        # before writing. Pure decision + message; the modal only appears for a
+        # deterministic block, and the write stays the single point below.
+        should_confirm, message = self._presave_disclosure(enforcement)
+        if should_confirm and not self._confirm_presave(message):
+            self._status.config(text="Rule not added.")
+            return
         record = config_io.create_authored_refinement(
             desc, scope, source="dashboard", enforcement=enforcement)
         if record is None:
@@ -3636,6 +3720,39 @@ class UnwantedCategoriesTab(ttk.Frame):
         self._desc_var.set("")
         self._status.config(text=status_note)
         self.refresh()
+
+    def _confirm_presave(self, message) -> bool:
+        """Modal proceed/cancel before an outright-block rule is saved. Returns
+        True to proceed, False to abandon. Mirrors the _prompt_list_tag Toplevel
+        idiom (transient + two buttons + WM_DELETE fallback), made synchronous
+        with wait_window so _create_rule stays the single write point."""
+        dlg = tk.Toplevel(self.app)
+        dlg.title("This rule blocks mail outright")
+        dlg.transient(self.app)
+        dlg.resizable(False, False)
+        frm = ttk.Frame(dlg, padding=(16, 14))
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frm, wraplength=460, justify="left",
+                  text=message).pack(anchor=tk.W)
+        result = {"ok": False}
+
+        def _proceed():
+            result["ok"] = True
+            dlg.destroy()
+
+        def _cancel():
+            dlg.destroy()
+
+        btns = ttk.Frame(frm)
+        btns.pack(anchor=tk.E, pady=(14, 0))
+        ttk.Button(btns, text="Add rule", style="Primary.TButton",
+                   command=_proceed).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Cancel", command=_cancel).pack(
+            side=tk.LEFT, padx=(6, 0))
+        dlg.protocol("WM_DELETE_WINDOW", _cancel)
+        dlg.grab_set()
+        dlg.wait_window()
+        return result["ok"]
 
     @staticmethod
     def _enforcement_for_tag(tag: str) -> dict:
