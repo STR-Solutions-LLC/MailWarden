@@ -406,7 +406,7 @@ def welcome_email_body(primary_account_email: str) -> str:
 Your spam filter is now running. By default it checks your inbox every 15
 minutes (you can set this anywhere from 5 to 360 minutes in the Dashboard),
 uses AI to identify spam, and moves flagged mail into your junk folder.
-Once a day (at 8:00 AM by default), you'll get a report summarizing what
+Once a day (at 8:00 AM), you'll get a report summarizing what
 was filtered. Every junked sender in that report is numbered — if MailWarden
 ever junks someone you want to hear from, reply APPROVE and the number (for
 example, APPROVE 3) to rescue them. If the block came from a rule you set

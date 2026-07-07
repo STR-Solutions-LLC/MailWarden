@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -158,6 +159,20 @@ def pending_retired_message():
     )
 
 
+def _entry_value(item) -> str:
+    """Display / comparison string for a whitelist or blacklist entry.
+
+    Blacklist entries may be a bare string OR a provenance-tagged object
+    {"value","scope"[,"provenance"]} written by the filter's block-sender
+    handler (APPROVE replies) and by authored Unwanted-Categories rules
+    (see config_io). The Lists tab must read every shape without crashing and
+    must NEVER flatten the stored object back to a bare string on a write path.
+    Returns "" for a malformed entry (dict with no string "value", or a
+    non-string, non-dict item)."""
+    raw = item.get("value") if isinstance(item, dict) else item
+    return raw if isinstance(raw, str) else ""
+
+
 # =============================================================================
 # Main window
 # =============================================================================
@@ -168,6 +183,11 @@ class Dashboard(tk.Tk):
         # Guard for the <Unmap> minimize backstop (Piece 2c) so it never fights
         # window teardown in _on_close. Set before any binding can fire.
         self._closing = False
+
+        # Tk swallows exceptions raised inside widget callbacks silently by
+        # default — a crashing button handler or tab refresh vanishes with no
+        # trace. Route them to the log instead so failures are visible.
+        self.report_callback_exception = self._report_callback_exception
 
         # PIECE 1 — Dashboard has NO Dock icon. Tk has just created the real
         # NSApplication in super().__init__(); this is the first moment NSApp()
@@ -513,26 +533,44 @@ class Dashboard(tk.Tk):
             except Exception:
                 pass
 
+    def _safe_refresh(self, tab, name: str) -> None:
+        """Refresh one tab, logging and swallowing any exception so a single
+        tab's failure can't abort the rest of refresh_all / the periodic cycle
+        (a dict-shaped blacklist entry once crashed the Lists tab and silently
+        aborted every tab after it)."""
+        try:
+            tab.refresh()
+        except Exception:
+            logging.getLogger("mailwarden.dashboard").exception(
+                "Tab refresh failed: %s", name)
+
+    def _report_callback_exception(self, exc, val, tb) -> None:
+        """Override Tk's default (which silently discards callback exceptions)
+        so a crashing widget handler is logged instead of vanishing."""
+        logging.getLogger("mailwarden.dashboard").error(
+            "Unhandled Tk callback exception", exc_info=(exc, val, tb))
+
     def refresh_all(self):
-        self.home_tab.refresh()
-        self.accounts_tab.refresh()
-        self.lists_tab.refresh()
-        self.signals_tab.refresh()
-        self.unwanted_tab.refresh()
-        self.usage_tab.refresh()
-        self.settings_tab.refresh()
-        self.diagnostics_tab.refresh()
+        self._safe_refresh(self.home_tab, "home")
+        self._safe_refresh(self.accounts_tab, "accounts")
+        self._safe_refresh(self.lists_tab, "lists")
+        self._safe_refresh(self.signals_tab, "signals")
+        self._safe_refresh(self.unwanted_tab, "unwanted")
+        self._safe_refresh(self.usage_tab, "usage")
+        self._safe_refresh(self.settings_tab, "settings")
+        self._safe_refresh(self.diagnostics_tab, "diagnostics")
 
     def _periodic_refresh(self):
         # The filter runs in a separate process every few minutes and writes
         # whitelist.json / blacklist.json / signals / decisions behind the
         # Dashboard's back. Periodic refresh keeps the visible tabs in sync
-        # without forcing the user to close and reopen the window.
+        # without forcing the user to close and reopen the window. Per-tab
+        # isolation means one tab's failure can't skip the tabs after it.
         try:
-            self.home_tab.refresh()
-            self.usage_tab.refresh()
-            self.lists_tab.refresh()
-            self.signals_tab.refresh()
+            self._safe_refresh(self.home_tab, "home")
+            self._safe_refresh(self.usage_tab, "usage")
+            self._safe_refresh(self.lists_tab, "lists")
+            self._safe_refresh(self.signals_tab, "signals")
         finally:
             self.after(60_000, self._periodic_refresh)
 
@@ -1496,23 +1534,24 @@ class ListsTab(ttk.Frame):
 
         wl = config_io.load_whitelist()
         for a in wl.get("addresses", []):
-            self._wl_tree.insert("", tk.END, values=("address", a))
+            self._wl_tree.insert("", tk.END, values=("address", _entry_value(a)))
         for d in wl.get("domains", []):
-            self._wl_tree.insert("", tk.END, values=("domain", d))
+            self._wl_tree.insert("", tk.END, values=("domain", _entry_value(d)))
 
         bl = config_io.load_blacklist()
         for a in bl.get("addresses", []):
-            self._bl_tree.insert("", tk.END, values=("address", a))
+            self._bl_tree.insert("", tk.END, values=("address", _entry_value(a)))
         for d in bl.get("domains", []):
-            self._bl_tree.insert("", tk.END, values=("domain", d))
+            self._bl_tree.insert("", tk.END, values=("domain", _entry_value(d)))
         for n in bl.get("display_names", []):
-            self._bl_tree.insert("", tk.END, values=("display_name", n))
+            self._bl_tree.insert("", tk.END, values=("display_name", _entry_value(n)))
         for k in bl.get("subject_keywords", []):
-            self._bl_tree.insert("", tk.END, values=("subject_keyword", k))
+            self._bl_tree.insert("", tk.END, values=("subject_keyword", _entry_value(k)))
 
-        # Conflict detection
-        addr_wl = {a.lower() for a in wl.get("addresses", [])}
-        addr_bl = {a.lower() for a in bl.get("addresses", [])}
+        # Conflict detection. Blacklist entries may be provenance dicts, so pull
+        # the value through _entry_value (never .lower() a dict) and drop empties.
+        addr_wl = {_entry_value(a).lower() for a in wl.get("addresses", []) if _entry_value(a)}
+        addr_bl = {_entry_value(a).lower() for a in bl.get("addresses", []) if _entry_value(a)}
         conflicts = sorted(addr_wl & addr_bl)
         if conflicts:
             self._conflict_label.config(
@@ -1589,7 +1628,7 @@ class ListsTab(ttk.Frame):
 
                 # --- Whitelist conflict check ---
                 wl = config_io.load_whitelist()
-                if val in {d.lower() for d in wl.get("domains", [])}:
+                if val in {_entry_value(d).lower() for d in wl.get("domains", []) if _entry_value(d)}:
                     messagebox.showerror(
                         "Whitelist conflict",
                         f"'{val}' is on your whitelist. Remove it there first.",
@@ -1612,7 +1651,7 @@ class ListsTab(ttk.Frame):
                 # clobbered; the fresh read inside the lock is the dedup read). ---
                 with file_lock.locked(paths.BLACKLIST_PATH):
                     data = config_io.load_blacklist()
-                    if val in {d.lower() for d in data.get("domains", [])}:
+                    if val in {_entry_value(d).lower() for d in data.get("domains", [])}:
                         messagebox.showinfo("Already blocked",
                                             f"'{val}' is already on the blacklist.",
                                             parent=self.app)
@@ -1623,7 +1662,7 @@ class ListsTab(ttk.Frame):
                 # Whitelist domain (C7: dedup-load + append + save under lock).
                 with file_lock.locked(paths.WHITELIST_PATH):
                     data = config_io.load_whitelist()
-                    if val in {d.lower() for d in data.get("domains", [])}:
+                    if val in {_entry_value(d).lower() for d in data.get("domains", []) if _entry_value(d)}:
                         messagebox.showinfo("Already whitelisted",
                                             f"'{val}' is already on the whitelist.",
                                             parent=self.app)
@@ -1636,7 +1675,7 @@ class ListsTab(ttk.Frame):
             with file_lock.locked(paths.WHITELIST_PATH):
                 data = config_io.load_whitelist()
                 key = "addresses" if kind == "address" else "domains"
-                if val.lower() not in {x.lower() for x in data[key]}:
+                if val.lower() not in {_entry_value(x).lower() for x in data[key]}:
                     data[key].append(val)
                     config_io.save_whitelist(data)
         else:
@@ -1647,7 +1686,7 @@ class ListsTab(ttk.Frame):
                 key = {"address": "addresses",
                        "display_name": "display_names",
                        "subject_keyword": "subject_keywords"}[kind]
-                if val.lower() not in {x.lower() for x in data.setdefault(key, [])}:
+                if val.lower() not in {_entry_value(x).lower() for x in data.setdefault(key, [])}:
                     data[key].append(val)
                     config_io.save_blacklist(data)
         self.refresh()
@@ -1663,7 +1702,8 @@ class ListsTab(ttk.Frame):
             with file_lock.locked(paths.WHITELIST_PATH):
                 data = config_io.load_whitelist()
                 key = "addresses" if kind == "address" else "domains"
-                data[key] = [x for x in data[key] if x.lower() != value.lower()]
+                data[key] = [x for x in data[key]
+                             if _entry_value(x).lower() != value.lower()]
                 config_io.save_whitelist(data)
         else:
             # C7: load + filter + save under one lock (fresh read under lock).
@@ -1677,7 +1717,8 @@ class ListsTab(ttk.Frame):
                     key = "subject_keywords"
                 else:
                     key = "display_names"
-                data[key] = [x for x in data.get(key, []) if x.lower() != value.lower()]
+                data[key] = [x for x in data.get(key, [])
+                             if _entry_value(x).lower() != value.lower()]
                 config_io.save_blacklist(data)
         self.refresh()
 
@@ -1725,18 +1766,20 @@ class ListsTab(ttk.Frame):
             writer.writerow(["kind", "value"])
             if which == "whitelist":
                 for a in data.get("addresses", []):
-                    writer.writerow(["address", a])
+                    writer.writerow(["address", _entry_value(a)])
                 for d in data.get("domains", []):
-                    writer.writerow(["domain", d])
+                    writer.writerow(["domain", _entry_value(d)])
             else:
+                # Blacklist entries may be provenance dicts; export the value
+                # only (the kind/value CSV has no column for provenance).
                 for a in data.get("addresses", []):
-                    writer.writerow(["address", a])
+                    writer.writerow(["address", _entry_value(a)])
                 for d in data.get("domains", []):
-                    writer.writerow(["domain", d])
+                    writer.writerow(["domain", _entry_value(d)])
                 for n in data.get("display_names", []):
-                    writer.writerow(["display_name", n])
+                    writer.writerow(["display_name", _entry_value(n)])
                 for k in data.get("subject_keywords", []):
-                    writer.writerow(["subject_keyword", k])
+                    writer.writerow(["subject_keyword", _entry_value(k)])
         messagebox.showinfo("Export complete", f"Wrote {path}.")
 
 
@@ -3817,14 +3860,6 @@ class SettingsTab(ttk.Frame):
             command=self._on_check_train_folders_now
         ).pack(anchor=tk.W, pady=(2, 0))
 
-        time_row = ttk.Frame(misc)
-        time_row.pack(fill=tk.X, pady=(6, 0))
-        ttk.Label(time_row, text="Daily report time (24h HH:MM):").pack(side=tk.LEFT)
-        self._report_time_var = tk.StringVar(value="08:00")
-        ttk.Entry(time_row, textvariable=self._report_time_var, width=8).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(time_row, text="Apply",
-                   command=self._on_apply_report_time).pack(side=tk.LEFT, padx=(8, 0))
-
         # Filter check interval — how often launchd wakes spam_filter.py.
         interval_row = ttk.Frame(misc)
         interval_row.pack(fill=tk.X, pady=(6, 0))
@@ -3909,9 +3944,6 @@ class SettingsTab(ttk.Frame):
         self._train_prompt_var.set(
             config.get("ui", {}).get("prompt_missing_train_folder", True))
 
-        hour = config.get("summary", {}).get("hour", 8)
-        minute = config.get("summary", {}).get("minute", 0)
-        self._report_time_var.set(f"{hour:02d}:{minute:02d}")
         self._interval_var.set(
             int(config.get("filter", {}).get("interval_minutes", 15))
         )
@@ -4030,26 +4062,6 @@ class SettingsTab(ttk.Frame):
         threading.Thread(
             target=self.app._check_train_folders_bg,
             args=(config,), daemon=True).start()
-
-    def _on_apply_report_time(self):
-        try:
-            hour, _, minute = self._report_time_var.get().partition(":")
-            h = int(hour)
-            m = int(minute) if minute else 0
-        except ValueError:
-            messagebox.showerror("Time format", "Use HH:MM in 24-hour format.")
-            return
-        # C7: write ONLY summary.hour/minute fresh under the lock.
-        def _set(config):
-            config.setdefault("summary", {})["hour"] = h
-            config["summary"]["minute"] = m
-        config_io.update_config(_set)
-        # v1.6.0: SMAppService plists are static inside the .app bundle.
-        # Schedule changes are written to config.json; daily_report.py reads
-        # config.json at runtime for its report hour/minute. No plist rewrite
-        # or agent re-registration needed.
-        messagebox.showinfo("Applied",
-                             f"Daily report will now run at {h:02d}:{m:02d}.")
 
     def _on_apply_filter_interval(self):
         try:
@@ -5976,12 +5988,12 @@ def _absorb_row(header: list[str], row: list[str],
 
     if address:
         if target_wl:
-            if address.lower() in {x.lower() for x in wl["addresses"]}:
+            if address.lower() in {_entry_value(x).lower() for x in wl["addresses"]}:
                 skipped += 1
             else:
                 wl["addresses"].append(address); added += 1
         else:
-            if address.lower() in {x.lower() for x in bl["addresses"]}:
+            if address.lower() in {_entry_value(x).lower() for x in bl["addresses"]}:
                 skipped += 1
             else:
                 bl["addresses"].append(address); added += 1
@@ -5997,17 +6009,17 @@ def _absorb_row(header: list[str], row: list[str],
         d = d.lstrip("@").rstrip(".").lower()
         if d and "." in d and re.fullmatch(r"[a-z0-9.\-]+", d):
             if target_bl:
-                if d.lower() in {x.lower() for x in bl.get("domains", [])}:
+                if d.lower() in {_entry_value(x).lower() for x in bl.get("domains", [])}:
                     skipped += 1
                 else:
                     bl.setdefault("domains", []).append(d); added += 1
             else:
-                if d.lower() in {x.lower() for x in wl.get("domains", [])}:
+                if d.lower() in {_entry_value(x).lower() for x in wl.get("domains", [])}:
                     skipped += 1
                 else:
                     wl.setdefault("domains", []).append(d); added += 1
     if name and target_bl:
-        if name.lower() in {x.lower() for x in bl["display_names"]}:
+        if name.lower() in {_entry_value(x).lower() for x in bl["display_names"]}:
             skipped += 1
         else:
             bl["display_names"].append(name); added += 1

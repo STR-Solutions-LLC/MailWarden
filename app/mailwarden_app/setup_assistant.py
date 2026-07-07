@@ -56,7 +56,6 @@ def _merge_finalized_config(
     is_fresh_install: bool,
     api_key: str,
     recipient: str,
-    time_str: str,
     menu_bar_enabled: bool,
 ) -> dict:
     """Pure seed+merge step for Setup finalize (audit B2).
@@ -90,16 +89,9 @@ def _merge_finalized_config(
         existing_by_email[a["username"]] = a
     cfg["accounts"] = list(existing_by_email.values())
 
+    # The daily report runs statically at 08:00; there is no configurable
+    # report time, so only the recipient is written into the summary block.
     cfg["summary"]["recipient"] = recipient
-
-    time_str = time_str or "08:00"
-    hour, _, minute = time_str.partition(":")
-    try:
-        cfg["summary"]["hour"] = int(hour)
-        cfg["summary"]["minute"] = int(minute) if minute else 0
-    except ValueError:
-        cfg["summary"]["hour"] = 8
-        cfg["summary"]["minute"] = 0
 
     cfg["ui"]["menu_bar_enabled"] = bool(menu_bar_enabled)
     # §0.11: dry run ON for new installs only; existing installs keep their setting.
@@ -133,7 +125,6 @@ class SetupAssistant(tk.Tk):
         self._api_key_var = tk.StringVar()
         self._api_key_status = tk.StringVar(value="")
         self._menu_bar_var = tk.BooleanVar(value=True)
-        self._summary_time_var = tk.StringVar(value="08:00")
         self._summary_recipient_var = tk.StringVar(value="")
         self._accounts: list[dict] = []
 
@@ -380,8 +371,8 @@ class SetupAssistant(tk.Tk):
                   style="Heading.TLabel").pack(anchor=tk.W, pady=(0, 4))
         ttk.Label(self.content, text=(
             "MailWarden sends a daily summary email showing what was filtered "
-            "and your current API usage. Choose where to send it and at what "
-            "time."),
+            "and your current API usage. It arrives each morning at 8:00 AM. "
+            "Choose where to send it."),
             wraplength=700, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 12))
 
         frm = ttk.Frame(self.content)
@@ -390,12 +381,6 @@ class SetupAssistant(tk.Tk):
         ttk.Label(frm, text="Send to:", width=12).grid(row=0, column=0, sticky=tk.W)
         ttk.Entry(frm, textvariable=self._summary_recipient_var,
                   width=40).grid(row=0, column=1, sticky=tk.W + tk.E, pady=4)
-
-        ttk.Label(frm, text="Time:", width=12).grid(row=1, column=0, sticky=tk.W)
-        time_entry = ttk.Entry(frm, textvariable=self._summary_time_var, width=10)
-        time_entry.grid(row=1, column=1, sticky=tk.W, pady=4)
-        ttk.Label(frm, text="(24-hour, HH:MM — local time)",
-                  foreground="#666").grid(row=1, column=2, sticky=tk.W, padx=(8, 0))
 
         frm.columnconfigure(1, weight=1)
 
@@ -435,7 +420,7 @@ class SetupAssistant(tk.Tk):
         summary += [
             "",
             f"Daily report:       {self._summary_recipient_var.get()} "
-            f"at {self._summary_time_var.get()}",
+            "at 8:00 AM",
             f"Menu bar icon:      {'enabled' if self._menu_bar_var.get() else 'disabled'}",
             "",
             "When you click Install and Start, MailWarden will:",
@@ -489,7 +474,6 @@ class SetupAssistant(tk.Tk):
             self._is_fresh_install,
             self._api_key_var.get().strip(),
             self._summary_recipient_var.get().strip(),
-            self._summary_time_var.get().strip(),
             self._menu_bar_var.get(),
         )
 

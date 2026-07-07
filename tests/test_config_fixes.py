@@ -244,7 +244,6 @@ def test_rerun_setup_preserves_existing_settings():
         is_fresh_install=False,
         api_key="sk-new",
         recipient="",
-        time_str="",
         menu_bar_enabled=True,
     )
 

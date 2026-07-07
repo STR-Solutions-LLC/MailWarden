@@ -96,9 +96,11 @@ DEFAULT_CONFIG: dict = {
         "use_starttls": True,
     },
     "summary": {
+        # The daily report runs statically at 08:00 via the SMAppService plist;
+        # there is no configurable report time. Legacy configs may still carry
+        # summary.hour / summary.minute — nothing reads them, so they are
+        # silently ignored (never crash).
         "recipient": "",
-        "hour": 8,
-        "minute": 0,
     },
     "whitelist": {"folder": None},
     "blacklist": {"folder": None},
