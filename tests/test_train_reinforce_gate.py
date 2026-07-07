@@ -308,6 +308,50 @@ def test_new_pattern_creates_pending_proposal_only(tmp_path, monkeypatch):
 
 
 # ===========================================================================
+# Audit 2026-07-06 C1: the batch/forward learner must be able to produce a
+# CURATE rule (legitimate mail the owner is sick of), not only "protect".
+# A protect rule can never override an authenticated brand-matched sender, so
+# before this fix, training on an unwanted-but-legitimate sender silently did
+# nothing. handle_new_pattern already honored rule_class; the prompt now
+# supplies it. These tests pin the through-flow and backward-compat.
+# ===========================================================================
+
+def _new_pattern_proposal(tmp_path, monkeypatch, classification):
+    sig_path = tmp_path / "signals.json"
+    pending_path = tmp_path / "pending_signals.json"
+    log_path = tmp_path / "signal_refinements.log"
+    monkeypatch.setattr(learn_signals, "SIGNALS_PATH", sig_path)
+    monkeypatch.setattr(learn_signals, "PENDING_SIGNALS_PATH", pending_path)
+    monkeypatch.setattr(learn_signals, "REFINEMENTS_LOG_PATH", log_path)
+    signals_data = _signals_doc([])
+    _write_json(sig_path, signals_data)
+    learn_signals.handle_new_pattern(
+        classification, _example("newpat.eml"), signals_data,
+        {"accounts": [], "smtp": {}}, learn_signals.setup_logging(),
+    )
+    return _read_json(pending_path)["conversations"][0]["proposed_refinement"]
+
+
+def test_c1_learner_curate_classification_produces_curate_rule(tmp_path, monkeypatch):
+    ref = _new_pattern_proposal(tmp_path, monkeypatch, {
+        "kind": "new_pattern", "headline": "political fundraising from PartyX",
+        "rationale": "legit but unwanted", "what_this_doesnt_cover": "",
+        "confidence": "high", "rule_class": "curate", "apply_scope": "all"})
+    assert ref["rule_class"] == "curate"
+    assert ref["scope"] == "all"
+
+
+def test_c1_learner_omitting_rule_class_defaults_to_protect(tmp_path, monkeypatch):
+    # Backward-compat: a model response without rule_class still yields a valid
+    # protect rule (pre-fix behavior preserved).
+    ref = _new_pattern_proposal(tmp_path, monkeypatch, {
+        "kind": "new_pattern", "headline": "phishing pattern",
+        "rationale": "credential theft", "what_this_doesnt_cover": "",
+        "confidence": "high"})
+    assert ref["rule_class"] == "protect"
+
+
+# ===========================================================================
 # 5. retired rule not matched: handle_duplicate returns False, no write.
 # ===========================================================================
 

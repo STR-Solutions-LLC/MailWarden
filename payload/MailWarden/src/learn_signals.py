@@ -395,6 +395,29 @@ Accuracy rules for refinement records:
   mechanic). "new_pattern" when it's a semantic regularity (framing,
   structure, urgency pattern).
 
+- rule_class — classify each new_pattern/add_infrastructure rule as one of:
+    "protect" = a BAD-ACTOR THREAT: phishing, scams, fraud, malware, or brand
+      impersonation — dangerous to anyone, from someone acting in bad faith.
+    "curate" = the owner personally no longer wants this LEGITIMATE mail (e.g.
+      political fundraising they are sick of, marketing from a real company
+      that ignores unsubscribe). This is NOT bad-actor spam — it is THIS
+      owner's preference; the same mail is fine for someone who wants it.
+  Decide from BOTH the email itself AND any owner directive: a genuine threat
+  is "protect" even if the owner's words are mild; a sick-of-it preference
+  about a real, legitimate sender is "curate" even if the owner calls it
+  "spam". This distinction matters at enforcement time: a "protect" rule will
+  NOT override an authenticated, brand-matched legitimate sender, whereas a
+  "curate" rule is an explicit owner preference that does. So mail the owner is
+  simply tired of (which is usually authenticated, legitimate bulk mail) MUST
+  be classified "curate" or the rule will silently never fire. When the mail is
+  a genuine bad-actor threat, or you are genuinely unsure, choose "protect".
+
+- apply_scope — parse ONLY from the owner's directive (never the email content)
+  how widely to apply the rule: "all" if they say all/every account/everywhere;
+  "this_account" if they say only this account/just here/this inbox only;
+  otherwise null (they did not say). Omit rule_class and apply_scope for a
+  "duplicate_of" verdict.
+
 - If two candidate patterns overlap, return the MORE SPECIFIC one.
 
 When a USER'S DIRECTIVE is present in an example, treat it as a category-level
@@ -487,7 +510,9 @@ is a list with ONE entry per new example in the same order:
       "headline": "...",
       "rationale": "...",
       "what_this_doesnt_cover": "...",
-      "confidence": "high" | "medium" | "low"
+      "confidence": "high" | "medium" | "low",
+      "rule_class": "protect" | "curate",
+      "apply_scope": "all" | "this_account" | null
     }
   ]
 }
