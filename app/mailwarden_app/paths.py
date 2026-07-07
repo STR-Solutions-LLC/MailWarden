@@ -35,6 +35,11 @@ PENDING_SIGNALS_PATH = MEMORY_DIR / "pending_signals.json"
 EULA_SENT_PATH = MEMORY_DIR / "eula_sent.json"
 UPDATE_CHECK_PATH = MEMORY_DIR / "update_check.json"
 INSTALLER_STATE_PATH = MEMORY_DIR / "installer_state.json"
+# Last-run keychain read outcome (Keychain migration). The engine writes this
+# each keychain-backed filter/report run (booleans + key names only, never
+# secret values); the Dashboard and menu bar read it to surface a locked/denied
+# keychain. Only written while secrets.backend == "keychain".
+KEYCHAIN_STATUS_PATH = MEMORY_DIR / "keychain_status.json"
 # Last bundle version we registered SMAppService agents for. Drives the
 # auto-refresh of stale registrations on upgrade — see app_entrypoint.py.
 REGISTERED_VERSION_PATH = MEMORY_DIR / "registered_version.json"

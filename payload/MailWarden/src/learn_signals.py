@@ -44,6 +44,7 @@ import time
 import anthropic
 
 import file_lock
+import keychain_store
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
@@ -90,7 +91,13 @@ def setup_logging() -> logging.Logger:
 
 def load_config() -> dict:
     with open(CONFIG_PATH, "r") as f:
-        return json.load(f)
+        data = json.load(f)
+    # Keychain: hydrate secret sentinels (no-op while backend == "config").
+    # Suppress Security UI first when keychain-backed — the learner also runs
+    # headless (spawned by the filter) so it must never prompt (§4.3).
+    if keychain_store.backend_of(data) == "keychain":
+        keychain_store.set_user_interaction_allowed(False)
+    return keychain_store.hydrate(data)
 
 
 def read_learner_scan_timestamp(config: dict) -> str | None:

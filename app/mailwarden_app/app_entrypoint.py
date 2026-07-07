@@ -394,6 +394,12 @@ def _run_classify_eml() -> int:
         if paths.CONFIG_PATH.is_file():
             with paths.CONFIG_PATH.open(encoding="utf-8") as f:
                 cfg = _json.load(f)
+            # Keychain: hydrate secret sentinels so the API key resolves under a
+            # keychain backend too (§5.3). No-op while backend == "config"; the
+            # $ANTHROPIC_API_KEY env override below still wins when set. Runs in a
+            # user Terminal context where the keychain is normally unlocked.
+            from . import keychain_store
+            cfg = keychain_store.hydrate(cfg)
     except Exception:
         cfg = {}
     anthro = cfg.get("anthropic", {}) if isinstance(cfg, dict) else {}

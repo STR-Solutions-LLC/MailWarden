@@ -22,6 +22,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import file_lock
+import keychain_store
 
 from utils import parse_from_address, extract_domain, random_token
 
@@ -61,6 +62,9 @@ LEARNER_STATE_PATH = PROJECT_ROOT / "memory" / "learner_state.json"
 # proposal times out (finding #16) so the history is not perpetually empty.
 REFINEMENTS_LOG_PATH = PROJECT_ROOT / "memory" / "signal_refinements.log"
 LOG_PATH = PROJECT_ROOT / "logs" / "spam_filter.log"
+# Keychain migration: last-run keychain read outcome. Only written while
+# secrets.backend == "keychain". See spam_filter.KEYCHAIN_STATUS_PATH.
+KEYCHAIN_STATUS_PATH = PROJECT_ROOT / "memory" / "keychain_status.json"
 
 
 def setup_logging() -> logging.Logger:
@@ -90,7 +94,58 @@ def setup_logging() -> logging.Logger:
 
 def load_config() -> dict:
     with open(CONFIG_PATH, "r") as f:
-        return json.load(f)
+        data = json.load(f)
+    # Keychain: hydrate secret sentinels (no-op while backend == "config").
+    # Suppress Security UI first when keychain-backed so this headless read
+    # fails closed instead of prompting (§4.3).
+    if keychain_store.backend_of(data) == "keychain":
+        keychain_store.set_user_interaction_allowed(False)
+    return keychain_store.hydrate(data)
+
+
+def _write_keychain_status(config: dict, pid_context: str) -> None:
+    """Record the per-run keychain read outcome (§6.2/§7.1). Best-effort; never
+    raises. Only meaningful — and only called — when the backend is keychain."""
+    try:
+        record = keychain_store.status_record(config, pid_context)
+        KEYCHAIN_STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=KEYCHAIN_STATUS_PATH.parent,
+                                        suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(record, f, indent=2)
+            os.replace(tmp_path, KEYCHAIN_STATUS_PATH)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
+    except Exception:
+        pass
+
+
+def _keychain_preflight(config: dict, logger: logging.Logger) -> bool:
+    """Keychain fail-closed gate for the report (§7.1). Returns True when the
+    caller must skip the run (a required secret has NO usable value). Shadow-
+    window failures (§6.2) served by the plaintext fallback are logged and land
+    in keychain_status.json as ok:false but do NOT skip the run — mirrors
+    spam_filter._keychain_preflight. INERT while secrets.backend != "keychain"."""
+    if keychain_store.backend_of(config) != "keychain":
+        return False
+    _write_keychain_status(config, "run-report")
+    hard = keychain_store.hard_secret_errors(config)
+    if hard:
+        keys = ", ".join(sorted({str(e.get("key", "?")) for e in hard}))
+        logger.error(
+            "[KEYCHAIN] required secret(s) unreadable (%s); skipping the daily "
+            "report without sending mail", keys)
+        return True
+    errors = config.get("_secret_errors") or []
+    if errors:
+        keys = ", ".join(sorted({str(e.get("key", "?")) for e in errors}))
+        logger.warning(
+            "[KEYCHAIN] shadow-mode plaintext fallback used for: %s (keychain "
+            "read failed; migration cannot verify until reads succeed)", keys)
+    return False
 
 
 # Retired shipped-default signals (fix a-1). Stripped in-memory on every load so
@@ -1438,6 +1493,11 @@ def main(now=None):
     now = now if now is not None else datetime.now()
 
     config = load_config()
+
+    # Keychain fail-closed gate (§7.1). Inert while backend == "config".
+    if _keychain_preflight(config, logger):
+        return
+
     signals_data = load_signals()
     api_key = config.get("anthropic", {}).get("api_key", "")
 

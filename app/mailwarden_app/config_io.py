@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from . import file_lock
+from . import keychain_store
 from . import paths
 
 
@@ -127,6 +128,17 @@ DEFAULT_CONFIG: dict = {
         "current_version": "1.0",
         "sent_to_accounts": {},
     },
+    # Secrets storage backend (Keychain migration). "config" = the plaintext
+    # config fields used today (the shipped default); "keychain" = the secret
+    # fields hold the "@keychain:v1" sentinel and real values live in the login
+    # keychain, hydrated in memory on load and stripped on save. The whole
+    # keychain feature is DARK behind this flag — every keychain code path is
+    # inert while backend == "config". migration.state drives the resumable
+    # migration state machine (docs/keychain-design-plan.md §5.3/§6).
+    "secrets": {
+        "backend": "config",
+        "migration": {"state": "none", "verified_tick_at": "", "scrubbed_at": ""},
+    },
     "ui": {
         "menu_bar_enabled": True,
         "update_check_last_run": "",
@@ -223,14 +235,20 @@ def load_config() -> dict:
                     anthropic_block.pop("confidence_threshold")
             # M16: fill in any schema keys missing from this (older) saved config.
             data = _deep_merge(DEFAULT_CONFIG, data)
-            return data
+            # Keychain: replace "@keychain:…" secret sentinels with the real
+            # values in memory. No-op (returns data unchanged) while
+            # secrets.backend == "config" — the shipped default.
+            return keychain_store.hydrate(data)
         except (json.JSONDecodeError, OSError):
             pass
     return copy.deepcopy(DEFAULT_CONFIG)
 
 
 def save_config(config: dict) -> None:
-    save_json_atomic(paths.CONFIG_PATH, config)
+    # Keychain: strip secret values to the sentinel before they touch disk when
+    # backend == "keychain". No-op (returns the same object) while backend ==
+    # "config", so the on-disk bytes are unchanged from today.
+    save_json_atomic(paths.CONFIG_PATH, keychain_store.strip_for_save(config))
     # 600 — readable only by the user (contains API key + email passwords)
     try:
         os.chmod(paths.CONFIG_PATH, 0o600)
@@ -297,6 +315,12 @@ def get_or_create_self_mail_secret() -> "str | None":
             if not paths.CONFIG_PATH.exists():
                 return None
             cfg = load_config()
+            # Keychain backend: the self-mail secret lives in the login keychain
+            # (folded into the keychain migration). Inert while backend ==
+            # "config" — the branch below is never entered and the plaintext
+            # config path runs byte-for-byte as before.
+            if keychain_store.backend_of(cfg) == "keychain":
+                return _self_mail_secret_keychain(cfg)
             secret = cfg.get(SELF_MAIL_SECRET_KEY)
             if isinstance(secret, str) and secret.strip():
                 return secret.strip()
@@ -306,6 +330,36 @@ def get_or_create_self_mail_secret() -> "str | None":
             return secret
     except Exception:
         return None
+
+
+def _self_mail_secret_keychain(cfg: dict) -> "str | None":
+    """Keychain-backend path for the per-install self-mail HMAC secret (GUI
+    process — the only one allowed to WRITE keychain items). Reads the item;
+    generates + stores it and marks the config field as the sentinel on first
+    use. Fail-open: returns None on a locked keychain, a write failure, or an
+    absent framework, so the caller stamps without the HMAC header and the
+    body-marker guard still protects. The caller already holds the config lock.
+    """
+    if not keychain_store.available():
+        return None
+    acct = keychain_store.self_mail_account()
+    try:
+        existing = keychain_store.read_secret(acct)
+    except (keychain_store.KeychainLocked, keychain_store.KeychainError):
+        return None
+    if isinstance(existing, str) and existing.strip():
+        return existing.strip()
+    secret = secrets.token_hex(32)
+    try:
+        keychain_store.write_secret(acct, keychain_store.label_for(acct), secret)
+    except Exception:
+        return None
+    cfg[SELF_MAIL_SECRET_KEY] = keychain_store.SENTINEL
+    try:
+        save_config(cfg)
+    except Exception:
+        pass
+    return secret
 
 
 def compute_self_mail_auth(secret: str, message_id: str) -> str:

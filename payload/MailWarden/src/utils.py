@@ -167,6 +167,29 @@ def _self_mail_config_path() -> Path:
     return Path(__file__).resolve().parent.parent / "config" / "config.json"
 
 
+def _self_mail_backend_is_keychain(cfg) -> bool:
+    """True when this config's secrets backend is 'keychain'. Defensive against
+    a missing/odd secrets block (defaults to config)."""
+    try:
+        return (cfg.get("secrets") or {}).get("backend") == "keychain"
+    except Exception:
+        return False
+
+
+def _read_self_mail_secret_keychain() -> "str | None":
+    """READ-ONLY keychain lookup of the self-mail secret (engine never writes
+    keychain items). Fail-open None on a locked/absent keychain or a missing
+    framework, so self-mail stamping falls back to the body-marker guard."""
+    try:
+        import keychain_store
+        if not keychain_store.available():
+            return None
+        v = keychain_store.read_secret(keychain_store.self_mail_account())
+        return v.strip() if isinstance(v, str) and v.strip() else None
+    except Exception:
+        return None
+
+
 def get_or_create_self_mail_secret(config_path=None) -> "str | None":
     """Return this install's shared self-mail HMAC secret, generating and
     persisting it on first use. Per-install (never a shipped default); stored as
@@ -192,6 +215,14 @@ def get_or_create_self_mail_secret(config_path=None) -> "str | None":
                 return None
             with open(path, "r") as f:
                 cfg = json.load(f)
+            # Keychain backend: read the self-mail secret from the login keychain
+            # (READ-ONLY — the engine never writes keychain items; the GUI mints
+            # this during migration / first-run). Fail-open None on a locked or
+            # absent keychain so the caller stamps without the HMAC header. INERT
+            # while backend == "config" (the shipped default): the plaintext path
+            # below runs byte-for-byte as before.
+            if _self_mail_backend_is_keychain(cfg):
+                return _read_self_mail_secret_keychain()
             secret = cfg.get(_SELF_MAIL_SECRET_KEY)
             if isinstance(secret, str) and secret.strip():
                 return secret.strip()

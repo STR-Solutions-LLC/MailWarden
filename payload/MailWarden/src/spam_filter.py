@@ -28,6 +28,7 @@ from pathlib import Path
 import anthropic
 
 import file_lock
+import keychain_store
 
 from utils import (
     parse_from_address, extract_domain,
@@ -87,6 +88,10 @@ PARSE_FAILURES_DIR = PROJECT_ROOT / "memory" / "classify_parse_failures"
 # rolled up here so the Dashboard's lifetime totals (and the daily report's
 # signal-history totals) never reset to zero. There is exactly ONE such store.
 LIFETIME_STATS_PATH = PROJECT_ROOT / "memory" / "lifetime_stats.json"
+# Keychain migration: last-run keychain read outcome (booleans + key names only,
+# never secret values). Written each keychain-backed run; read by the Dashboard/
+# menu bar. Only written while secrets.backend == "keychain".
+KEYCHAIN_STATUS_PATH = PROJECT_ROOT / "memory" / "keychain_status.json"
 
 # Wave-4 reply-corridor state. Per (account, folder, UIDVALIDITY) high-UID
 # watermark so the owner's YES/APPROVE/numbered command replies are picked up
@@ -149,7 +154,66 @@ def setup_logging(level_name: str) -> logging.Logger:
 
 def load_config() -> dict:
     with open(CONFIG_PATH, "r") as f:
-        return json.load(f)
+        data = json.load(f)
+    # Keychain: hydrate "@keychain:…" secret sentinels from the login keychain.
+    # No-op while secrets.backend == "config" (the shipped default), so this
+    # returns exactly what json.load produced. Suppress Security UI FIRST when
+    # keychain-backed so a locked keychain can never block this headless read
+    # behind an invisible dialog (§4.3) — it fails closed on the status code.
+    if keychain_store.backend_of(data) == "keychain":
+        keychain_store.set_user_interaction_allowed(False)
+    return keychain_store.hydrate(data)
+
+
+def _write_keychain_status(config: dict, pid_context: str) -> None:
+    """Record the per-run keychain read outcome (§6.2/§7.1). Best-effort; never
+    raises. Only meaningful — and only called — when the backend is keychain."""
+    try:
+        record = keychain_store.status_record(config, pid_context)
+        KEYCHAIN_STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=KEYCHAIN_STATUS_PATH.parent,
+                                        suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(record, f, indent=2)
+            os.replace(tmp_path, KEYCHAIN_STATUS_PATH)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
+    except Exception:
+        pass
+
+
+def _keychain_preflight(config: dict, logger: logging.Logger,
+                        pid_context: str) -> bool:
+    """Keychain fail-closed gate (§7.1). Returns True when the caller must skip
+    the ENTIRE run without touching any mail (a required secret has NO usable
+    value — locked keychain, missing item, or ACL denial with no fallback).
+    Shadow-window failures (§6.2) where the plaintext fallback served the secret
+    are logged and land in keychain_status.json as ok:false (so Batch 3's
+    tick-verify can never pass on a keychain that didn't genuinely work) but do
+    NOT skip the run — shadow mode exists precisely so filtering keeps working
+    mid-migration. INERT while secrets.backend != "keychain": returns False
+    immediately with no side effects, so config-backend behavior is
+    byte-for-byte unchanged."""
+    if keychain_store.backend_of(config) != "keychain":
+        return False
+    _write_keychain_status(config, pid_context)
+    hard = keychain_store.hard_secret_errors(config)
+    if hard:
+        keys = ", ".join(sorted({str(e.get("key", "?")) for e in hard}))
+        logger.error(
+            "[KEYCHAIN] required secret(s) unreadable (%s); skipping this run "
+            "without touching any mail", keys)
+        return True
+    errors = config.get("_secret_errors") or []
+    if errors:
+        keys = ", ".join(sorted({str(e.get("key", "?")) for e in errors}))
+        logger.warning(
+            "[KEYCHAIN] shadow-mode plaintext fallback used for: %s (keychain "
+            "read failed; migration cannot verify until reads succeed)", keys)
+    return False
 
 
 def load_processed_ids() -> dict:
@@ -1848,7 +1912,11 @@ def save_config_atomic(config: dict, config_path: Path):
     fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
-            json.dump(config, f, indent=2)
+            # Keychain: strip secret values to the sentinel before they hit disk
+            # when backend == "keychain" (closes the EULA-merge leak, §5.3). A
+            # pass-through — same object, identical bytes — while backend ==
+            # "config".
+            json.dump(keychain_store.strip_for_save(config), f, indent=2)
         os.replace(tmp_path, config_path)
     except Exception:
         if os.path.exists(tmp_path):
@@ -7435,6 +7503,12 @@ def run_filter(force: bool = False):
     """
     config = load_config()
     logger = setup_logging(config.get("filter", {}).get("log_level", "INFO"))
+
+    # Keychain fail-closed gate (§7.1). Inert while secrets.backend == "config".
+    # When keychain-backed and a required secret is unreadable, skip the whole
+    # tick — no IMAP login, no classification, no mail moved.
+    if _keychain_preflight(config, logger, "run-filter"):
+        return
 
     # Reset the per-tick learner-trigger guard so each filter run may spawn
     # exactly one learner (and only one, no matter how many spam examples
