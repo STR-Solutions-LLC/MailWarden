@@ -193,6 +193,7 @@ def _approve_harness(monkeypatch, *, msg_data, dry_run=False,
     calls = {
         "add_approved_domain": [],
         "add_whitelist_domain": [],
+        "add_whitelist_address": [],
         "send_email": [],           # (subject, body, to_addr)
         "notify_unverified": 0,
         "mark_uid_seen": 0,
@@ -281,6 +282,11 @@ def _approve_harness(monkeypatch, *, msg_data, dry_run=False,
         return add_wl_returns
     monkeypatch.setattr(spam_filter, "add_whitelist_domain", _add_wl)
 
+    def _add_wl_addr(address, logger):
+        calls["add_whitelist_address"].append(address)
+        return add_wl_returns
+    monkeypatch.setattr(spam_filter, "add_whitelist_address", _add_wl_addr)
+
     monkeypatch.setattr(spam_filter, "load_report_approvals_store",
                         lambda logger: dict(approvals_store or {}))
 
@@ -332,6 +338,74 @@ def test_branch_owner_approve_writes_domain(monkeypatch):
                     "whenever a message is verified as genuinely from that "
                     "domain. Mail that can't be verified will still be "
                     "judged normally.")
+
+
+# --- Audit 2026-07-06 C2: a prior APPROVE must not silently cancel the owner's
+# own AI-enforced category (curate) rule. ---
+def test_c2_account_has_active_ai_curate_detection():
+    def sig(refs):
+        return {"ai_refinements": refs}
+    acct = "owner@example.com"
+    assert spam_filter._account_has_active_ai_curate(
+        sig([{"status": "active", "rule_class": "curate",
+              "enforcement": "ai", "scope": "all"}]), acct) is True
+    assert spam_filter._account_has_active_ai_curate(
+        sig([{"status": "active", "rule_class": "curate",
+              "enforcement": "mixed", "scope": "all"}]), acct) is True
+    # legacy curate rule with no enforcement field still counts
+    assert spam_filter._account_has_active_ai_curate(
+        sig([{"status": "active", "rule_class": "curate", "scope": "all"}]),
+        acct) is True
+    # deterministic curate fires pre-AI -> no bypass needed
+    assert spam_filter._account_has_active_ai_curate(
+        sig([{"status": "active", "rule_class": "curate",
+              "enforcement": "deterministic", "scope": "all"}]), acct) is False
+    # protect rule is not a curate preference
+    assert spam_filter._account_has_active_ai_curate(
+        sig([{"status": "active", "rule_class": "protect",
+              "enforcement": "ai", "scope": "all"}]), acct) is False
+    # retired curate does not count
+    assert spam_filter._account_has_active_ai_curate(
+        sig([{"status": "retired", "rule_class": "curate",
+              "enforcement": "ai", "scope": "all"}]), acct) is False
+    assert spam_filter._account_has_active_ai_curate(sig([]), acct) is False
+
+
+def test_c2_rule0_carries_curate_override():
+    assert "USER PREFERENCE (curate) rule" in spam_filter.RULE_0_TEXT
+    assert "outranks their earlier approval" in spam_filter.RULE_0_TEXT
+    assert "those four" in spam_filter.RULE_0_TEXT
+
+
+# --- Audit 2026-07-06 C4: APPROVE on a sender at a SHARED provider must trust
+# only the exact address, never the whole provider. ---
+def _shared_token_store(token="abc123"):
+    return {token: {"created": datetime.now().isoformat(), "account": "Acct",
+                    "window_end": datetime.now().isoformat(),
+                    "entries": {
+                        "1": {"from_domain": "gmail.com",
+                              "from": "Scammy <invoice-dept-2291@gmail.com>",
+                              "subject": "Your invoice", "block_source": "ai"}}}}
+
+
+def test_c4_approve_shared_provider_trusts_exact_address_not_domain(monkeypatch):
+    calls = _approve_harness(monkeypatch, msg_data=_mwr_msg(body="APPROVE 1"),
+                             approvals_store=_shared_token_store())
+    # Exact address whitelisted; the whole gmail.com domain is NOT approved.
+    assert calls["add_whitelist_address"] == ["invoice-dept-2291@gmail.com"]
+    assert calls["add_approved_domain"] == []
+    assert calls["add_whitelist_domain"] == []
+    body = calls["send_email"][0][1]
+    assert "invoice-dept-2291@gmail.com" in body
+    assert "shared email provider" in body
+
+
+def test_c4_approve_company_domain_still_approves_whole_domain(monkeypatch):
+    # A non-shared (company) domain keeps the original whole-domain approval.
+    calls = _approve_harness(monkeypatch, msg_data=_mwr_msg(body="APPROVE 1"),
+                             approvals_store=_fresh_token_store())
+    assert calls["add_approved_domain"] == ["newsletter.test"]
+    assert calls["add_whitelist_address"] == []
 
 
 def test_branch_approve_plus_drop_runs_approve_and_tells_owner(monkeypatch):

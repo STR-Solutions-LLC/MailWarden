@@ -37,7 +37,7 @@ from utils import (
     clear_dnsbl_cache, verify_dkim_locally,
     make_tls_context,
 )
-from learn_signals import save_signals
+from learn_signals import save_signals, is_shared_mail_domain
 
 # Project root is the parent of src/
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -445,6 +445,27 @@ def add_whitelist_domain(domain: str, logger: logging.Logger) -> bool:
             return False
         data.setdefault("domains", []).append(d)
         data["_domains_set"] = set(data.get("_domains_set", set())) | {d}
+        save_whitelist(data)
+        return True
+
+
+def add_whitelist_address(address: str, logger: logging.Logger) -> bool:
+    """Locked read-modify-write: add ONE trusted exact ADDRESS (lowercased) to
+    whitelist.json's address tier, which the highest-priority gate
+    (check_whitelist_address_only) reads. Used when a report APPROVE names a
+    sender at a SHARED mail provider (gmail.com, etc.): trusting the whole
+    domain would wave through every account on that provider, so we trust only
+    the exact sender the owner approved. Returns True when newly added, False
+    when already present or empty."""
+    a = (address or "").strip().lower()
+    if not a or "@" not in a:
+        return False
+    with file_lock.locked(WHITELIST_PATH):
+        data = load_whitelist(logger)
+        if a in data.get("_addresses_set", set()):
+            return False
+        data.setdefault("addresses", []).append(a)
+        data["_addresses_set"] = set(data.get("_addresses_set", set())) | {a}
         save_whitelist(data)
         return True
 
@@ -4139,9 +4160,12 @@ RULE_0_TEXT = (
     "soft or learned signal — none may junk this message. The ONLY things that "
     "may still override are: (a) a link whose domain is unrelated to the "
     "approved sender, (b) an explicit request to send money or credentials to "
-    "an unrelated party, or (c) evidence the sender is forged or impersonated "
-    "rather than the approved domain. Absent one of those three, return "
-    "NOT_SPAM."
+    "an unrelated party, (c) evidence the sender is forged or impersonated "
+    "rather than the approved domain, or (d) the message clearly matches an "
+    "explicit USER PREFERENCE (curate) rule listed below in which the owner "
+    "asked NOT to receive this kind of legitimate mail — the owner's own rule "
+    "outranks their earlier approval of the sender, so junk it. Absent one of "
+    "those four, return NOT_SPAM."
 )
 RULE_0_SUBORDINATION_LINE = (
     "These hard signals — and every learned signal further below — are likewise "
@@ -4183,6 +4207,29 @@ _ATTRIBUTION_INSTRUCTION = (
     "identifiers of any rule above that materially influenced your decision "
     "(use an empty array if none)."
 )
+
+
+def _account_has_active_ai_curate(signals: dict, account_name: str = None) -> bool:
+    """True when the account has >=1 ACTIVE, in-scope curate rule whose
+    enforcement still needs the AI (``ai`` / ``mixed`` / legacy-none).
+
+    Audit 2026-07-06 C2: such a rule lives only in the AI prompt, so an
+    owner-approved AI-skip (or a domain-whitelist pass) would deliver matching
+    mail without ever consulting it — silently cancelling the owner's own
+    category rule. When one exists we must route approved-sender mail through
+    the AI so the rule can fire. Deterministic-only curate rules are excluded:
+    their exact tokens/senders are enforced at the keyword/blacklist gate, which
+    runs BEFORE the skip, so they need no bypass."""
+    for r in (signals.get("ai_refinements", []) or []):
+        if r.get("status", "active") != "active":
+            continue
+        if (r.get("rule_class") or "").strip().lower() != "curate":
+            continue
+        if (r.get("enforcement") or "").strip().lower() == "deterministic":
+            continue
+        if _refinement_in_scope(r, account_name):
+            return True
+    return False
 
 
 def _build_learned_lines(signals: dict, account_name: str = None):
@@ -9048,11 +9095,45 @@ USER'S FOLLOW-UP:
                                     invalid_nums.append(n)
                                     continue
                                 resolved_any = True
+                                # Audit 2026-07-06 C4: if the sender is at a
+                                # SHARED mail provider (gmail.com, yahoo.com,
+                                # …), approving the whole domain would trust
+                                # every account on that provider — the single
+                                # commonest source of real phishing. Trust only
+                                # the exact address the owner approved instead.
+                                appr_addr = (parse_from_address(
+                                    entry.get("from", "") or "").get("address")
+                                    or "").strip().lower()
+                                shared = is_shared_mail_domain(dom)
                                 # Finding #6: branch on what actually junked
                                 # this item. Legacy token records written
                                 # before block_source existed default to the
                                 # AI path — identical to prior behavior.
                                 source = (entry.get("block_source") or "ai")
+                                if shared and appr_addr and source != "subject_keyword":
+                                    # Exact-address rescue (gate 1). Covers both
+                                    # the pre-classifier and AI cases: the owner
+                                    # wants THIS sender, not the whole provider.
+                                    # (subject_keyword stays an honest no-op
+                                    # below, same as for non-shared domains.)
+                                    if add_whitelist_address(appr_addr, logger):
+                                        logger.info(
+                                            f"  WHITELISTED sender address: "
+                                            f"{appr_addr} (item {n}, shared "
+                                            f"provider {dom}, MWR-{mwr_token})")
+                                        ack_lines.append(
+                                            f"Approved {appr_addr} (item {n}). "
+                                            f"Because {dom} is a shared email "
+                                            f"provider used by many people, I "
+                                            f"trusted just this exact sender, "
+                                            f"not the whole {dom} domain. Future "
+                                            f"mail from this address won't be "
+                                            f"blocked.")
+                                    else:
+                                        ack_lines.append(
+                                            f"{appr_addr} is already on your "
+                                            f"trusted senders — no change.")
+                                    continue
                                 if source == "subject_keyword":
                                     # Case A: a deterministic rule the owner
                                     # set — no approval store can override it.
@@ -9468,6 +9549,15 @@ USER'S FOLLOW-UP:
                     # gates, so a hard-signal junk still wins.
                     approved_domain = _owner_approved_authenticated_domain(
                         msg_data, approved_domains)
+                    # Audit 2026-07-06 C2: the owner's OWN category (curate) rule
+                    # OUTRANKS a prior approval of the sender. If this account has
+                    # an active, in-scope AI-enforced curate rule, do NOT skip the
+                    # AI here — route the message through the classifier (which
+                    # carries RULE 0's curate override) so a clear match can still
+                    # be junked. Deterministic curate rules already fired earlier.
+                    if approved_domain and _account_has_active_ai_curate(
+                            signals, account_name):
+                        approved_domain = ""
                     if approved_domain:
                         total_evaluated += 1
                         logger.info(
