@@ -224,7 +224,16 @@ def get_or_create_self_mail_secret(config_path=None) -> "str | None":
             if _self_mail_backend_is_keychain(cfg):
                 return _read_self_mail_secret_keychain()
             secret = cfg.get(_SELF_MAIL_SECRET_KEY)
-            if isinstance(secret, str) and secret.strip():
+            # A SENTINEL-valued field ("@keychain:…") is NOT a real secret — it is
+            # a leftover from a keychain revert whose item was deleted. Treat it as
+            # ABSENT so the plaintext re-mint below runs, or the HMAC key would
+            # become the literal public sentinel and silently re-open the Wave-6
+            # spoofing bypass. ("Read-only" is about KEYCHAIN items; the engine may
+            # still mint + persist a plaintext self-mail secret at the config
+            # backend, exactly as before.)
+            import keychain_store as _ks
+            if isinstance(secret, str) and secret.strip() \
+                    and not secret.startswith(_ks.SENTINEL_PREFIX):
                 return secret.strip()
             secret = secrets.token_hex(32)
             cfg[_SELF_MAIL_SECRET_KEY] = secret

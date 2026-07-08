@@ -95,6 +95,17 @@ def load_config() -> dict:
     # Keychain: hydrate secret sentinels (no-op while backend == "config").
     # Suppress Security UI first when keychain-backed — the learner also runs
     # headless (spawned by the filter) so it must never prompt (§4.3).
+    #
+    # By design the learner has NO fail-closed keychain preflight, unlike the
+    # filter and report (§7.1). Two reasons this is correct and in scope:
+    #   1. It is spawned BY the filter, which already ran its own preflight in the
+    #      same session with the same keychain state a moment earlier — a hard
+    #      secret failure here would have failed that tick closed first.
+    #   2. It performs NO mail moves and NOTHING destructive: it reads example
+    #      .eml files and PROPOSES refinements by email. If the API key is
+    #      unreadable the Anthropic client call simply errors, the learner logs it
+    #      and exits — there is no partial-junking hazard to guard against. So the
+    #      all-or-nothing skip the filter/report need does not apply here.
     if keychain_store.backend_of(data) == "keychain":
         keychain_store.set_user_interaction_allowed(False)
     return keychain_store.hydrate(data)

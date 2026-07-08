@@ -19,6 +19,13 @@ Reads corpus from ~/Desktop/MailWarden-Benchmark/ (three labeled folders,
 plus the optional 4-Graymail folder, which is scored separately and excluded
 from recall/precision/FP).
 API key is read from $ANTHROPIC_API_KEY or ~/MailWarden/config/config.json.
+
+Offline regression gate (Keychain migration and any dark-shipped work):
+  tests/.venv/bin/python tools/eval_run.py --offline
+The `--offline` output must be BYTE-IDENTICAL to the same command run against a
+clean baseline worktree (e.g. `git worktree add <dir> <baseline-sha>` + run there
+with this same venv). The pre-classifier is deterministic and no prompt text may
+change, so any diff is a regression. Run `--offline` on both trees and `cmp` them.
 """
 import argparse
 import json

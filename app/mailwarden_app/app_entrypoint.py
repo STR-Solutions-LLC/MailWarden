@@ -74,6 +74,103 @@ def _cli_set_dry_run(value: str) -> int:
     return 0
 
 
+def _cli_keychain_verify() -> int:
+    """Migration step-2 probe (§6.2). Read every expected keychain item as THIS
+    (bundled-python) code identity, print a JSON verdict, and exit 0 when every
+    read succeeded else 1. Never prints a secret value. On a machine without the
+    Security framework (dev / CI) reports available:false and exits 1."""
+    from . import config_io, keychain_store
+    import json
+    if not keychain_store.available():
+        print(json.dumps({"ok": False, "available": False,
+                          "missing": [], "locked": False, "errors": []}))
+        return 1
+    # Headless: suppress Security UI so an ACL miss / locked keychain returns an
+    # error code instead of blocking behind an invisible dialog (§4.3).
+    keychain_store.set_user_interaction_allowed(False)
+    # Fresh-install caller passes the expected item KEYS (never secret values) on
+    # stdin, because config.json is not written until AFTER provisioning — a
+    # disk-derived key list would be empty and the verify would pass vacuously.
+    # When no keys are supplied, derive from the on-disk config (upgrade path).
+    keys = None
+    if "--keys-from-stdin" in sys.argv:
+        try:
+            keys = (json.loads(sys.stdin.read() or "{}") or {}).get("keys")
+        except Exception:
+            keys = None
+    cfg = config_io.load_config()
+    verdict = keychain_store.verify_keys(cfg, keys=keys)
+    verdict["available"] = True
+    print(json.dumps(verdict))
+    return 0 if verdict.get("ok") else 1
+
+
+def _cli_set_secrets_backend(value: str) -> int:
+    """Kill-switch / revert escape hatch (§7.2). ``--set-secrets-backend=config``
+    reverts off the keychain: read every item back into config.json (0600),
+    flag backend "config" + migration.state "none", then delete the items. A
+    still-unreadable secret is written as "" with a WARNING that it must be
+    re-entered — the revert always completes rather than trapping the owner.
+
+    ``--set-secrets-backend=keychain`` is refused: flipping ON is only safe
+    through the migration state machine (which writes+verifies items before the
+    flip); doing it here would brick secret reads. (Ruling recorded in the batch
+    report.)"""
+    from . import config_io, keychain_store
+    v = (value or "").strip().lower()
+    if v == "keychain":
+        sys.stderr.write(
+            "MailWarden: refusing to enable the keychain backend from the CLI. "
+            "Enabling it requires the migration (which writes and verifies the "
+            "keychain items first). Use the Dashboard's Keychain setup instead.\n")
+        return 2
+    if v != "config":
+        sys.stderr.write(
+            "Usage: MailWarden --set-secrets-backend=config\n")
+        return 2
+
+    unreadable: list = []
+
+    def _revert(cfg):
+        # cfg is loaded FRESH inside the lock and already hydrated by load_config:
+        # readable items now sit as real plaintext in the fields; unreadable ones
+        # still hold the sentinel. Blank those, drop hydrate's _-keys, and flip
+        # the backend so the save below writes plaintext (strip is a no-op once
+        # backend == "config").
+        unreadable[:] = keychain_store.clear_unresolved_sentinels(cfg)
+        sec = cfg.setdefault("secrets", {})
+        sec["backend"] = "config"
+        sec.setdefault("migration",
+                       {})["state"] = "none"
+
+    config_io.update_config(_revert)
+
+    if unreadable:
+        # Some secrets were unreadable (ACL-denied / locked). Deleting the items
+        # now would destroy the LAST copy of a secret we could not recover — an
+        # ACL that denies reads can still permit deletes, so this is a real
+        # footgun. KEEP the items; they can be cleaned up later once readable
+        # (re-run this after fixing the keychain, or delete-data uninstall).
+        print("secrets backend is now config "
+              "(keychain items KEPT — some secrets were unreadable)")
+        sys.stderr.write(
+            "WARNING: these secrets could not be read back from the keychain and "
+            "were left blank — re-enter them in Accounts/Settings:\n  "
+            + "\n  ".join(unreadable) + "\n")
+        return 0
+
+    # Every secret was restored to plaintext; remove the now-orphaned items.
+    deleted = 0
+    try:
+        if keychain_store.available():
+            deleted = keychain_store.delete_all_items()
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"MailWarden: keychain item cleanup failed: {e}\n")
+    print("secrets backend is now config "
+          f"(keychain items removed: {deleted})")
+    return 0
+
+
 def _run_test_validate() -> int:
     """Live HTTPS test: hit api.anthropic.com with an obviously-invalid key
     and verify the call returns in under 15 seconds with an auth-rejection
@@ -273,9 +370,12 @@ def _run_user_script(script_name: str) -> int:
     # --run-learner dispatch flags. Leaving them in argv trips their
     # argparse with "unrecognized arguments" and aborts.
     our_flags = {"--run-filter", "--run-report", "--run-learner",
-                 "--diagnose", "--test-validate", "--status", "--dashboard"}
+                 "--diagnose", "--test-validate", "--status", "--dashboard",
+                 "--keychain-verify", "--keys-from-stdin"}
     sys.argv = [str(script)] + [a for a in sys.argv[1:]
-                                 if a not in our_flags and not a.startswith("--set-dry-run=")]
+                                 if a not in our_flags
+                                 and not a.startswith("--set-dry-run=")
+                                 and not a.startswith("--set-secrets-backend=")]
 
     # Filter + report share the same IMAP account list and decisions.log, so
     # gate them behind a single lock. A scheduled run and a manual Run Now
@@ -394,10 +494,16 @@ def _run_classify_eml() -> int:
         if paths.CONFIG_PATH.is_file():
             with paths.CONFIG_PATH.open(encoding="utf-8") as f:
                 cfg = _json.load(f)
-            # Keychain: hydrate secret sentinels so the API key resolves under a
-            # keychain backend too (§5.3). No-op while backend == "config"; the
-            # $ANTHROPIC_API_KEY env override below still wins when set. Runs in a
-            # user Terminal context where the keychain is normally unlocked.
+            # Keychain: resolve secret sentinels so the API key works under a
+            # keychain backend too. §5.3's prose says to route this reader through
+            # config_io.load_config(); we DELIBERATELY diverge — hydrating the raw
+            # read in place — to keep this path's read-only, side-effect-free
+            # semantics (no _deep_merge back-fill, no on-load schema migrations,
+            # no chance of a config write) and to preserve the $ANTHROPIC_API_KEY
+            # env override precedence below. hydrate() is the same resolver
+            # load_config() calls, so the API key resolves identically; it is a
+            # no-op while backend == "config". Runs in a user Terminal context
+            # where the keychain is normally unlocked.
             from . import keychain_store
             cfg = keychain_store.hydrate(cfg)
     except Exception:
@@ -513,6 +619,12 @@ def main() -> int:
         return _run_test_validate()
     if "--classify-eml" in sys.argv:
         return _run_classify_eml()
+    # Keychain migration step-2 probe (§6.2): headless, no bootstrap, no GUI. Run
+    # as the OTHER code identity (the bundled python) by the migration/wizard so a
+    # real ACL/DR read is proved before any plaintext is deleted. Prints a JSON
+    # verdict (booleans + key names only) and exits 0/1.
+    if "--keychain-verify" in sys.argv:
+        return _cli_keychain_verify()
 
     from . import startup_log
     startup_log.session_start()
@@ -531,6 +643,11 @@ def _main_inner(startup_log) -> int:
     for arg in sys.argv:
         if arg.startswith("--set-dry-run="):
             return _cli_set_dry_run(arg.split("=", 1)[1])
+    # Keychain kill-switch / revert escape hatch (§7.2). Runs before bootstrap so
+    # a broken GUI is never a prerequisite for reverting off the keychain.
+    for arg in sys.argv:
+        if arg.startswith("--set-secrets-backend="):
+            return _cli_set_secrets_backend(arg.split("=", 1)[1])
 
     # Self-install / upgrade ~/MailWarden/ from bundled Resources. Only the
     # Dashboard process runs bootstrap — headless launchd-spawned agents

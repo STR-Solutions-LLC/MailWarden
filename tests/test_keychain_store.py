@@ -434,7 +434,13 @@ def test_secitem_calls_only_inside_raw_ops():
     with open(path) as f:
         lines = f.readlines()
     import re
-    allowed = {"write_secret", "read_secret", "delete_secret", "_access"}
+    # Batch 2 adds delete_all_items() — a genuine new raw primitive that
+    # enumerates by service (SecItemCopyMatching) for the delete-data uninstall
+    # (§7.3). It is the only SecItem* call site added outside the original three
+    # raw ops, and is reachable ONLY when the caller has already confirmed
+    # backend == "keychain" (dark-ship preserved at the "config" backend).
+    allowed = {"write_secret", "read_secret", "delete_secret", "_access",
+               "delete_all_items"}
     current = None
     def_re = re.compile(r"^def (\w+)")
     for line in lines:

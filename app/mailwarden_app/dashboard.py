@@ -26,6 +26,7 @@ from . import config_io
 from . import explain_text
 from . import file_lock
 from . import help_content
+from . import keychain_store
 from . import paths
 from . import smappservice_install
 from . import startup_log
@@ -1447,7 +1448,20 @@ class AccountsTab(ttk.Frame):
             # a FRESH read under the lock so a peer's concurrent config change
             # isn't reverted.
             def _append(config):
-                config.setdefault("accounts", []).append(dlg.saved_account)
+                acct = dlg.saved_account
+                # Keychain persistence (§8.2): write the IMAP password to the
+                # keychain when keychain-backed; no-op (today's plaintext) at the
+                # config backend. The password field is sentinelized on save.
+                keychain_store.sync_secret(
+                    config,
+                    keychain_store.imap_account(acct.get("imap_host", ""),
+                                                acct.get("username", "")),
+                    keychain_store.label_for(
+                        keychain_store.imap_account(acct.get("imap_host", ""),
+                                                    acct.get("username", "")),
+                        acct.get("username", "")),
+                    acct.get("password", ""))
+                config.setdefault("accounts", []).append(acct)
             config_io.update_config(_append)
             self.app.refresh_all()
 
@@ -1463,7 +1477,34 @@ class AccountsTab(ttk.Frame):
             # C7: dialog interaction between read and write — replace ONLY the
             # account at idx on a fresh read under the lock.
             def _replace(config):
-                config["accounts"][idx] = dlg.saved_account
+                new = dlg.saved_account
+                old = config["accounts"][idx]
+                new_key = keychain_store.imap_account(
+                    new.get("imap_host", ""), new.get("username", ""))
+                old_key = keychain_store.imap_account(
+                    old.get("imap_host", ""), old.get("username", ""))
+                newpw = new.get("password", "")
+                # D5: write the NEW item FIRST, then retire the OLD one — a crash
+                # between the two must never leave the mailbox with no item. Both
+                # are no-ops at the config backend.
+                keychain_store.sync_secret(
+                    config, new_key,
+                    keychain_store.label_for(new_key, new.get("username", "")),
+                    newpw)
+                if old_key != new_key:
+                    # Only delete the old item once the new one was GENUINELY
+                    # stored: a blank/sentinel password (e.g. a locked keychain
+                    # at dialog open) means sync wrote nothing, so keeping the old
+                    # item is safer than losing the last copy. Shared-mailbox
+                    # guard still applies (§3).
+                    stored_new = (isinstance(newpw, str) and newpw
+                                  and not newpw.startswith(
+                                      keychain_store.SENTINEL_PREFIX))
+                    if stored_new:
+                        others = [a for i, a in enumerate(config["accounts"])
+                                  if i != idx]
+                        keychain_store.forget_secret(config, old_key, others)
+                config["accounts"][idx] = new
             config_io.update_config(_replace)
             self.app.refresh_all()
 
@@ -1478,6 +1519,13 @@ class AccountsTab(ttk.Frame):
         # C7: askyesno interaction between read and write — delete ONLY the
         # account at idx on a fresh read under the lock.
         def _delete(config):
+            removed = config["accounts"][idx]
+            key = keychain_store.imap_account(
+                removed.get("imap_host", ""), removed.get("username", ""))
+            others = [a for i, a in enumerate(config["accounts"]) if i != idx]
+            # Delete the IMAP item unless another account shares the mailbox (§3);
+            # no-op at the config backend.
+            keychain_store.forget_secret(config, key, others)
             del config["accounts"][idx]
         config_io.update_config(_delete)
         self.app.refresh_all()
@@ -4116,7 +4164,14 @@ class SettingsTab(ttk.Frame):
 
     def refresh(self):
         config = config_io.load_config()
-        self._api_var.set(config.get("anthropic", {}).get("api_key", ""))
+        # Keychain backend (§8.3): never load the secret into the entry — show a
+        # masked (blank) field; the real key stays in the keychain and a blank
+        # save is treated as "unchanged" in _on_save_api. Config backend keeps
+        # today's behavior (the plaintext key is shown for editing).
+        if keychain_store.backend_of(config) == "keychain":
+            self._api_var.set("")
+        else:
+            self._api_var.set(config.get("anthropic", {}).get("api_key", ""))
         default_model = "claude-haiku-4-5-20251001"
         anthro = config.get("anthropic", {})
         classify_mode = anthro.get("classify_mode", "cascade")
@@ -4164,7 +4219,20 @@ class SettingsTab(ttk.Frame):
 
         def _apply(config):
             anthro = config.setdefault("anthropic", {})
-            anthro["api_key"] = api_key
+            # Keychain persistence (§8.3). At the config backend this is exactly
+            # today's behavior (write whatever was typed; a blank field clears the
+            # key). At the keychain backend a BLANK field is the masked
+            # placeholder (refresh() below shows no value), so it must NOT clear
+            # the stored key — only a non-blank typed key rotates the item. A
+            # non-blank value is written to the keychain (sync_secret) and the
+            # field is sentinelized on save.
+            kc = keychain_store.backend_of(config) == "keychain"
+            if not kc or api_key:
+                keychain_store.sync_secret(
+                    config, keychain_store.api_key_account(),
+                    keychain_store.label_for(keychain_store.api_key_account()),
+                    api_key)
+                anthro["api_key"] = api_key
             if choice is not None:
                 apply_model_choice(anthro, choice[0], choice[1])
             config.setdefault("filter", {})["confidence_threshold"] = threshold
@@ -4215,6 +4283,16 @@ class SettingsTab(ttk.Frame):
         import threading
         self._api_status.config(text="Validating…")
         key = self._api_var.get().strip()
+        # §8.3: at the keychain backend refresh() blanks the entry (masked), so a
+        # blank field means "validate the STORED key", not "". Hydrate the real
+        # key from the keychain and validate that. Config backend is unchanged.
+        if not key:
+            cfg = config_io.load_config()
+            if keychain_store.backend_of(cfg) == "keychain":
+                stored = cfg.get("anthropic", {}).get("api_key", "")
+                if isinstance(stored, str) and \
+                        not stored.startswith(keychain_store.SENTINEL_PREFIX):
+                    key = stored.strip()
 
         def worker():
             ok, msg = validators.validate_api_key(key)
@@ -4731,6 +4809,24 @@ class SettingsTab(ttk.Frame):
 
                 # (b) Stop any running agent processes (best-effort, skippable).
                 self._stop_running_agents()
+
+                # (b2) Delete-data uninstall also removes the login-keychain
+                # items (§7.3). Read the backend from config BEFORE the data dir
+                # is deleted below. Gated on backend == "keychain" so NO SecItem*
+                # call is reachable at the config backend (dark ship); a keep-data
+                # uninstall leaves the items so a reinstall picks them back up
+                # (trust is DR-based, not install-instance-based).
+                if delete_data:
+                    try:
+                        cfg = config_io.load_config()
+                        if keychain_store.backend_of(cfg) == "keychain" \
+                                and keychain_store.available():
+                            n = keychain_store.delete_all_items()
+                            startup_log.step(
+                                f"uninstall: deleted {n} keychain item(s)")
+                    except Exception as e:  # noqa: BLE001
+                        startup_log.step(
+                            f"uninstall: keychain item delete error: {e}")
 
                 # (c) Optionally delete the user-data dir (config holds the API
                 # key + email passwords; logs; memory; signal history).

@@ -420,3 +420,334 @@ def status_record(config: dict, pid_context: str) -> dict:
 def _now_iso() -> str:
     from datetime import datetime
     return datetime.now().isoformat()
+
+
+# ===========================================================================
+# Batch 2 — CLI verify, GUI persistence gating, and uninstall.
+#
+# Everything below stays DARK behind the same secrets.backend flag: the pure
+# helpers never touch a raw op, and every function that CAN write/read/delete
+# an item is either backend-gated (returns immediately at the "config" backend)
+# or reachable only from a code path the migration state machine (Batch 3) and
+# the M1 checklist (Batch 5) light up. No SecItem* CALL is added outside the
+# raw ops except delete_all_items()'s enumeration (a genuine new raw primitive;
+# see the drift-guard's allowed set).
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Pure decision helpers (no IO) — safe to call at any backend, unit-tested.
+# ---------------------------------------------------------------------------
+
+def _present(value) -> bool:
+    """True for a non-empty string secret field (a configured secret). An empty
+    field means 'no secret here' — never a keychain item."""
+    return isinstance(value, str) and value.strip() != ""
+
+
+def expected_account_keys(config: dict) -> list:
+    """The item keys the keychain should hold for THIS config (§3): one per
+    non-empty secret field — the API key, the SMTP password, and each account's
+    IMAP password (deduped, so a shared mailbox collapses to one key). A field
+    holding the sentinel counts (already migrated); an empty field does not.
+
+    This is the single source of truth shared by --keychain-verify (§6.2 step 2),
+    the fresh-install provisioner (§6.3), and — in Batch 3 — the migration
+    writer, so all three agree on exactly which items must exist. self_mail_secret
+    is intentionally excluded: it is lazily minted through its own backend-aware
+    path, not a migrated config field, so it may legitimately be absent."""
+    if not isinstance(config, dict):
+        return []
+    keys: list = []
+    anthro = config.get("anthropic") or {}
+    if _present(anthro.get("api_key")):
+        keys.append(api_key_account())
+    smtp = config.get("smtp") or {}
+    if _present(smtp.get("password")):
+        keys.append(smtp_account(smtp.get("host", ""), smtp.get("username", "")))
+    for acct in config.get("accounts") or []:
+        if isinstance(acct, dict) and _present(acct.get("password")):
+            k = imap_account(acct.get("imap_host", ""), acct.get("username", ""))
+            if k not in keys:
+                keys.append(k)
+    return keys
+
+
+def key_in_use(account_key: str, accounts) -> bool:
+    """True when any account in ``accounts`` still derives ``account_key`` — the
+    shared-mailbox guard (§3): two accounts with the same (imap_host, username)
+    share ONE item, so removing/editing one must NOT delete the item the other
+    still needs."""
+    for a in accounts or []:
+        if isinstance(a, dict) and \
+                imap_account(a.get("imap_host", ""), a.get("username", "")) == account_key:
+            return True
+    return False
+
+
+def clear_unresolved_sentinels(config: dict) -> list:
+    """Revert helper (§7.2). After a revert hydration, any secret field STILL
+    holding a sentinel was unreadable from the keychain; blank it to "" and return
+    the derived account keys of the blanked fields so the caller can warn the
+    owner to re-enter them. Also drops any non-persisted ``_``-prefixed key that
+    hydrate left on the dict. PURE (no keychain IO) — walks the same three secret
+    slots hydrate does. Mutates ``config`` in place."""
+    if not isinstance(config, dict):
+        return []
+    blanked: list = []
+
+    def clear(container, field, account_key):
+        v = container.get(field)
+        if isinstance(v, str) and v.startswith(SENTINEL_PREFIX):
+            container[field] = ""
+            blanked.append(account_key)
+
+    anthro = config.get("anthropic")
+    if isinstance(anthro, dict) and "api_key" in anthro:
+        clear(anthro, "api_key", api_key_account())
+    smtp = config.get("smtp")
+    if isinstance(smtp, dict) and "password" in smtp:
+        clear(smtp, "password",
+              smtp_account(smtp.get("host", ""), smtp.get("username", "")))
+    for acct in config.get("accounts", []) or []:
+        if isinstance(acct, dict) and "password" in acct:
+            clear(acct, "password",
+                  imap_account(acct.get("imap_host", ""), acct.get("username", "")))
+    # The per-install self-mail HMAC secret is auto-minted, not owner-entered, so
+    # a sentinel value here must be BLANKED (never left as the literal sentinel,
+    # which the config-backend getter would otherwise return verbatim as the HMAC
+    # key — silently re-opening the Wave-6 marker-spoofing bypass). Blank so the
+    # getter re-mints a fresh secret on next use; do NOT add it to `blanked` (no
+    # owner re-entry is needed for it).
+    sm = config.get(SELF_MAIL_SECRET_KEY)
+    if isinstance(sm, str) and sm.startswith(SENTINEL_PREFIX):
+        config[SELF_MAIL_SECRET_KEY] = ""
+    for k in [k for k in config if isinstance(k, str) and k.startswith("_")]:
+        del config[k]
+    return blanked
+
+
+# ---------------------------------------------------------------------------
+# Verify (§6.2 step 2). Reads every expected item; returns booleans + key names
+# only, never values. Delegates to read_secret (a raw op) so no SecItem* call is
+# added here. Safe to call in-process (no UI-suppression side effect — the
+# headless --keychain-verify entry suppresses UI itself).
+# ---------------------------------------------------------------------------
+
+def verify_keys(config: dict, keys=None) -> dict:
+    """Read every expected account key and categorize the result:
+    ``{"ok", "missing": [...], "locked": bool, "errors": [...]}``. ``ok`` is True
+    only when every expected item read back cleanly. Never returns or logs a
+    secret value. Reads regardless of the backend flag (verify runs at migration
+    step 2, while the backend is still "config" but the items already exist).
+
+    ``keys`` (key-name strings only, never secret values) overrides derivation
+    from ``config`` — the crux of the fresh-install fix: the wizard saves config
+    AFTER provisioning, so a subprocess re-deriving from disk would see an empty
+    config and pass vacuously. The wizard therefore passes the in-memory
+    expected keys explicitly. When ``keys`` is None the on-disk config is used
+    (the migration/upgrade path, where config.json already holds the secrets)."""
+    missing: list = []
+    errors: list = []
+    locked = False
+    for key in (keys if keys is not None else expected_account_keys(config)):
+        try:
+            got = read_secret(key)
+        except KeychainLocked:
+            locked = True
+            continue
+        except KeychainError:
+            errors.append(key)
+            continue
+        if got is None:
+            missing.append(key)
+    return {"ok": not missing and not errors and not locked,
+            "missing": missing, "locked": locked, "errors": errors}
+
+
+# ---------------------------------------------------------------------------
+# GUI-only writers (§8). Every one is backend-gated: a pure pass-through at the
+# "config" backend (the dark default), so today's plaintext persistence is
+# byte-identical. Callers set the plaintext config field and save separately;
+# strip_for_save() sentinelizes it on save once migration.state == "complete".
+# ---------------------------------------------------------------------------
+
+def write_configured_secrets(config: dict) -> None:
+    """Write every currently-plaintext configured secret in ``config`` into the
+    keychain (fresh-install provisioning §6.3, and — Batch 3 — migration step 1).
+    NOT backend-gated: the caller has already decided keychain is in force. Skips
+    empty fields and fields already holding the sentinel. GUI-process only."""
+    anthro = config.get("anthropic") or {}
+    v = anthro.get("api_key")
+    if isinstance(v, str) and v and not v.startswith(SENTINEL_PREFIX):
+        k = api_key_account()
+        write_secret(k, label_for(k), v)
+    smtp = config.get("smtp") or {}
+    v = smtp.get("password")
+    if isinstance(v, str) and v and not v.startswith(SENTINEL_PREFIX):
+        k = smtp_account(smtp.get("host", ""), smtp.get("username", ""))
+        write_secret(k, label_for(k, smtp.get("username", "")), v)
+    for acct in config.get("accounts") or []:
+        if not isinstance(acct, dict):
+            continue
+        v = acct.get("password")
+        if isinstance(v, str) and v and not v.startswith(SENTINEL_PREFIX):
+            k = imap_account(acct.get("imap_host", ""), acct.get("username", ""))
+            write_secret(k, label_for(k, acct.get("username", "")), v)
+
+
+def sync_secret(config: dict, account_key: str, label: str, value: str) -> None:
+    """Persist ONE changed secret (Settings API key, an account's IMAP password,
+    SMTP) to the keychain when keychain-backed; a no-op at the "config" backend.
+    ``value`` must be the real typed secret — an empty or already-sentinel value
+    is ignored (nothing to store; the field save handles clearing)."""
+    if backend_of(config) != "keychain":
+        return
+    if not isinstance(value, str) or not value or value.startswith(SENTINEL_PREFIX):
+        return
+    write_secret(account_key, label, value)
+
+
+def forget_secret(config: dict, account_key: str, remaining_accounts=None) -> None:
+    """Delete an account's IMAP item when keychain-backed and no OTHER remaining
+    account still derives the same key (shared-mailbox guard, §3); a no-op at the
+    "config" backend. Pass the account list WITHOUT the row being removed/edited
+    as ``remaining_accounts``."""
+    if backend_of(config) != "keychain":
+        return
+    if key_in_use(account_key, remaining_accounts):
+        return
+    delete_secret(account_key, missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Fresh-install provisioning (§6.3 / §12.6). DARK until Batch 5 flips the
+# default backend: gated on the config's own backend being "keychain", which is
+# "config" today, so the wizard's plaintext save is byte-identical. When lit, it
+# writes the secrets, spawns the OTHER code identity to prove a headless read
+# (the faithful ACL test), and on ANY failure falls back to plaintext config so
+# first-run is never blocked.
+# ---------------------------------------------------------------------------
+
+def spawn_keychain_verify(config: dict, timeout: float = 10.0) -> dict:
+    """Spawn the bundled python as the OTHER code identity to run
+    ``launcher.py --keychain-verify`` (§6.2 step 2) — the faithful test of the ACL
+    path the launchd agents use, because keychain trust is evaluated against the
+    main executable, not the script.
+
+    The expected item KEYS are derived from the IN-MEMORY ``config`` and handed to
+    the subprocess over stdin (never argv — the keys embed usernames/hosts). This
+    is essential on a fresh install, where config.json is not written until AFTER
+    provisioning: a subprocess re-deriving keys from disk would find an empty
+    config and report ok vacuously with zero reads. Only key NAMES cross the pipe,
+    never secret values. Returns the parsed JSON verdict, or an ok:false verdict
+    on timeout / spawn / parse failure. M1/GUI-only (real /Applications paths)."""
+    import subprocess
+    import json as _json
+    launcher = APP_PATH + "/Contents/Resources/launcher.py"
+    payload = _json.dumps({"keys": expected_account_keys(config)})
+    try:
+        proc = subprocess.run(
+            [PY_PATH, launcher, "--keychain-verify", "--keys-from-stdin"],
+            input=payload, capture_output=True, text=True, timeout=timeout)
+        out = (proc.stdout or "").strip()
+        return _json.loads(out) if out else {"ok": False, "missing": [],
+                                             "locked": False, "spawn_error": True}
+    except Exception:
+        return {"ok": False, "missing": [], "locked": False, "spawn_error": True}
+
+
+def _fall_back_to_config(config: dict) -> None:
+    """Roll a failed keychain provisioning back to the plaintext-config backend
+    (§6.3): keep the real secrets in the config fields (they get written 0600 as
+    today), flag the backend "config", and best-effort delete any partial items
+    so nothing is left half-migrated."""
+    sec = config.setdefault("secrets", {})
+    sec["backend"] = "config"
+    sec.setdefault("migration", {})["state"] = "none"
+    # Never leave a sentinel self-mail secret behind on the config backend (same
+    # Wave-6 hole clear_unresolved_sentinels guards): blank it so the getter
+    # re-mints a real secret.
+    sm = config.get(SELF_MAIL_SECRET_KEY)
+    if isinstance(sm, str) and sm.startswith(SENTINEL_PREFIX):
+        config[SELF_MAIL_SECRET_KEY] = ""
+    try:
+        if available():
+            delete_all_items()
+    except Exception:
+        pass
+
+
+def provision_fresh_install(config: dict, verifier=None) -> dict:
+    """Fresh-install wizard hook (§6.3). No-op returning immediately when the
+    config's backend is "config" — the dark default — so today's plaintext wizard
+    save is byte-identical. When the backend is "keychain" (Batch 5+): write every
+    configured secret, spawn the headless verify, and on success mark migration
+    complete (so save sentinelizes). On a missing framework, a write failure, or a
+    verify failure, fall back to plaintext config and NEVER block first run.
+
+    ``verifier`` is an injection seam for tests: a callable ``(config) -> verdict
+    dict``; production uses the real subprocess spawn. Returns a small result dict
+    ``{"backend", "provisioned", "reason"?}`` for the caller's log line."""
+    if backend_of(config) != "keychain":
+        return {"backend": "config", "provisioned": False}
+    if not available():
+        _fall_back_to_config(config)
+        return {"backend": "config", "provisioned": False,
+                "reason": "framework_absent"}
+    try:
+        write_configured_secrets(config)
+    except Exception as e:  # noqa: BLE001
+        # §12.6: NEVER block first run. Catch ANY failure — not only
+        # KeychainError/KeychainLocked but an unexpected objc.error or other
+        # low-level fault from a write — and fall back to plaintext config.
+        _fall_back_to_config(config)
+        return {"backend": "config", "provisioned": False,
+                "reason": "write_failed", "error": f"{type(e).__name__}: {e}"}
+    verify = verifier or (lambda cfg: spawn_keychain_verify(cfg))
+    try:
+        verdict = verify(config)
+    except Exception as e:  # noqa: BLE001
+        _fall_back_to_config(config)
+        return {"backend": "config", "provisioned": False,
+                "reason": "verify_failed", "error": f"{type(e).__name__}: {e}"}
+    if verdict.get("ok"):
+        config.setdefault("secrets", {}).setdefault(
+            "migration", {})["state"] = "complete"
+        return {"backend": "keychain", "provisioned": True}
+    _fall_back_to_config(config)
+    return {"backend": "config", "provisioned": False, "reason": "verify_failed"}
+
+
+# ---------------------------------------------------------------------------
+# Uninstall (§7.3). Enumerate every MailWarden item by service and delete each,
+# so a delete-data uninstall removes the secrets too. Gated by the CALLER on
+# backend == "keychain" so no SecItem* call is reachable at the "config" backend
+# (dark ship). Enumeration is a genuine new raw primitive — the ONLY SecItem*
+# CALL added outside read/write/delete_secret; the drift-guard allows it.
+# ---------------------------------------------------------------------------
+
+def delete_all_items() -> int:
+    """Delete every MailWarden generic-password item in the login keychain,
+    regardless of the current config (§7.3, delete-data uninstall). Enumerates by
+    service, then deletes each via delete_secret. Returns the number removed.
+    Requires the framework (raises KeychainError if absent, like the raw ops)."""
+    if not _SECURITY_IMPORTED:
+        raise KeychainError("delete_all_items (framework absent)", 0)
+    query = {
+        kSecClass: kSecClassGenericPassword,
+        kSecAttrService: SERVICE,
+        kSecReturnAttributes: True,
+        kSecMatchLimit: kSecMatchLimitAll,
+    }
+    status, items = SecItemCopyMatching(query, None)
+    if status == errSecItemNotFound:
+        return 0
+    if status != errSecSuccess:
+        raise KeychainError("SecItemCopyMatching(all)", status)
+    count = 0
+    for it in (items or []):
+        acct = it.get(kSecAttrAccount) if hasattr(it, "get") else None
+        if acct:
+            delete_secret(acct, missing_ok=True)
+            count += 1
+    return count

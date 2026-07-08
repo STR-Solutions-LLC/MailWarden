@@ -322,7 +322,12 @@ def get_or_create_self_mail_secret() -> "str | None":
             if keychain_store.backend_of(cfg) == "keychain":
                 return _self_mail_secret_keychain(cfg)
             secret = cfg.get(SELF_MAIL_SECRET_KEY)
-            if isinstance(secret, str) and secret.strip():
+            # A SENTINEL-valued field ("@keychain:…") is NOT a real secret — it is
+            # a leftover from a keychain revert whose item was deleted. Treat it as
+            # ABSENT and re-mint, or the HMAC key would become the literal public
+            # sentinel constant and silently re-open the Wave-6 spoofing bypass.
+            if isinstance(secret, str) and secret.strip() \
+                    and not secret.startswith(keychain_store.SENTINEL_PREFIX):
                 return secret.strip()
             secret = secrets.token_hex(32)
             cfg[SELF_MAIL_SECRET_KEY] = secret

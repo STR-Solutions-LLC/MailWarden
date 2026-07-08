@@ -23,6 +23,7 @@ from . import app_entrypoint
 from . import config_io
 from . import file_lock
 from . import help_content
+from . import keychain_store
 from . import paths
 from . import smappservice_install
 from . import theme
@@ -481,6 +482,21 @@ class SetupAssistant(tk.Tk):
         # audit B2, owned by another session). The lock serializes this blind
         # save against other writers' read-modify-write windows on config.json.
         with file_lock.locked(paths.CONFIG_PATH):
+            # Keychain fresh-install provisioning (§6.3). Inert (no-op) while the
+            # draft's backend is "config" — the dark default — so today's
+            # plaintext wizard save is byte-identical. Once Batch 5 flips the
+            # DEFAULT_CONFIG backend to "keychain", this writes the secrets to the
+            # keychain, verifies a headless read, and sentinelizes on save; any
+            # failure falls back to plaintext config so first-run is never blocked.
+            result = keychain_store.provision_fresh_install(cfg)
+            try:
+                from . import startup_log
+                startup_log.step(
+                    f"keychain provision: backend={result.get('backend')} "
+                    f"provisioned={result.get('provisioned')} "
+                    f"reason={result.get('reason', '')}")
+            except Exception:
+                pass
             config_io.save_config(cfg)
 
         state = config_io.load_installer_state()
