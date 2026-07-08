@@ -84,8 +84,9 @@ identities that must read secrets:**
 
 - `Contents/MacOS/MailWarden` — identifier `com.strsolutions.mailwarden` (verified with
   `codesign -dv` on the built app; matches `CFBundleIdentifier`, `setup_app.py:109`).
-- `Contents/MacOS/python` — identifier `org.python.python` (verified with `codesign -dv`;
-  it is python.org's interpreter binary copied in by py2app).
+- `Contents/MacOS/python` — identifier `python` on the final signed bundle (see the
+  batch-4 correction note in §4.2; the interpreter is python.org's, copied in by py2app,
+  but the Developer-ID re-sign derives the identifier from the basename).
 
 **Engine readers (run as `Contents/MacOS/python` under launchd):**
 
@@ -283,7 +284,19 @@ guarantee both checks pass for both executables from item creation onward.
 Current identifiers (verified on the built bundle with `codesign -dv`):
 
 - `Contents/MacOS/MailWarden` → identifier `com.strsolutions.mailwarden`
-- `Contents/MacOS/python` → identifier `org.python.python`
+- `Contents/MacOS/python` → identifier `python`
+
+> **Batch-4 ground-truth correction (2026-07-08).** An earlier draft of this
+> document stated the bundled interpreter's identifier is `org.python.python`.
+> That was taken from python.org's framework binary / the pre-signing py2app
+> copy. The value that actually ships is the bare `python`: the nested-signing
+> loop runs `codesign --force --sign <DevID>` with no `-i`, so codesign derives
+> the identifier from the file's basename (`python`). Every past notarized beta
+> shipped it this way and Apple accepted them. The frozen expectation and the
+> build gate use `python`; keychain trust is unaffected because ACLs are anchored
+> by binary *path* (`SecTrustedApplicationCreateFromPath`), which records the
+> real DR whatever the identifier string is. Occurrences of `org.python.python`
+> elsewhere in this document should be read as `python`.
 
 When `build_installer.sh` signs these with the Developer ID Application cert
 (`build_installer.sh:286-349`) and no explicit `-r` requirement, codesign generates the
@@ -314,11 +327,13 @@ Developer-ID-signed staged copy that actually ships.)
   continues with no prompt and no re-ACL step. Nothing binds to a certificate serial,
   expiry, or cdhash.
 - **Identifier stability is now a shipping invariant.** `com.strsolutions.mailwarden` and
-  `org.python.python` must never change once the first keychain release ships, or stored
-  DRs stop matching. Add a build-gate assertion to `build_installer.sh` (in the Developer
-  ID branch, after signing): `codesign -d -r- …/MacOS/python` must contain
-  `identifier "org.python.python"` and `subject.OU] = "6BXSAHWH29"`, same for the outer
-  app — die otherwise. (Decision: do NOT rename the python identifier to something
+  `python` (see the correction note above — NOT `org.python.python`) must never change once
+  the first keychain release ships, or stored DRs stop matching. This build-gate assertion
+  is implemented in `scripts/check_designated_requirements.py`, invoked by
+  `build_installer.sh` in the Developer ID branch after signing: `codesign -d -r- …/MacOS/python`
+  must pin `identifier python` (codesign renders this bare identifier unquoted) and
+  `subject.OU] = "6BXSAHWH29"`, same for the outer app (`identifier "com.strsolutions.mailwarden"`,
+  quoted) — die otherwise. (Decision: do NOT rename the python identifier to something
   MailWarden-specific. Tighter scoping is marginal — only STR-signed binaries can match
   anyway because of the team clause — and keeping the identifier that every past beta
   already has removes a whole class of "which identifier did the item trust?" states.)
@@ -836,7 +851,8 @@ Total ≈ 4 engineering sessions + one M1 test session.
 2. PyObjC `pyobjc-framework-Security` over `security` CLI (partition-list dead end) and
    over ctypes (maintenance) (§5.1–5.2).
 3. One item per secret; account key derived from host+username; delete+add on change (§3, §5.2).
-4. Keep identifier `org.python.python`; add a build gate that freezes both identifiers (§4.2).
+4. Keep the interpreter's shipped identifier as-is (it is `python`, not `org.python.python`
+   — see the §4.2 batch-4 correction note); add a build gate that freezes both identifiers (§4.2).
 5. Fail closed = skip the entire tick on ANY unreadable secret (§7.1).
 6. Fresh-install wizard falls back to plaintext config (status quo) if keychain setup
    fails, rather than blocking first-run (§6.3).

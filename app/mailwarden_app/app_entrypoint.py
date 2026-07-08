@@ -219,6 +219,11 @@ def _run_diagnose() -> int:
         # is silently dead. The bare module import below is necessary but
         # not sufficient — see the SMAppService symbol check after the loop.
         "ServiceManagement",
+        # Security is the Keychain secrets-backend framework (keychain_store.py).
+        # Bundled only in the built app — dev/CI lack it, exactly like
+        # ServiceManagement — so this gate hard-fails a build that dropped the
+        # wrapper. The from-import symbol check after the loop is authoritative.
+        "Security",
         "pydantic", "httpx", "httpcore", "h11", "anyio",
         "certifi", "distro", "idna", "jiter", "sniffio",
         "typing_extensions", "docstring_parser",
@@ -278,6 +283,17 @@ def _run_diagnose() -> int:
     except Exception as e:
         print(f"  FAIL ServiceManagement.SMAppService: {type(e).__name__}: {e}")
         failed.append(("ServiceManagement.SMAppService", str(e)))
+
+    # Verify the exact Security symbol keychain_store.py imports. As with
+    # SMAppService, a bare `import Security` can succeed against a partial
+    # namespace while the generic-password call is absent — only the from-import
+    # proves the framework wrapper the keychain backend needs is bundled.
+    try:
+        from Security import SecItemCopyMatching  # noqa: F401
+        print("  OK   Security.SecItemCopyMatching  (Keychain secrets backend)")
+    except Exception as e:
+        print(f"  FAIL Security.SecItemCopyMatching: {type(e).__name__}: {e}")
+        failed.append(("Security.SecItemCopyMatching", str(e)))
 
     print()
     if failed:

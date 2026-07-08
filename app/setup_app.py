@@ -173,6 +173,11 @@ OPTIONS = {
         # Without this, ModuleNotFoundError at runtime and NO services
         # register with macOS.
         "ServiceManagement",
+        # Security is the Keychain secrets-backend framework wrapper
+        # (keychain_store.py). Same modulegraph-drops-framework-wrappers hazard
+        # as ServiceManagement above — without this the keychain backend is
+        # unimportable in the bundle and secrets reads/writes fail.
+        "Security",
     ],
     "includes": ["tkinter", "tkinter.ttk", "tkinter.filedialog", "tkinter.messagebox",
                  "tkinter.simpledialog",

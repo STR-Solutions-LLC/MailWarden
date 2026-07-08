@@ -151,6 +151,11 @@ pip install --quiet py2app rumps anthropic openpyxl dnspython dkimpy
 PYOBJC_CORE_MAJOR=$(pip show pyobjc-core | awk '/^Version:/{split($2,v,"."); print v[1]}')
 [ -n "$PYOBJC_CORE_MAJOR" ] || die "pyobjc-core not installed — rumps install failed?"
 pip install --quiet "pyobjc-framework-ServiceManagement>=${PYOBJC_CORE_MAJOR}.0,<$((PYOBJC_CORE_MAJOR+1))"
+# pyobjc-framework-Security is REQUIRED at runtime by keychain_store.py (the
+# Keychain secrets backend). Like ServiceManagement it is not a transitive dep
+# of anything above and must be named explicitly, with the same major pin so
+# the framework wrapper matches the installed pyobjc-core ABI.
+pip install --quiet "pyobjc-framework-Security>=${PYOBJC_CORE_MAJOR}.0,<$((PYOBJC_CORE_MAJOR+1))"
 
 log "Building MailWarden.app with py2app..."
 cd "$APP_DIR"
@@ -347,6 +352,15 @@ if /usr/bin/security find-identity -v -p codesigning \
                 die "Nested binary still ad-hoc after signing (would fail notarization): $bin"
             fi
         done
+    # DR gate (keychain design plan §4.2). Keychain ACL trust is anchored on
+    # each executable's designated requirement (identifier + team OU), NOT a
+    # cdhash — so a Developer-ID re-sign of the same team keeps existing
+    # keychain items readable across updates. That only holds while both
+    # identifiers never change. Freeze them here: if either DR drifts, fail the
+    # build now rather than strand every field install's keychain items later.
+    log "  Asserting frozen designated requirements (keychain trust anchor)..."
+    "$BUILD_PY" "$INSTALLER_ROOT/scripts/check_designated_requirements.py" "$BUILT_APP" \
+        || die "Designated-requirement gate FAILED — keychain trust anchor drifted. Do not ship."
     log "  Developer ID codesign complete"
 else
     log "Developer ID cert NOT found — falling back to ad-hoc sign."
