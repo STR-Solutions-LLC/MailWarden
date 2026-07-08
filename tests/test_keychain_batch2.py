@@ -362,7 +362,10 @@ def test_cli_set_backend_config_reverts_restores_plaintext(
     assert on_disk["smtp"]["password"] == "SMTP-REAL"
     assert on_disk["accounts"][0]["password"] == "IMAP-REAL"
     assert on_disk["secrets"]["backend"] == "config"
-    assert on_disk["secrets"]["migration"]["state"] == "none"
+    # BATCH-5 FLAG: revert (CLI escape hatch too) now lands on the durable
+    # opt-out marker (was "none") so auto-migration never re-migrates and
+    # uninstall still cleans any orphaned items.
+    assert on_disk["secrets"]["migration"]["state"] == ks.STATE_OPTED_OUT
     assert "_secret_errors" not in on_disk       # hydrate's underscore key gone
     assert deleted["n"] == 3
 

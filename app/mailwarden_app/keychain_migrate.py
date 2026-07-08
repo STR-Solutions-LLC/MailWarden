@@ -11,16 +11,21 @@ never imports this module — the migration writer is the one process allowed to
 create keychain items (§5.2), and the only one with UI to surface a failure. So,
 unlike keychain_store.py, this file is NOT duplicated into the engine tree.
 
-DARK SHIP. Everything here is inert while the shipped default backend "config"
-is in force:
+BATCH 5 — THE FLIP. ``AUTO_MIGRATE_ENABLED`` is now True: an installed app on a
+real Mac auto-migrates plaintext config to the Keychain on the first Dashboard
+launch. What replaces the old "dark ship" safety is a DEV/CI/SOURCE invariant,
+enforced by the hard gate in migration_should_run:
 
-  * ``AUTO_MIGRATE_ENABLED`` is False, so run_migration() never INITIATES a
-    migration (state "none" + backend "config" -> no-op). No config-backend beta
-    ever holds an in-progress state, so the resume path is unreachable too — the
-    whole state machine is provably inert (proved by the dark-ship tests).
+  * The keychain only ever engages in the BUILT app on a real Mac —
+    migration_should_run requires BOTH ``available`` (Security.framework present)
+    AND ``installed`` (both trusted /Applications executables on disk). A dev
+    checkout, CI, the test suite and the offline eval have neither, so
+    run_migration() short-circuits to "skipped" before any keychain op is
+    reached, and load_config resolves the "config" backend (DEFAULT_CONFIG is
+    unchanged). Source behavior is therefore byte-identical to before the flip.
   * Every GUI-surface helper (keychain_banner, keychain_warning_active,
-    api_key_placeholder_hint, help gating) returns "nothing to show" at the
-    config backend.
+    api_key_placeholder_hint, help gating) still returns "nothing to show" at the
+    config backend, so a not-yet-migrated / opted-out install shows nothing new.
 
 The migration itself is crash-safe and idempotent: state lives in
 ``secrets.migration.state`` (persisted through the locked config_io.update_config),
@@ -66,10 +71,12 @@ _RESUMABLE = frozenset({
     FAILED_ITEMS_WRITE, FAILED_EXEC_VERIFY, FAILED_TICK_VERIFY,
 })
 
-# DARK-SHIP MASTER SWITCH (§11). False until Batch 5's M1 checklist passes; then
-# the auto-migration trigger turns on. While False, run_migration() never starts
-# a migration at the config backend. (Recorded ruling B3-1.)
-AUTO_MIGRATE_ENABLED = False
+# AUTO-MIGRATION MASTER SWITCH (§11). Flipped True in Batch 5 (THE FLIP) after
+# the §10.2 M1 checklist passed. When True, an installed app auto-migrates on the
+# first Dashboard launch; the available()+installed() gate in migration_should_run
+# keeps this inert in dev/CI/source (ruling B5-1, supersedes the Batch-3 dark
+# default B3-1). A false value is still honored as a global kill switch.
+AUTO_MIGRATE_ENABLED = True
 
 # The value each backup-config secret field is overwritten with (§6.4). It starts
 # with keychain_store.SENTINEL_PREFIX so a restored scrubbed backup is treated as
@@ -151,10 +158,13 @@ def migration_should_run(config: dict, *, available: bool, installed: bool,
       ``force`` (the manual "Re-run Keychain setup" button) even from "none".
     - "none" + backend "config" -> START only when auto-migration is enabled
       (Batch 5) or ``force``, and there is at least one secret to migrate.
-    - Any other/unknown state (e.g. "reverted_kept") -> inert.
+    - ``STATE_OPTED_OUT`` (a durable "Stop using the Keychain") -> INERT to
+      auto-migration; re-migrated ONLY by an explicit re-enable (``force``).
+    - Any other/unknown state -> inert.
 
-    DARK: with auto_enabled False and no in-progress state (the only reality in a
-    config-backend beta), this returns False before any keychain op is reached."""
+    DEV-SAFE: a dev checkout / CI / the test suite has neither ``available`` nor
+    ``installed``, so this returns False before any keychain op is reached even
+    with AUTO_MIGRATE_ENABLED True."""
     if not (available and installed):
         return False
     state = keychain_store.migration_state(config)
@@ -162,6 +172,11 @@ def migration_should_run(config: dict, *, available: bool, installed: bool,
         return False
     if force and state != STATE_COMPLETE:
         return _has_migratable_secrets(config) or state in _RESUMABLE
+    if state == keychain_store.STATE_OPTED_OUT:
+        # Durable opt-out (§7.2): auto-migration must NEVER re-migrate. Only the
+        # explicit "Use the Keychain" re-enable (force=True, handled above)
+        # clears it. Reached only post-keychain, so dark-safe by construction.
+        return False
     if state in _RESUMABLE:
         return True
     if state == STATE_NONE and keychain_store.backend_of(config) == "keychain":
@@ -400,7 +415,13 @@ def run_migration(deps: MigrationDeps, *, force: bool = False) -> dict:
         state = keychain_store.migration_state(cfg)
         action = _action_for(state)
         if action is None:
-            return {"action": "complete", "state": keychain_store.migration_state(cfg)}
+            # Only STATE_COMPLETE is a genuine completion. Any OTHER stateless
+            # state that reaches here (opted_out / unknown / inert — e.g. a forced
+            # run whose state carries no migration step) must NOT masquerade as
+            # "complete" (Batch-5 review MEDIUM): report it truthfully as "inert".
+            if state == STATE_COMPLETE:
+                return {"action": "complete", "state": state}
+            return {"action": "inert", "state": state}
         parked = _STEPS[action](deps, cfg, start_epoch)
         if parked is not None:
             return parked
@@ -477,8 +498,9 @@ def scrub_upgrade_backups() -> int:
 
 
 # ---------------------------------------------------------------------------
-# Kill-switch actions (§7.2) — reachable ONLY at the keychain backend (the
-# Settings group is hidden at the config backend; see is_settings_group_visible).
+# Kill-switch actions (§7.2). revert_off_keychain / restart_migration / clear are
+# reachable from the keychain-backend or failed:* control set; reenable_keychain
+# is the config-backend opt-out control (see keychain_group_view).
 # ---------------------------------------------------------------------------
 
 def revert_off_keychain(deps: MigrationDeps) -> dict:
@@ -522,8 +544,32 @@ def restart_migration(deps: MigrationDeps) -> dict:
     failed:items_write with the banner surfacing the locked cause (D4)."""
     cfg = deps.load_config()
     epoch = keychain_store.revert_epoch(cfg)
-    _set_state(deps, epoch, STATE_NONE)
+    if _set_state(deps, epoch, STATE_NONE):
+        # A concurrent cross-process revert (e.g. the CLI
+        # --set-secrets-backend=config escape hatch) bumped the revert epoch
+        # between our snapshot and this guarded write, so the reset ABORTED —
+        # nothing was written and the opt-out/terminal state the revert just
+        # committed still stands (D3). Report the abort truthfully and do NOT
+        # drive run_migration, which would otherwise churn and mislabel the
+        # outcome (Batch-5 review MEDIUM). Data-safety holds: zero keychain ops.
+        return _aborted(deps)
     return run_migration(deps, force=True)
+
+
+def reenable_keychain(deps: MigrationDeps) -> dict:
+    """"Use the Keychain" (§7.2, Batch 5) — the re-enable control shown to a user
+    who previously turned the Keychain OFF (state STATE_OPTED_OUT, backend
+    "config", secrets back in the settings file). Clears the durable opt-out and
+    force-migrates those plaintext secrets into the Keychain again.
+
+    Delegates to restart_migration, which persists state "none" (that single
+    write clears the opt-out marker) and then drives the §6.2 machine with
+    force=True. Crash self-heal: if the process dies AFTER the opt-out is cleared
+    (state "none", backend still "config") but before the migration completes, the
+    next Dashboard launch's auto path resumes it — migration_should_run for
+    "none"+config now returns True because AUTO_MIGRATE_ENABLED is on and there are
+    migratable secrets. So a mid-re-enable crash never strands the user."""
+    return restart_migration(deps)
 
 
 def clear_stored_api_key(deps: MigrationDeps) -> dict:
@@ -613,23 +659,36 @@ _BANNER_MIGRATION_FAILED_CLOSED = {
 
 
 def _has_usable_plaintext(config: dict) -> bool:
-    """True when at least one secret field still holds a real plaintext value
-    (non-empty, non-sentinel) — i.e. the shadow-window fallback is available and
-    filtering is not fail-closed. Used to keep every banner string TRUE of the
-    state it renders in (D4)."""
+    """True only when EVERY configured secret still holds a real plaintext value
+    (non-empty, non-sentinel) — i.e. the shadow-window fallback can serve the
+    WHOLE run, so filtering genuinely keeps working and a "still working" banner
+    is TRUE of the state (D4).
+
+    Part 4c — tightened from the old OR-logic ("at least one real"): under the
+    all-or-nothing fail-closed rule (§7.1) a SINGLE unreadable secret skips the
+    entire tick, so a mixed partial-lock — e.g. the API key readable but one
+    account's IMAP password an unreadable sentinel — is NOT "still working". Any
+    configured secret field holding a sentinel therefore makes this False. A field
+    that is empty/absent is "not configured" and is ignored; at least one real
+    secret must exist (a wholly-empty config has nothing to fall back on)."""
+    def is_sentinel(v) -> bool:
+        return isinstance(v, str) and v.startswith(keychain_store.SENTINEL_PREFIX)
+
     def real(v) -> bool:
-        return isinstance(v, str) and v.strip() != "" \
-            and not v.startswith(keychain_store.SENTINEL_PREFIX)
+        return isinstance(v, str) and v.strip() != "" and not is_sentinel(v)
+
+    slots = []
     anthro = config.get("anthropic") or {}
-    if real(anthro.get("api_key")):
-        return True
+    slots.append(anthro.get("api_key"))
     smtp = config.get("smtp") or {}
-    if real(smtp.get("password")):
-        return True
+    slots.append(smtp.get("password"))
     for acct in config.get("accounts") or []:
-        if isinstance(acct, dict) and real(acct.get("password")):
-            return True
-    return False
+        if isinstance(acct, dict):
+            slots.append(acct.get("password"))
+    # A configured-but-unreadable secret (sentinel) fails the whole run closed.
+    if any(is_sentinel(v) for v in slots):
+        return False
+    return any(real(v) for v in slots)
 
 
 def _cause_banner(status: Optional[dict]) -> Optional[dict]:
@@ -688,15 +747,72 @@ def keychain_warning_active(config: dict, status: Optional[dict]) -> bool:
 MENU_BAR_WARNING_TEXT = "Keychain problem — open MailWarden"
 
 
+# Button identifiers for the Settings "Keychain (advanced)" group. The Dashboard
+# builds one widget per id and packs exactly the subset keychain_group_view names
+# for the current state — so which controls appear is unit-tested decision logic,
+# not GUI code (matches the Batch-3 pattern).
+KC_BTN_REPAIR = "repair"
+KC_BTN_RERUN = "rerun"
+KC_BTN_CLEAR = "clear"
+KC_BTN_STOP = "stop"
+KC_BTN_REENABLE = "reenable"
+
+# Draft copy (scope addendum: factual + succinct; per-string review waived, but
+# each must be TRUE of the state it renders in).
+KC_DESC_KEYCHAIN = (
+    "Your Anthropic API key and email passwords are stored in your Mac's login "
+    "Keychain instead of a settings file. These controls are for repair and for "
+    "switching back if you ever need to.")
+# Part 4b: a failed:* park with the backend STILL "config" (failed:items_write /
+# failed:exec_verify — the flip is step 3) means the secrets are STILL in the
+# settings file, so the keychain description above would be false here.
+KC_DESC_FAILED_CONFIG = (
+    "MailWarden couldn't finish moving your passwords to the Keychain, so they're "
+    "still in its settings file. You can try the move again, or leave things as "
+    "they are.")
+# Part 3: the durable opt-out state — backend "config", secrets in the settings
+# file by the user's choice, with a control to switch back.
+KC_DESC_OPTED_OUT = (
+    "You turned the Keychain off, so your Anthropic API key and email passwords "
+    "are stored in MailWarden's settings file. You can switch back to using the "
+    "Keychain whenever you like.")
+
+
+def keychain_group_view(config: dict) -> Optional[dict]:
+    """What the Settings "Keychain (advanced)" group should render, or None when
+    the group is hidden (§7.2/§8/§12.8). Returns
+    ``{"description": str, "buttons": [KC_BTN_* ids]}``.
+
+    States:
+      * STATE_OPTED_OUT (backend "config") — the durable "Stop using the Keychain"
+        landing: describe the settings-file storage and offer the single
+        "Use the Keychain" re-enable (Part 3).
+      * keychain backend — the full repair/rerun/clear/stop control set.
+      * failed:* at the "config" backend — a parked migration whose secrets are
+        STILL in the settings file: the same control set, but an ACCURATE
+        description that does not claim keychain storage (Part 4b, D1).
+
+    Hidden (None) at the "config" backend with state "none"/"complete", so a
+    not-yet-migrated or opted-out-then-fresh Dashboard is byte-identical to today
+    (ruling B3-4 preserved)."""
+    state = keychain_store.migration_state(config)
+    backend = keychain_store.backend_of(config)
+    if state == keychain_store.STATE_OPTED_OUT:
+        return {"description": KC_DESC_OPTED_OUT, "buttons": [KC_BTN_REENABLE]}
+    full = [KC_BTN_REPAIR, KC_BTN_RERUN, KC_BTN_CLEAR, KC_BTN_STOP]
+    if backend == "keychain":
+        return {"description": KC_DESC_KEYCHAIN, "buttons": full}
+    if state.startswith("failed:"):
+        return {"description": KC_DESC_FAILED_CONFIG, "buttons": full}
+    return None
+
+
 def is_settings_group_visible(config: dict) -> bool:
-    """Whether the Settings "Keychain (advanced)" group is shown (§7.2/§8/§12.8).
-    Shown at the keychain backend AND in any failed:* migration state (D1) — a
-    failed:items_write/exec_verify parks with the backend still "config", and the
-    banner's "try the move again from Settings → Keychain" must point at a group
-    that actually exists. Hidden in the dark config-backend beta (state "none"),
-    so the Dashboard is byte-identical to today (ruling B3-4)."""
-    return (keychain_store.backend_of(config) == "keychain"
-            or keychain_store.migration_state(config).startswith("failed:"))
+    """Whether the Settings "Keychain (advanced)" group is shown at all — a thin
+    bool over keychain_group_view (§7.2/§8/§12.8). True at the keychain backend,
+    in any failed:* state (D1), and in the durable opt-out state (Part 3). Hidden
+    at the "config" backend with state "none"/"complete"."""
+    return keychain_group_view(config) is not None
 
 
 def _api_key_stored(config: dict) -> bool:
@@ -738,6 +854,23 @@ def _installed() -> bool:
             and os.path.exists(keychain_store.PY_PATH))
 
 
+def fresh_install_backend() -> str:
+    """The secrets backend a FRESH install should provision (§6.3, Batch 5).
+
+    Returns "keychain" ONLY in the installed app on a real Mac where the Security
+    framework is available AND both trusted /Applications executables exist;
+    "config" everywhere else — a dev checkout, CI, the test suite, the offline
+    eval, or a Mac somehow missing the framework. This is the SAFE fresh-install
+    default: the wizard sets the draft backend to this value before
+    keychain_store.provision_fresh_install runs, so DEFAULT_CONFIG stays "config"
+    (dev/source load_config is byte-identical) and the keychain engages only in
+    the built app. provision_fresh_install itself still falls back to plaintext
+    on any write/verify failure, so first-run is never bricked (§6.3/§12.6)."""
+    if keychain_store.available() and _installed():
+        return "keychain"
+    return "config"
+
+
 def _real_kickstart(label: str) -> None:
     uid = os.getuid()
     subprocess.run(["launchctl", "kickstart", f"gui/{uid}/{label}"],
@@ -773,9 +906,9 @@ def build_deps(log: Callable[[str], None] = _noop_log) -> MigrationDeps:
 def maybe_run(startup_log) -> dict:
     """_main_inner hook (§6.1), Dashboard-process only. Wraps run_migration so any
     failure is non-fatal — a keychain hiccup must never block the Dashboard
-    launch. DARK: with AUTO_MIGRATE_ENABLED False and no in-progress state (the
-    only reality in a config-backend beta), migration_should_run short-circuits
-    before any keychain op, so this is a cheap no-op."""
+    launch. In the installed app on a real Mac this now auto-migrates (Batch 5);
+    in dev/CI/source migration_should_run short-circuits on the available()+
+    installed() gate before any keychain op, so this stays a cheap no-op there."""
     try:
         deps = build_deps(log=lambda m: startup_log.step(m))
         result = run_migration(deps)

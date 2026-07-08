@@ -4194,22 +4194,31 @@ class SettingsTab(ttk.Frame):
         # beta shows nothing and the Settings tab is byte-identical to today.
         self._kc_group = ttk.LabelFrame(self._f, text="Keychain (advanced)",
                                         padding=(10, 6))
-        ttk.Label(self._kc_group, wraplength=620, text=(
-            "Your Anthropic API key and email passwords are stored in your Mac's "
-            "login Keychain instead of a settings file. These controls are for "
-            "repair and for switching back if you ever need to.")).pack(
-                anchor=tk.W)
+        # Description + button set are state-driven by keychain_migrate.
+        # keychain_group_view (Part 3/4b): the label text and which buttons are
+        # packed change with the state, so _refresh_keychain_group sets them.
+        self._kc_desc = ttk.Label(self._kc_group, wraplength=620, text="")
+        self._kc_desc.pack(anchor=tk.W)
         kc_btns = ttk.Frame(self._kc_group)
         kc_btns.pack(fill=tk.X, pady=(8, 0))
-        ttk.Button(kc_btns, text="Repair keychain access",
-                   command=self._on_keychain_repair).pack(side=tk.LEFT)
-        ttk.Button(kc_btns, text="Re-run Keychain setup",
-                   command=self._on_keychain_rerun).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(kc_btns, text="Clear stored key…",
-                   command=self._on_keychain_clear_key).pack(
-                       side=tk.LEFT, padx=(8, 0))
-        ttk.Button(kc_btns, text="Stop using the Keychain", style="Danger.TButton",
-                   command=self._on_keychain_stop).pack(side=tk.LEFT, padx=(8, 0))
+        km = keychain_migrate
+        self._kc_buttons = {
+            km.KC_BTN_REPAIR: ttk.Button(
+                kc_btns, text="Repair keychain access",
+                command=self._on_keychain_repair),
+            km.KC_BTN_RERUN: ttk.Button(
+                kc_btns, text="Re-run Keychain setup",
+                command=self._on_keychain_rerun),
+            km.KC_BTN_CLEAR: ttk.Button(
+                kc_btns, text="Clear stored key…",
+                command=self._on_keychain_clear_key),
+            km.KC_BTN_STOP: ttk.Button(
+                kc_btns, text="Stop using the Keychain", style="Danger.TButton",
+                command=self._on_keychain_stop),
+            km.KC_BTN_REENABLE: ttk.Button(
+                kc_btns, text="Use the Keychain", style="Primary.TButton",
+                command=self._on_keychain_reenable),
+        }
 
         # Danger zone — full uninstall. Placed last so it sits at the bottom
         # of the scrollable Settings tab, visually set apart as destructive.
@@ -4379,14 +4388,24 @@ class SettingsTab(ttk.Frame):
     # ----- Keychain (advanced) group (§7.2/§8). GUI wiring is M1-tested; the
     # decision + action logic lives in keychain_migrate (unit-tested). -----
     def _refresh_keychain_group(self, config):
-        """Pack the Keychain group only at the keychain backend (dark: hidden at
-        the config backend), positioned just above the Uninstall danger zone."""
-        visible = keychain_migrate.is_settings_group_visible(config)
-        if visible:
-            if not self._kc_group.winfo_ismapped():
-                self._kc_group.pack(fill=tk.X, pady=(0, 8), before=self._danger)
-        else:
+        """Render the Keychain group per keychain_migrate.keychain_group_view:
+        hidden entirely when the view is None (config backend, state none/complete
+        — byte-identical to today), else show the state-accurate description and
+        pack exactly the buttons the view names (Part 3/4b). Positioned just above
+        the Uninstall danger zone."""
+        view = keychain_migrate.keychain_group_view(config)
+        if view is None:
             self._kc_group.pack_forget()
+            return
+        self._kc_desc.config(text=view["description"])
+        wanted = view["buttons"]
+        for btn_id, btn in self._kc_buttons.items():
+            if btn_id in wanted:
+                btn.pack(side=tk.LEFT, padx=(0 if btn_id == wanted[0] else 8, 0))
+            else:
+                btn.pack_forget()
+        if not self._kc_group.winfo_ismapped():
+            self._kc_group.pack(fill=tk.X, pady=(0, 8), before=self._danger)
 
     def _on_keychain_repair(self):
         import threading
@@ -4447,6 +4466,27 @@ class SettingsTab(ttk.Frame):
             messagebox.showinfo(
                 "Keychain turned off",
                 "Your passwords are back in MailWarden's settings file.")
+
+    def _on_keychain_reenable(self):
+        # "Use the Keychain" — shown only in the durable opt-out state. Clears the
+        # opt-out and force-migrates the plaintext secrets back into the Keychain
+        # (a mid-run crash self-heals on the next launch; see reenable_keychain).
+        if not messagebox.askyesno(
+                "Use the Keychain?",
+                "MailWarden will move your API key and email passwords into your "
+                "Mac's login Keychain and use it from now on.\n\nProceed?",
+                default=messagebox.YES):
+            return
+        import threading
+        deps = keychain_migrate.build_deps()
+        threading.Thread(
+            target=lambda: keychain_migrate.reenable_keychain(deps),
+            daemon=True).start()
+        self.refresh()
+        messagebox.showinfo(
+            "Using the Keychain",
+            "MailWarden is moving your passwords into the Keychain. This runs in "
+            "the background; check back in a moment.")
 
     def _on_menubar_toggle(self):
         # v1.6.0: SMAppService manages agent lifecycle. We write the user's
@@ -4957,11 +4997,11 @@ class SettingsTab(ttk.Frame):
                 # (b2) Delete-data uninstall also removes the login-keychain
                 # items (§7.3). Read the backend from config BEFORE the data dir
                 # is deleted below. Gated on keychain_items_may_exist() so NO
-                # SecItem* call is reachable at the config backend that never
-                # migrated (dark ship: backend "config" + state "none" => False),
-                # while orphans left by a partial migration or a KEPT-branch
-                # revert (backend flipped back to "config" but items KEPT) are
-                # STILL cleaned up (carry-over B). A keep-data uninstall leaves the
+                # SecItem* call is reachable at a config backend that never
+                # migrated (backend "config" + state "none" => False), while
+                # orphans left by a partial migration OR any revert (durable
+                # STATE_OPTED_OUT — including a clean revert whose delete crashed,
+                # Batch 5) are STILL cleaned up (carry-over B). A keep-data uninstall leaves the
                 # items so a reinstall picks them back up (trust is DR-based, not
                 # install-instance-based).
                 if delete_data:

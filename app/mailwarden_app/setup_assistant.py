@@ -23,6 +23,7 @@ from . import app_entrypoint
 from . import config_io
 from . import file_lock
 from . import help_content
+from . import keychain_migrate
 from . import keychain_store
 from . import paths
 from . import smappservice_install
@@ -482,12 +483,21 @@ class SetupAssistant(tk.Tk):
         # audit B2, owned by another session). The lock serializes this blind
         # save against other writers' read-modify-write windows on config.json.
         with file_lock.locked(paths.CONFIG_PATH):
-            # Keychain fresh-install provisioning (§6.3). Inert (no-op) while the
-            # draft's backend is "config" — the dark default — so today's
-            # plaintext wizard save is byte-identical. Once Batch 5 flips the
-            # DEFAULT_CONFIG backend to "keychain", this writes the secrets to the
-            # keychain, verifies a headless read, and sentinelizes on save; any
-            # failure falls back to plaintext config so first-run is never blocked.
+            # Keychain fresh-install provisioning (§6.3, Batch 5). On a genuine
+            # fresh install, choose the backend the SAFE way: keychain_migrate.
+            # fresh_install_backend() returns "keychain" ONLY in the installed app
+            # on a real Mac with the Security framework — and "config" in
+            # dev/CI/source (available()+installed() both False), so DEFAULT_CONFIG
+            # stays "config" and this whole path is byte-identical to today off the
+            # M1. provision_fresh_install then writes the secrets, verifies a
+            # headless read, and sentinelizes on save; on ANY write/verify failure
+            # (or a missing framework) it falls back to plaintext config so
+            # first-run is never blocked. A wizard RE-RUN on an existing install
+            # leaves the merged backend untouched (never clobbers a keychain
+            # install or a durable opt-out).
+            if self._is_fresh_install:
+                cfg.setdefault("secrets", {})["backend"] = \
+                    keychain_migrate.fresh_install_backend()
             result = keychain_store.provision_fresh_install(cfg)
             try:
                 from . import startup_log

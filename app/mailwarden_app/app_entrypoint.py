@@ -136,9 +136,10 @@ def _cli_set_secrets_backend(value: str) -> int:
         # readable items now sit as real plaintext in the fields; unreadable ones
         # still hold the sentinel. The shared core blanks the unreadable
         # sentinels, drops hydrate's _-keys, flips the backend to "config", and
-        # sets migration.state -> "none" when everything was recovered or
-        # "reverted_kept" when some items are KEPT (so a later delete-data
-        # uninstall still cleans those orphans — carry-over B).
+        # sets migration.state -> the durable STATE_OPTED_OUT marker in every
+        # case (Batch 5) — which keeps keychain_items_may_exist() True so a later
+        # delete-data uninstall still cleans any orphans (carry-over B). The
+        # clean-vs-kept distinction survives only in the returned unreadable list.
         unreadable[:] = keychain_store.revert_config_to_plaintext(cfg)
 
     config_io.update_config(_revert)

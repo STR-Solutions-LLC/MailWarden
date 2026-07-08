@@ -637,10 +637,13 @@ keep filtering working (config backend through step 2; shadow mode in step 3).
 
 ### 6.3 Fresh installs (Setup Assistant)
 
-When `keychain_store.available()` and the app runs from `/Applications`: the wizard's save
-(`setup_assistant.py:57-75, 1036-1061`) calls `write_secret()` for the API key, the IMAP
-password, and the SMTP password, then writes config with sentinels and
-`backend: "keychain"`, `migration.state: "complete"` — plaintext never touches disk. The
+When `keychain_store.available()` and the app runs from `/Applications` (both checked by the
+`keychain_migrate.fresh_install_backend()` gate, which returns `"keychain"` only in that
+case and `"config"` in dev/CI/source — DEFAULT_CONFIG stays `"config"`): the wizard's save
+(`setup_assistant.py:57-75, 1036-1061`) sets the draft backend to that value, then
+`provision_fresh_install` calls `write_secret()` for the API key, the IMAP password, and the
+SMTP password, then writes config with sentinels and `backend: "keychain"`,
+`migration.state: "complete"` — plaintext never touches disk. The
 wizard's final step runs the `--keychain-verify` subprocess (step 2 above) before
 declaring success; on failure it falls back to writing plaintext config
 (`backend: "config"`) with a non-blocking warning — the status quo, never a bricked
@@ -690,12 +693,29 @@ subject to Matt's review per copy standards.
 Supported, in Settings under a "Keychain (advanced)" group:
 
 - **"Stop using the Keychain"** — Dashboard reads every item, writes real values back
-  into `config.json` (0600, `config_io.py:220-224`), sets `backend: "config"`,
-  `migration.state: "none"`, deletes the items (no stale divergence), logs the event.
-  Requires a readable keychain; if items are unreadable the button explains that
-  re-entering credentials in Accounts/Settings is the recovery (that path always works —
-  values typed in the UI are written wherever the current backend says).
-- **"Re-run Keychain setup"** — resets state to `none` and runs the §6.2 machine again.
+  into `config.json` (0600, `config_io.py:220-224`), sets `backend: "config"`, and marks
+  `migration.state: "opted_out"` — a **durable opt-out** (Batch 5, `STATE_OPTED_OUT` in
+  `keychain_store.py`). BOTH revert outcomes land this same marker: a clean revert (every
+  secret recovered; the items are then deleted) and a KEPT revert (some items unreadable
+  and deliberately left — the clean/kept distinction survives only in the returned
+  `unreadable` list, which drives the "re-enter these" warning). The opt-out is a lasting
+  choice: **auto-migration NEVER re-migrates an opted-out user** (`migration_should_run`
+  returns False for `opted_out`), and the marker also keeps `keychain_items_may_exist()`
+  True so a later delete-data uninstall still cleans any orphaned items — including a clean
+  revert whose item delete was interrupted (the §7.3 crash-window fix). Requires a readable
+  keychain; if items are unreadable the button explains that re-entering credentials in
+  Accounts/Settings is the recovery (that path always works — values typed in the UI are
+  written wherever the current backend says).
+- **"Use the Keychain"** — the re-enable control shown to an opted-out user
+  (`reenable_keychain`, `keychain_group_view` packs it as the sole button in the opt-out
+  state). It clears the opt-out and force-migrates the plaintext secrets back into the
+  Keychain (delegates to "Re-run Keychain setup" below). A crash after the opt-out is
+  cleared but before the migration completes self-heals: the state is `none` + backend
+  `config`, which the auto path resumes on the next Dashboard launch.
+- **"Re-run Keychain setup"** — resets state to `none` and runs the §6.2 machine again
+  with `force=True`. If a concurrent cross-process revert commits between its epoch snapshot
+  and the reset write, the reset aborts and reports `action: "aborted"` (opt-out preserved,
+  zero keychain writes) rather than churning.
 - **Headless escape hatch** for a broken GUI: `--set-secrets-backend=config` CLI flag next
   to `--set-dry-run` (`app_entrypoint.py:525-527`), performing the same revert; documented
   in Help. If the keychain itself is unreadable it writes empty strings + a WARNING that
@@ -822,6 +842,22 @@ deliberately-broken state is a FAIL of risk #1.**
     wizard), verify step passes, first tick works.
 11. **GUI secret consumers:** Check-an-Email fetch, Train-folder create, Validate key —
     all work post-migration.
+
+**Batch 5 (THE FLIP) additions — durable opt-out + re-enable:**
+
+12. **Opt-out durability:** after step 7's "Stop using the Keychain", quit and relaunch
+    the Dashboard → auto-migration does NOT re-migrate (config `migration.state` stays
+    `opted_out`, backend `config`, no keychain items recreated, no dialog). The Settings
+    "Keychain (advanced)" group shows the opt-out description + a single "Use the Keychain"
+    button.
+13. **Re-enable:** click "Use the Keychain" → migration re-runs → items reappear in Keychain
+    Access, `config.json` sentinelized, `migration.state` `complete`, filter tick works;
+    zero dialogs. Toggling Stop → Use the Keychain repeatedly stays clean.
+14. **Fresh-install default is keychain (Batch 5):** item 10 now provisions the Keychain by
+    default in the built app (the wizard sets backend `keychain` via
+    `fresh_install_backend()`); confirm a fresh install lands on backend `keychain` with no
+    plaintext in `config.json`, and that a keychain-write/verify failure still falls back to
+    plaintext config (never a bricked first-run).
 
 ---
 

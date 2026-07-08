@@ -554,13 +554,18 @@ def clear_unresolved_sentinels(config: dict) -> list:
     return blanked
 
 
-# Migration state left by a KEPT-branch revert (§7.2): the backend is flipped
-# back to "config" but one or more keychain items could NOT be read back, so
-# they were KEPT (deleting the last copy of an ACL-denied secret is a footgun).
-# This is NOT one of the state-machine's own states — the driver never acts on
-# it — it is purely a marker so keychain_items_may_exist() stays True and a later
-# delete-data uninstall still cleans the orphans (carry-over B).
-STATE_REVERTED_KEPT = "reverted_kept"
+# Durable OPT-OUT marker left by EVERY "Stop using the Keychain" revert (§7.2).
+# The backend is flipped back to "config" and the user has made a lasting choice
+# to stay on the settings-file backend. This is NOT one of the state-machine's
+# own steps — the driver never advances it — and auto-migration treats it as
+# INERT (migration_should_run returns False for it) so an opted-out user is never
+# silently re-migrated. Only an explicit "Use the Keychain" re-enable (the force
+# path) leaves it. It also keeps keychain_items_may_exist() True so a later
+# delete-data uninstall still cleans any orphaned items — covering BOTH a
+# KEPT-branch revert (unreadable items deliberately not deleted) AND the crash
+# window of a clean revert (items were about to be deleted but the process died
+# before delete_all_items ran).
+STATE_OPTED_OUT = "opted_out"
 
 
 def revert_config_to_plaintext(config: dict) -> list:
@@ -572,16 +577,22 @@ def revert_config_to_plaintext(config: dict) -> list:
     account keys so the caller can warn the owner to re-enter them), drops
     hydrate's ``_``-prefixed keys, and flips ``secrets.backend`` to "config".
 
-    ``secrets.migration.state`` goes to "none" when EVERY secret was recovered
-    (the caller then deletes the now-orphaned items — no stragglers) or to
-    "reverted_kept" when some were unreadable and the items are being KEPT (the
-    marker keychain_items_may_exist() reads so a later delete-data uninstall still
-    removes those orphans). PURE — no keychain IO; the caller does any delete."""
+    ``secrets.migration.state`` goes to the durable ``STATE_OPTED_OUT`` marker in
+    BOTH outcomes — a clean revert (every secret recovered; the caller then
+    deletes the now-orphaned items) AND a KEPT revert (some unreadable, items
+    kept). Unifying them fixes the old asymmetry: a clean revert used to land on
+    "none", which auto-migration (Batch 5) would re-migrate, and a KEPT revert
+    used to stick on "reverted_kept" forever. Now both are inert to
+    auto-migration and both keep keychain_items_may_exist() True so uninstall
+    cleans any orphans (a clean revert's items may still exist if the process
+    crashed before the caller's delete). The clean/kept distinction survives only
+    in the returned ``unreadable`` list (the re-entry warning). PURE — no keychain
+    IO; the caller does any delete."""
     unreadable = clear_unresolved_sentinels(config)
     sec = config.setdefault("secrets", {})
     sec["backend"] = "config"
     mig = sec.setdefault("migration", {})
-    mig["state"] = STATE_REVERTED_KEPT if unreadable else "none"
+    mig["state"] = STATE_OPTED_OUT
     # D3: bump the revert epoch so any migration thread still running in this
     # process (a background repair/re-run) detects the revert on its next
     # iteration and aborts cleanly instead of silently resurrecting the keychain
@@ -596,12 +607,14 @@ def revert_config_to_plaintext(config: dict) -> list:
 def keychain_items_may_exist(config: dict) -> bool:
     """True when login-keychain items may exist for this install. Gates the
     delete-data uninstall's item cleanup (§7.3, carry-over B) so orphans left by
-    a partial migration (crash mid-flight) or a KEPT-branch revert are still
-    removed. INERT (False) in a config-backend beta that never migrated: backend
-    "config" + migration.state "none" => False, so no SecItem enumeration is
-    reachable in dark ship. A SUCCESSFUL full revert leaves state "none" (items
-    already deleted, no orphans) => False; a KEPT revert leaves "reverted_kept"
-    and a mid-migration crash leaves items_written/etc. => True."""
+    a partial migration (crash mid-flight) or ANY revert are still removed. INERT
+    (False) in a config-backend beta that never migrated: backend "config" +
+    migration.state "none" => False, so no SecItem enumeration is reachable. Every
+    revert now leaves the durable STATE_OPTED_OUT marker (!= "none") => True, so a
+    clean revert whose caller crashed before delete_all_items still gets cleaned
+    (Batch-5 §7.3 crash-window fix), and a KEPT revert's deliberately-retained
+    items are cleaned too. A mid-migration crash leaves items_written/etc. =>
+    True."""
     if not isinstance(config, dict):
         return False
     if backend_of(config) == "keychain":

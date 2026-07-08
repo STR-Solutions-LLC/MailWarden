@@ -238,8 +238,10 @@ def test_migration_should_run_resumes_in_progress_regardless_of_auto():
                                        auto_enabled=False) is True, state
 
 
-def test_migration_should_run_complete_and_reverted_kept_are_inert():
-    for state in ("complete", "reverted_kept"):
+# BATCH-5 FLAG: "reverted_kept" -> "opted_out". Both revert branches now land on
+# the unified durable opt-out marker; auto-migration must treat it as inert.
+def test_migration_should_run_complete_and_opted_out_are_inert():
+    for state in ("complete", ks.STATE_OPTED_OUT):
         cfg = _seed_config()
         cfg["secrets"]["migration"]["state"] = state
         assert km.migration_should_run(cfg, available=True, installed=True,
@@ -261,7 +263,8 @@ def test_action_for_routing():
     assert km._action_for(km.FAILED_TICK_VERIFY) == "tick_verify"
     assert km._action_for(km.STATE_TICK_VERIFIED) == "scrub"
     assert km._action_for(km.STATE_COMPLETE) is None
-    assert km._action_for("reverted_kept") is None
+    # BATCH-5 FLAG: opt-out marker has no migration step (driver never advances it).
+    assert km._action_for(ks.STATE_OPTED_OUT) is None
 
 
 # ===========================================================================
@@ -485,8 +488,11 @@ def _boom(*a, **k):
     raise AssertionError("a keychain op ran in dark ship")
 
 
-def test_dark_ship_run_migration_touches_no_keychain_op(env):
-    deps = env.deps(auto_enabled=False)         # the shipped default
+def test_auto_disabled_run_migration_touches_no_keychain_op(env):
+    # BATCH-5 FLAG: auto_enabled=False is no longer the shipped default (the flip
+    # turned it on), but it remains a valid global KILL SWITCH — with it off,
+    # run_migration must still touch no keychain op.
+    deps = env.deps(auto_enabled=False)
     # Any keychain-touching dep exploding would fail the test.
     deps.write_secrets = _boom
     deps.read_back = _boom
@@ -498,10 +504,12 @@ def test_dark_ship_run_migration_touches_no_keychain_op(env):
     assert env.disk() == _seed_config()         # config untouched, byte-shape same
 
 
-def test_dark_ship_auto_flag_is_off_by_default():
-    # The shipped constant must be False (Batch 5 flips it). This is the dark
-    # switch the whole feature hangs on.
-    assert km.AUTO_MIGRATE_ENABLED is False
+def test_auto_migrate_flag_is_on_after_the_flip():
+    # BATCH-5 FLAG: this asserted False through Batches 1-4 (dark ship). Batch 5
+    # (THE FLIP) turned it on; dev-safety now rests on the available()+installed()
+    # gate, not on this constant (see test_maybe_run_at_config_backend_is_skipped
+    # and test_flip_is_dev_safe_via_install_gate).
+    assert km.AUTO_MIGRATE_ENABLED is True
 
 
 def test_maybe_run_at_config_backend_is_skipped(env):
@@ -511,8 +519,9 @@ def test_maybe_run_at_config_backend_is_skipped(env):
 
         def step(self, m):
             self.msgs.append(m)
-    # build_deps() uses the real installed() (False on this dev box) and the real
-    # AUTO_MIGRATE_ENABLED (False) -> skipped, no exception.
+    # build_deps() uses the real installed() (False on this dev box); even with
+    # AUTO_MIGRATE_ENABLED now True (Batch 5), the available()+installed() gate
+    # short-circuits to skipped, no exception, config untouched.
     out = km.maybe_run(Log())
     assert out.get("action") in ("skipped", "complete")
     assert env.disk() == _seed_config()
@@ -563,7 +572,8 @@ def test_revert_off_keychain_restores_plaintext_and_deletes(env):
     assert out["deleted"] == 3
     disk = env.disk()
     assert disk["secrets"]["backend"] == "config"
-    assert disk["secrets"]["migration"]["state"] == "none"
+    # BATCH-5 FLAG: clean revert now lands on the durable opt-out (was "none").
+    assert disk["secrets"]["migration"]["state"] == ks.STATE_OPTED_OUT
     assert disk["anthropic"]["api_key"] == REAL_SECRETS["api_key"]
     assert disk["smtp"]["password"] == REAL_SECRETS["smtp"]
     assert disk["accounts"][0]["password"] == REAL_SECRETS["imap"]
@@ -579,7 +589,10 @@ def test_revert_off_keychain_unreadable_keeps_items_and_marks(env):
     assert ks.imap_account("imap.host.com", "me@host.com") in out["unreadable"]
     disk = env.disk()
     assert disk["secrets"]["backend"] == "config"
-    assert disk["secrets"]["migration"]["state"] == "reverted_kept"  # carry-over B
+    # BATCH-5 FLAG: KEPT revert now uses the SAME durable opt-out marker as a
+    # clean revert (was "reverted_kept"); the KEPT distinction lives in
+    # out["unreadable"]. keychain_items_may_exist stays True so uninstall cleans.
+    assert disk["secrets"]["migration"]["state"] == ks.STATE_OPTED_OUT
     assert disk["accounts"][0]["password"] == ""          # unreadable -> blanked
     assert env.fk.items != {}                              # items KEPT
 
@@ -765,27 +778,31 @@ def test_keychain_items_may_exist_matrix():
     assert ks.keychain_items_may_exist(cfg("keychain", "complete")) is True
     # Crashed mid-migration (backend config, items written) -> True.
     assert ks.keychain_items_may_exist(cfg("config", "items_written")) is True
-    # KEPT-branch revert -> True (orphans still get cleaned by delete-data uninstall).
-    assert ks.keychain_items_may_exist(cfg("config", "reverted_kept")) is True
-    # Successful revert -> False (items already deleted, no orphans).
+    # BATCH-5 FLAG: any revert (clean OR kept) -> durable opt-out -> True, so a
+    # clean revert whose delete crashed still gets cleaned by delete-data
+    # uninstall (was "none"->False, the §7.3 crash-window bug Part 4a fixes).
+    assert ks.keychain_items_may_exist(cfg("config", ks.STATE_OPTED_OUT)) is True
+    # A genuinely-never-migrated install stays "none" -> False (dark-safe).
     assert ks.keychain_items_may_exist(cfg("config", "none")) is False
 
 
 def test_revert_config_to_plaintext_states():
-    # All readable -> state none (caller will delete items, no orphans).
+    # BATCH-5 FLAG: both branches now set the unified durable opt-out marker
+    # (was "none" / "reverted_kept"); clean vs kept lives in the returned list.
+    # All readable -> opted_out (caller will delete items).
     cfg = {"anthropic": {"api_key": "sk-real"}, "smtp": {}, "accounts": [],
            "secrets": {"backend": "keychain", "migration": {"state": "complete"}}}
     assert ks.revert_config_to_plaintext(cfg) == []
     assert cfg["secrets"]["backend"] == "config"
-    assert cfg["secrets"]["migration"]["state"] == "none"
-    # Some unreadable -> state reverted_kept + the blanked keys returned.
+    assert cfg["secrets"]["migration"]["state"] == ks.STATE_OPTED_OUT
+    # Some unreadable -> opted_out + the blanked keys returned.
     cfg2 = {"anthropic": {"api_key": ks.SENTINEL},
             "smtp": {"host": "s", "username": "u", "password": "sk-real"},
             "accounts": [],
             "secrets": {"backend": "keychain", "migration": {"state": "complete"}}}
     unreadable = ks.revert_config_to_plaintext(cfg2)
     assert unreadable == [ks.api_key_account()]
-    assert cfg2["secrets"]["migration"]["state"] == "reverted_kept"
+    assert cfg2["secrets"]["migration"]["state"] == ks.STATE_OPTED_OUT
     assert cfg2["anthropic"]["api_key"] == ""
 
 
