@@ -170,13 +170,29 @@ def test_hydrate_keychain_mixed_missing_and_locked(fake_kc):
     assert (ks.imap_account("imap.host.com", "me@host.com"), "locked") in reasons
 
 
-def test_hydrate_empty_secret_not_read(fake_kc):
-    # An empty API key (no key configured) is never a keychain item — hydrate
-    # must leave "" untouched and not record it as an error.
+def test_hydrate_empty_api_key_is_hard_error_at_keychain(fake_kc):
+    # CHANGED by defect D5 (was test_hydrate_empty_secret_not_read): at the
+    # keychain backend a CLEARED (empty) Anthropic API key is now a HARD,
+    # fail-closed condition — the tick must SKIP rather than run the untested
+    # half-mode §7.1 rejects. hydrate leaves the field blank but records an
+    # "empty" non-shadow error so hard_secret_errors fails the run closed.
     cfg = _keychain_config(api_key="")
     cfg = ks.hydrate(cfg)
-    assert cfg["anthropic"]["api_key"] == ""
-    assert all(e["key"] != ks.api_key_account() for e in cfg["_secret_errors"])
+    assert cfg["anthropic"]["api_key"] == ""            # field left blank
+    assert (ks.api_key_account(), "empty") in \
+        {(e["key"], e["reason"]) for e in cfg["_secret_errors"]}
+    assert ks.hard_secret_errors(cfg)                    # -> fail closed
+    assert ks.status_record(cfg, "run-filter")["empty"] == [ks.api_key_account()]
+
+
+def test_hydrate_empty_non_api_secret_is_not_an_error(fake_kc):
+    # Only the API key is fail-closed-on-empty (D5); an empty SMTP password is
+    # not (reports don't gate the filter tick). No "empty" error recorded.
+    fake_kc.items = {ks.api_key_account(): "sk",
+                     ks.imap_account("imap.host.com", "me@host.com"): "imap"}
+    cfg = _keychain_config(api_key=ks.SENTINEL, smtp="", imap=ks.SENTINEL)
+    cfg = ks.hydrate(cfg)
+    assert all(e["reason"] != "empty" for e in cfg["_secret_errors"])
 
 
 def test_hydrate_shadow_mode_prefers_keychain_falls_back(fake_kc):

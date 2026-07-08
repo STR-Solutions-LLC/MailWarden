@@ -134,14 +134,12 @@ def _cli_set_secrets_backend(value: str) -> int:
     def _revert(cfg):
         # cfg is loaded FRESH inside the lock and already hydrated by load_config:
         # readable items now sit as real plaintext in the fields; unreadable ones
-        # still hold the sentinel. Blank those, drop hydrate's _-keys, and flip
-        # the backend so the save below writes plaintext (strip is a no-op once
-        # backend == "config").
-        unreadable[:] = keychain_store.clear_unresolved_sentinels(cfg)
-        sec = cfg.setdefault("secrets", {})
-        sec["backend"] = "config"
-        sec.setdefault("migration",
-                       {})["state"] = "none"
+        # still hold the sentinel. The shared core blanks the unreadable
+        # sentinels, drops hydrate's _-keys, flips the backend to "config", and
+        # sets migration.state -> "none" when everything was recovered or
+        # "reverted_kept" when some items are KEPT (so a later delete-data
+        # uninstall still cleans those orphans — carry-over B).
+        unreadable[:] = keychain_store.revert_config_to_plaintext(cfg)
 
     config_io.update_config(_revert)
 
@@ -733,6 +731,21 @@ def _main_inner(startup_log) -> int:
                 f"smappservice registration refresh FAILED (non-fatal): "
                 f"{type(e).__name__}: {e}"
             )
+
+        # Keychain migration (§6.1). Dashboard-process ONLY — this whole else
+        # branch is gated above so headless launchd agents (filter, report,
+        # menubar) never reach it, and the migration writer is the one process
+        # allowed to create keychain items (§5.2). DARK: AUTO_MIGRATE_ENABLED is
+        # False and no config-backend beta holds an in-progress state, so
+        # maybe_run() short-circuits before any keychain op. Non-fatal by
+        # construction — a keychain hiccup must never block the Dashboard launch.
+        try:
+            from . import keychain_migrate
+            keychain_migrate.maybe_run(startup_log)
+        except Exception as e:  # noqa: BLE001
+            startup_log.step(
+                f"keychain migration hook FAILED (non-fatal): "
+                f"{type(e).__name__}: {e}")
 
     # Headless filter entry points — invoked by launchd agents.
     if "--run-filter" in sys.argv:

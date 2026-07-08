@@ -255,6 +255,19 @@ def migration_state(config: dict) -> str:
     return mig.get("state", "none")
 
 
+def revert_epoch(config: dict) -> int:
+    """Monotonic counter bumped by every revert-to-config (§7.2). An in-flight
+    migration snapshots it at start and aborts cleanly if it changes mid-run, so
+    a "Stop using the Keychain" pressed during a background repair/re-run can
+    never be silently undone by the still-running migration thread (defect D3)."""
+    sec = config.get("secrets") or {}
+    mig = sec.get("migration") or {}
+    try:
+        return int(mig.get("revert_epoch", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def hydrate(config: dict) -> dict:
     """Replace keychain-backed secret fields in ``config`` with their real
     values, in memory (§5.3). No-op — the identical object is returned — when the
@@ -333,6 +346,18 @@ def hydrate(config: dict) -> dict:
     # secret read through get_or_create_self_mail_secret (its own backend-aware
     # path), never consumed from the config dict, so hydrating it would risk
     # returning the sentinel string to that reader when the item is absent.
+    #
+    # D5: at the keychain backend a CLEARED (empty) Anthropic API key is a HARD,
+    # fail-closed condition — the tick must SKIP, not run the untested half-mode
+    # (IMAP logins + deterministic junking + a per-message AI auth error) that
+    # §7.1's all-or-nothing rule rejects. Recorded as a non-shadow error so
+    # hard_secret_errors() fails the run closed and status_record() surfaces it
+    # to the banner. INERT at the config backend (this whole function returned
+    # early above), so an empty key there keeps today's behavior — dark ship.
+    resolved_api = anthro.get("api_key") if isinstance(anthro, dict) else None
+    if isinstance(resolved_api, str) and resolved_api.strip() == "":
+        errors.append({"key": api_key_account(), "reason": "empty",
+                       "shadow": False})
     config["_secret_errors"] = errors
     return config
 
@@ -412,6 +437,9 @@ def status_record(config: dict, pid_context: str) -> dict:
         "missing": [e.get("key") for e in errors if e.get("reason") == "missing"],
         "locked": any(e.get("reason") == "locked" for e in errors),
         "errors": [e.get("key") for e in errors if e.get("reason") == "error"],
+        # D5: a CLEARED (empty) required key — distinct cause so the banner can
+        # say "no API key configured" instead of "unreadable".
+        "empty": [e.get("key") for e in errors if e.get("reason") == "empty"],
         "shadow_fallback": any(e.get("shadow") for e in errors),
         "pid_context": pid_context,
     }
@@ -524,6 +552,61 @@ def clear_unresolved_sentinels(config: dict) -> list:
     for k in [k for k in config if isinstance(k, str) and k.startswith("_")]:
         del config[k]
     return blanked
+
+
+# Migration state left by a KEPT-branch revert (§7.2): the backend is flipped
+# back to "config" but one or more keychain items could NOT be read back, so
+# they were KEPT (deleting the last copy of an ACL-denied secret is a footgun).
+# This is NOT one of the state-machine's own states — the driver never acts on
+# it — it is purely a marker so keychain_items_may_exist() stays True and a later
+# delete-data uninstall still cleans the orphans (carry-over B).
+STATE_REVERTED_KEPT = "reverted_kept"
+
+
+def revert_config_to_plaintext(config: dict) -> list:
+    """Shared kill-switch / revert core (§7.2), used by the CLI escape hatch and
+    the Dashboard "Stop using the Keychain" button so the two paths behave
+    identically. The ``config`` passed in is already HYDRATED by load_config —
+    readable items sit as plaintext in their fields; unreadable ones still hold
+    the sentinel. This: blanks the unreadable sentinels (and returns their derived
+    account keys so the caller can warn the owner to re-enter them), drops
+    hydrate's ``_``-prefixed keys, and flips ``secrets.backend`` to "config".
+
+    ``secrets.migration.state`` goes to "none" when EVERY secret was recovered
+    (the caller then deletes the now-orphaned items — no stragglers) or to
+    "reverted_kept" when some were unreadable and the items are being KEPT (the
+    marker keychain_items_may_exist() reads so a later delete-data uninstall still
+    removes those orphans). PURE — no keychain IO; the caller does any delete."""
+    unreadable = clear_unresolved_sentinels(config)
+    sec = config.setdefault("secrets", {})
+    sec["backend"] = "config"
+    mig = sec.setdefault("migration", {})
+    mig["state"] = STATE_REVERTED_KEPT if unreadable else "none"
+    # D3: bump the revert epoch so any migration thread still running in this
+    # process (a background repair/re-run) detects the revert on its next
+    # iteration and aborts cleanly instead of silently resurrecting the keychain
+    # backend it just left. Atomic with the backend flip (same locked write).
+    try:
+        mig["revert_epoch"] = int(mig.get("revert_epoch", 0)) + 1
+    except (TypeError, ValueError):
+        mig["revert_epoch"] = 1
+    return unreadable
+
+
+def keychain_items_may_exist(config: dict) -> bool:
+    """True when login-keychain items may exist for this install. Gates the
+    delete-data uninstall's item cleanup (§7.3, carry-over B) so orphans left by
+    a partial migration (crash mid-flight) or a KEPT-branch revert are still
+    removed. INERT (False) in a config-backend beta that never migrated: backend
+    "config" + migration.state "none" => False, so no SecItem enumeration is
+    reachable in dark ship. A SUCCESSFUL full revert leaves state "none" (items
+    already deleted, no orphans) => False; a KEPT revert leaves "reverted_kept"
+    and a mid-migration crash leaves items_written/etc. => True."""
+    if not isinstance(config, dict):
+        return False
+    if backend_of(config) == "keychain":
+        return True
+    return migration_state(config) != "none"
 
 
 # ---------------------------------------------------------------------------

@@ -24,6 +24,7 @@ except ImportError:  # rumps is only present in the bundled .app
 
 from . import config_io
 from . import file_lock
+from . import keychain_migrate
 from . import paths
 from . import startup_log
 
@@ -550,6 +551,17 @@ class MailWardenMenuBar(rumps.App if rumps else object):
         paused = config.get("ui", {}).get("paused", False) or not any(
             a.get("enabled", True) for a in config.get("accounts", []))
         self.pause_item.title = "Resume Filtering" if paused else "Pause Filtering"
+
+        # Keychain failure (§7.1). Read the engine's last-run status file (no
+        # secrets — booleans + key names only) and, when the keychain backend is
+        # active and a read failed, override to a RED warning that points the
+        # owner at the Dashboard. Inert at the config backend (dark): the helper
+        # returns False, so this whole block is a no-op and the status line above
+        # stands unchanged.
+        kc_status = config_io.load_json(paths.KEYCHAIN_STATUS_PATH, None)
+        if keychain_migrate.keychain_warning_active(config, kc_status):
+            self.status_item.title = (
+                f"{STATE_RED[0]}  {keychain_migrate.MENU_BAR_WARNING_TEXT}")
 
     def on_run_now(self, _sender):
         ok, msg = run_filter_subprocess()

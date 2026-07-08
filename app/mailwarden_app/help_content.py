@@ -555,6 +555,26 @@ UNINSTALL_MAILWARDEN = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Keychain storage (Help tab section). Shown only when the Keychain backend is
+# active (docs/keychain-design-plan.md §8). Draft copy — factual + succinct.
+# ---------------------------------------------------------------------------
+KEYCHAIN_STORAGE_TITLE = "Where are my passwords stored?"
+KEYCHAIN_STORAGE = (
+    "MailWarden stores your Anthropic API key and your email account passwords "
+    "in your Mac's login Keychain — the same encrypted store macOS uses for "
+    "Safari passwords and Wi-Fi keys — instead of a plain settings file.\n\n"
+    "You don't have to do anything. The login Keychain unlocks automatically "
+    "when you log in, so filtering keeps running in the background.\n\n"
+    "If your login password and your Keychain password ever stop matching — for "
+    "example after resetting your password through macOS Recovery — the Keychain "
+    "stays locked, and MailWarden pauses filtering instead of guessing. The "
+    "Dashboard tells you when this happens and how to fix it in Keychain Access.\n\n"
+    "Settings → Keychain has controls to repair access, re-run the setup, clear "
+    "your stored API key, or switch back to the settings file."
+)
+
+
 CHECK_AND_TEACH_HELP = (
     "The \"Check an Email\" tab lets you paste any email's raw source and see, in "
     "plain English, exactly how MailWarden would handle it — and why.\n\n"
@@ -649,6 +669,9 @@ HELP_TAB_SECTIONS = [
     ("What each email command does", None),  # rendered specially from EMAIL_COMMAND_EXAMPLES
     ("Where to install MailWarden", USAGE_MODEL_LONG),
     ("Auto-launch at login", AUTO_LAUNCH_AT_LOGIN),
+    # Keychain storage — rendered only at the keychain backend (HelpTab gates it
+    # on keychain_migrate.show_help_entry; dark: hidden in the config-backend beta).
+    (KEYCHAIN_STORAGE_TITLE, KEYCHAIN_STORAGE),
     ("Uninstalling MailWarden", UNINSTALL_MAILWARDEN),
     ("How MailWarden handles emails that contain instructions or AI prompts", AI_PROMPT_RESISTANCE),
     ("What MailWarden does not do", WHAT_MAILWARDEN_DOES_NOT_DO),

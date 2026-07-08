@@ -26,6 +26,7 @@ from . import config_io
 from . import explain_text
 from . import file_lock
 from . import help_content
+from . import keychain_migrate
 from . import keychain_store
 from . import paths
 from . import smappservice_install
@@ -1077,6 +1078,17 @@ class HomeTab(ttk.Frame):
         ttk.Button(self._update_banner, text="View Release Notes",
                    command=self._on_open_releases).pack(side=tk.RIGHT)
 
+        # Keychain failure banner (§7.1). Hidden unless the keychain backend is
+        # active AND the last engine run reported a read failure (or a migration
+        # parked) — inert in the dark config-backend beta.
+        self._kc_banner = ttk.Frame(self._f, padding=(8, 8), relief=tk.GROOVE)
+        self._kc_banner_label = ttk.Label(self._kc_banner, text="",
+                                          foreground="#a11", wraplength=520,
+                                          justify=tk.LEFT)
+        self._kc_banner_label.pack(side=tk.LEFT)
+        self._kc_banner_btn = ttk.Button(self._kc_banner, text="")
+        self._kc_banner_btn.pack(side=tk.RIGHT)
+
     def refresh(self):
         config = config_io.load_config()
 
@@ -1148,6 +1160,33 @@ class HomeTab(ttk.Frame):
 
         # Update check (throttled to once per 14 days)
         self._maybe_show_update_banner()
+
+        # Keychain failure banner (§7.1). Inert at the config backend (dark).
+        self._maybe_show_keychain_banner(config)
+
+    def _maybe_show_keychain_banner(self, config):
+        status = config_io.load_json(paths.KEYCHAIN_STATUS_PATH, None)
+        banner = keychain_migrate.keychain_banner(config, status)
+        if banner is None:
+            self._kc_banner.pack_forget()
+            return
+        self._kc_banner_label.config(text=f"{banner['title']}\n{banner['detail']}")
+        action = banner.get("action")
+        if action == "open_keychain_access":
+            self._kc_banner_btn.config(
+                text="Open Keychain Access",
+                command=lambda: subprocess.Popen(
+                    ["open", "-a", "Keychain Access"]))
+            self._kc_banner_btn.pack(side=tk.RIGHT)
+        elif action == "repair":
+            self._kc_banner_btn.config(
+                text="Repair keychain access",
+                command=self.app.settings_tab._on_keychain_repair
+                if hasattr(self.app, "settings_tab") else (lambda: None))
+            self._kc_banner_btn.pack(side=tk.RIGHT)
+        else:
+            self._kc_banner_btn.pack_forget()
+        self._kc_banner.pack(fill=tk.X, pady=(8, 0))
 
     def _on_toggle_dry_run(self):
         new_val = bool(self._dry_run_var.get())
@@ -4150,9 +4189,32 @@ class SettingsTab(ttk.Frame):
         ttk.Button(contribute, text="Share my learned signals",
                    command=self._on_share_signals).pack(anchor=tk.W, pady=(6, 0))
 
+        # Keychain (advanced) group (§7.2/§8/§12.8). Built once but only PACKED at
+        # the keychain backend (see _refresh_keychain_group), so the config-backend
+        # beta shows nothing and the Settings tab is byte-identical to today.
+        self._kc_group = ttk.LabelFrame(self._f, text="Keychain (advanced)",
+                                        padding=(10, 6))
+        ttk.Label(self._kc_group, wraplength=620, text=(
+            "Your Anthropic API key and email passwords are stored in your Mac's "
+            "login Keychain instead of a settings file. These controls are for "
+            "repair and for switching back if you ever need to.")).pack(
+                anchor=tk.W)
+        kc_btns = ttk.Frame(self._kc_group)
+        kc_btns.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(kc_btns, text="Repair keychain access",
+                   command=self._on_keychain_repair).pack(side=tk.LEFT)
+        ttk.Button(kc_btns, text="Re-run Keychain setup",
+                   command=self._on_keychain_rerun).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(kc_btns, text="Clear stored key…",
+                   command=self._on_keychain_clear_key).pack(
+                       side=tk.LEFT, padx=(8, 0))
+        ttk.Button(kc_btns, text="Stop using the Keychain", style="Danger.TButton",
+                   command=self._on_keychain_stop).pack(side=tk.LEFT, padx=(8, 0))
+
         # Danger zone — full uninstall. Placed last so it sits at the bottom
         # of the scrollable Settings tab, visually set apart as destructive.
         danger = ttk.LabelFrame(self._f, text="Uninstall", padding=(10, 6))
+        self._danger = danger
         danger.pack(fill=tk.X, pady=(16, 8))
         ttk.Label(danger, wraplength=620, text=(
             "Completely remove MailWarden from this Mac. This unregisters "
@@ -4170,8 +4232,18 @@ class SettingsTab(ttk.Frame):
         # today's behavior (the plaintext key is shown for editing).
         if keychain_store.backend_of(config) == "keychain":
             self._api_var.set("")
+            # Carry-over A: a blank masked field reads as "no key configured";
+            # show a factual hint (key stored, or — after Clear — "no key", D5).
+            self._api_status.config(
+                text=keychain_migrate.api_key_placeholder_hint(config))
         else:
             self._api_var.set(config.get("anthropic", {}).get("api_key", ""))
+            # D6: config backend must be byte-identical to ba5399b — do NOT touch
+            # _api_status here (clearing it would wipe a lingering Saved./
+            # validation message the old code left in place).
+        # Keychain (advanced) group: shown ONLY at the keychain backend (§7.2/
+        # §8/§12.8). Hidden in the dark config-backend beta (byte-identical UI).
+        self._refresh_keychain_group(config)
         default_model = "claude-haiku-4-5-20251001"
         anthro = config.get("anthropic", {})
         classify_mode = anthro.get("classify_mode", "cascade")
@@ -4303,6 +4375,78 @@ class SettingsTab(ttk.Frame):
             self.after(0, done)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    # ----- Keychain (advanced) group (§7.2/§8). GUI wiring is M1-tested; the
+    # decision + action logic lives in keychain_migrate (unit-tested). -----
+    def _refresh_keychain_group(self, config):
+        """Pack the Keychain group only at the keychain backend (dark: hidden at
+        the config backend), positioned just above the Uninstall danger zone."""
+        visible = keychain_migrate.is_settings_group_visible(config)
+        if visible:
+            if not self._kc_group.winfo_ismapped():
+                self._kc_group.pack(fill=tk.X, pady=(0, 8), before=self._danger)
+        else:
+            self._kc_group.pack_forget()
+
+    def _on_keychain_repair(self):
+        import threading
+        deps = keychain_migrate.build_deps()
+        threading.Thread(
+            target=lambda: keychain_migrate.restart_migration(deps),
+            daemon=True).start()
+        messagebox.showinfo(
+            "Repairing Keychain access",
+            "MailWarden is rebuilding access to your saved passwords. This runs "
+            "in the background; check back in a moment.")
+
+    def _on_keychain_rerun(self):
+        import threading
+        deps = keychain_migrate.build_deps()
+        threading.Thread(
+            target=lambda: keychain_migrate.restart_migration(deps),
+            daemon=True).start()
+        messagebox.showinfo(
+            "Re-running Keychain setup",
+            "MailWarden is moving your passwords into the Keychain again. This "
+            "runs in the background; check back in a moment.")
+
+    def _on_keychain_clear_key(self):
+        if not messagebox.askyesno(
+                "Clear your stored API key?",
+                "This deletes your Anthropic API key from the Keychain and "
+                "clears it from MailWarden.\n\nSpam filtering stops until you "
+                "enter a new key in Settings.\n\nClear it now?",
+                icon=messagebox.WARNING, default=messagebox.NO):
+            return
+        deps = keychain_migrate.build_deps()
+        keychain_migrate.clear_stored_api_key(deps)
+        self.refresh()
+        messagebox.showinfo(
+            "API key cleared",
+            "Your stored API key was removed. Enter a new key in Settings to "
+            "resume filtering.")
+
+    def _on_keychain_stop(self):
+        if not messagebox.askyesno(
+                "Stop using the Keychain?",
+                "MailWarden will move your API key and email passwords back into "
+                "its settings file and stop using the Keychain.\n\nProceed?",
+                icon=messagebox.WARNING, default=messagebox.NO):
+            return
+        deps = keychain_migrate.build_deps()
+        result = keychain_migrate.revert_off_keychain(deps)
+        self.refresh()
+        unreadable = result.get("unreadable") or []
+        if unreadable:
+            messagebox.showwarning(
+                "Some passwords need re-entering",
+                "MailWarden switched back to its settings file, but it could not "
+                "read some passwords from the Keychain. Re-enter them in Accounts "
+                "and Settings:\n\n" + "\n".join(unreadable))
+        else:
+            messagebox.showinfo(
+                "Keychain turned off",
+                "Your passwords are back in MailWarden's settings file.")
 
     def _on_menubar_toggle(self):
         # v1.6.0: SMAppService manages agent lifecycle. We write the user's
@@ -4812,14 +4956,18 @@ class SettingsTab(ttk.Frame):
 
                 # (b2) Delete-data uninstall also removes the login-keychain
                 # items (§7.3). Read the backend from config BEFORE the data dir
-                # is deleted below. Gated on backend == "keychain" so NO SecItem*
-                # call is reachable at the config backend (dark ship); a keep-data
-                # uninstall leaves the items so a reinstall picks them back up
-                # (trust is DR-based, not install-instance-based).
+                # is deleted below. Gated on keychain_items_may_exist() so NO
+                # SecItem* call is reachable at the config backend that never
+                # migrated (dark ship: backend "config" + state "none" => False),
+                # while orphans left by a partial migration or a KEPT-branch
+                # revert (backend flipped back to "config" but items KEPT) are
+                # STILL cleaned up (carry-over B). A keep-data uninstall leaves the
+                # items so a reinstall picks them back up (trust is DR-based, not
+                # install-instance-based).
                 if delete_data:
                     try:
                         cfg = config_io.load_config()
-                        if keychain_store.backend_of(cfg) == "keychain" \
+                        if keychain_store.keychain_items_may_exist(cfg) \
                                 and keychain_store.available():
                             n = keychain_store.delete_all_items()
                             startup_log.step(
@@ -5908,7 +6056,12 @@ class HelpTab(ttk.Frame):
         txt.insert(tk.END, "MailWarden Help\n", "h1")
         txt.insert(tk.END, help_content.HELP_TAB_INTRO + "\n", "body")
 
+        # The Keychain storage entry is shown only at the keychain backend (§8);
+        # hidden in the dark config-backend beta (Help tab byte-identical to today).
+        show_keychain = keychain_migrate.show_help_entry(config_io.load_config())
         for title, body in help_content.HELP_TAB_SECTIONS:
+            if title == help_content.KEYCHAIN_STORAGE_TITLE and not show_keychain:
+                continue
             txt.insert(tk.END, title + "\n", "h2")
             if body is None and title == "What each email command does":
                 for cmd, desc in help_content.EMAIL_COMMAND_EXAMPLES:
