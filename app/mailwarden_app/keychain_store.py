@@ -162,11 +162,17 @@ def set_user_interaction_allowed(allowed: bool) -> None:
 # ---------------------------------------------------------------------------
 
 def _access():
-    """Build a SecAccess trusting BOTH installed executables (§4.1/§5.2)."""
-    status, gui = SecTrustedApplicationCreateFromPath(APP_PATH, None)
+    """Build a SecAccess trusting BOTH installed executables (§4.1/§5.2).
+
+    ``SecTrustedApplicationCreateFromPath`` takes a C ``const char *`` path;
+    the PyObjC bridge for that argument wants a ``bytes`` object, not ``str``
+    (a ``str`` raises ValueError: "Expecting byte string ..."). This only bites
+    on a real Mac with the Security framework, so dev/CI (framework absent)
+    never exercised it — hence the M1-only failure. Encode the paths."""
+    status, gui = SecTrustedApplicationCreateFromPath(APP_PATH.encode("utf-8"), None)
     if status != errSecSuccess:
         raise KeychainError("trusted-app (app)", status)
-    status, py = SecTrustedApplicationCreateFromPath(PY_PATH, None)
+    status, py = SecTrustedApplicationCreateFromPath(PY_PATH.encode("utf-8"), None)
     if status != errSecSuccess:
         raise KeychainError("trusted-app (python)", status)
     status, access = SecAccessCreate("MailWarden", [gui, py], None)

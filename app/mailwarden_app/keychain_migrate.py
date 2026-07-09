@@ -917,6 +917,12 @@ def maybe_run(startup_log) -> dict:
             f"state={result.get('state')}")
         return result
     except Exception as e:  # noqa: BLE001
+        # Log the FULL traceback, not just the message: keychain failures only
+        # reproduce on a real Mac with the Security framework, so the traceback
+        # is the only way to pinpoint the failing call without a rebuild.
+        import traceback
         startup_log.step(
             f"keychain migration FAILED (non-fatal): {type(e).__name__}: {e}")
+        for line in traceback.format_exc().rstrip().splitlines():
+            startup_log.step(f"  traceback: {line}")
         return {"action": "error", "error": f"{type(e).__name__}: {e}"}

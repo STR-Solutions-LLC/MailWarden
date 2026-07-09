@@ -430,11 +430,14 @@ errSecInteractionNotAllowed = -25308
 
 def _access():
     # Trust BOTH executables. PyObjC convention: pass None for out-params,
-    # receive (OSStatus, value) tuples.
-    status, gui = SecTrustedApplicationCreateFromPath(APP_PATH, None)
+    # receive (OSStatus, value) tuples. The path arg is a C `const char *` and
+    # the PyObjC bridge requires BYTES, not str (a str raises ValueError:
+    # "Expecting byte string of length 1"). This only surfaces on a real Mac
+    # with the Security framework — dev/CI never reach it. [2026-07-09 fix.]
+    status, gui = SecTrustedApplicationCreateFromPath(APP_PATH.encode("utf-8"), None)
     if status != errSecSuccess:
         raise KeychainError("trusted-app (app)", status)
-    status, py = SecTrustedApplicationCreateFromPath(PY_PATH, None)
+    status, py = SecTrustedApplicationCreateFromPath(PY_PATH.encode("utf-8"), None)
     if status != errSecSuccess:
         raise KeychainError("trusted-app (python)", status)
     status, access = SecAccessCreate("MailWarden", [gui, py], None)
