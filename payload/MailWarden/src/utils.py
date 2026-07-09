@@ -216,11 +216,15 @@ def get_or_create_self_mail_secret(config_path=None) -> "str | None":
             with open(path, "r") as f:
                 cfg = json.load(f)
             # Keychain backend: read the self-mail secret from the login keychain
-            # (READ-ONLY — the engine never writes keychain items; the GUI mints
-            # this during migration / first-run). Fail-open None on a locked or
-            # absent keychain so the caller stamps without the HMAC header. INERT
-            # while backend == "config" (the shipped default): the plaintext path
-            # below runs byte-for-byte as before.
+            # (READ-ONLY — the engine never writes keychain items). The GUI mints +
+            # writes this item: during the keychain migration's item-write step
+            # (keychain_migrate._ensure_self_mail_item), as a completed-install
+            # self-repair on Dashboard open when it is absent
+            # (keychain_migrate._repair_self_mail_secret), and on first-run (the
+            # setup welcome email). Fail-open None on a locked or absent keychain so
+            # the caller stamps without the HMAC header. INERT while backend ==
+            # "config" (the shipped default): the plaintext path below runs
+            # byte-for-byte as before.
             if _self_mail_backend_is_keychain(cfg):
                 return _read_self_mail_secret_keychain()
             secret = cfg.get(_SELF_MAIL_SECRET_KEY)

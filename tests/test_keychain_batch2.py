@@ -305,6 +305,9 @@ def test_cli_keychain_verify_ok(tmp_path, monkeypatch, capsys, fake_kc):
     fake_kc.items = {
         ks.api_key_account(): "sk",
         ks.imap_account("imap.host.com", "me@host.com"): "imap",
+        # A1-1: a healthy migrated install also carries the self-mail HMAC item,
+        # which the disk-derived keychain-backend verify now requires.
+        ks.self_mail_account(): "sm",
     }
     rc = app_entrypoint._cli_keychain_verify()
     out = json.loads(capsys.readouterr().out.strip())

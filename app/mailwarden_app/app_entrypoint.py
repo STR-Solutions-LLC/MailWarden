@@ -99,6 +99,17 @@ def _cli_keychain_verify() -> int:
         except Exception:
             keys = None
     cfg = config_io.load_config()
+    # A1-1: the disk-derived (migrated/upgrade) verify must ALSO require the
+    # self-mail HMAC item at the keychain backend — the migration + completed-
+    # install repair now provision it, so a migrated install must have it.
+    # expected_account_keys() intentionally omits it (auto-minted, not a config
+    # field); adding it HERE keeps the provisioner/migration-failure semantics of
+    # that shared helper unchanged. The explicit --keys-from-stdin fresh-install
+    # path is untouched (it passes its own in-memory keys).
+    if keys is None:
+        keys = keychain_store.expected_account_keys(cfg)
+        if keychain_store.backend_of(cfg) == "keychain":
+            keys = keys + [keychain_store.self_mail_account()]
     verdict = keychain_store.verify_keys(cfg, keys=keys)
     verdict["available"] = True
     print(json.dumps(verdict))

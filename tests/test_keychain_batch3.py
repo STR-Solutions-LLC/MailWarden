@@ -270,7 +270,7 @@ def test_action_for_routing():
 # ===========================================================================
 # Happy path — none -> complete.
 # ===========================================================================
-def _assert_migrated(bed):
+def _assert_migrated(bed, expect_self_mail=True):
     """Invariants after a completed migration: state complete + scrubbed_at,
     every real secret in the keychain, config.json holds ONLY sentinels (no
     plaintext leaked)."""
@@ -278,7 +278,15 @@ def _assert_migrated(bed):
     assert disk["secrets"]["backend"] == "keychain"
     assert disk["secrets"]["migration"]["state"] == "complete"
     assert disk["secrets"]["migration"]["scrubbed_at"]
-    assert bed.fk.items == _expected_kc_keys()
+    # A1-1: the migration's items-write step also provisions the self-mail HMAC
+    # item (minted, so its value is not asserted here). A resume that skips
+    # step 1 (pre-fix mid-flight install) legitimately lacks it until the
+    # maybe_run repair — those callers pass expect_self_mail=False.
+    if expect_self_mail:
+        assert ks.self_mail_account() in bed.fk.items
+    core = {k: v for k, v in bed.fk.items.items()
+            if k != ks.self_mail_account()}
+    assert core == _expected_kc_keys()
     text = bed.disk_text()
     for secret in REAL_SECRETS.values():
         assert secret not in text, f"plaintext {secret!r} leaked into config.json"
@@ -394,7 +402,12 @@ def test_resume_from_state_reaches_complete(env, start_state, backend):
     env.cfgfile.write_text(json.dumps(cfg))
     result = km.run_migration(env.deps())
     assert result["action"] == "complete", (start_state, backend)
-    _assert_migrated(env)
+    # Resumes that skip step 1 don't provision the self-mail item inside
+    # run_migration — the maybe_run repair covers them (test_keychain_self_mail
+    # _a1_1 proves it); every other start state must have written it.
+    _assert_migrated(env, expect_self_mail=start_state not in (
+        km.STATE_ITEMS_WRITTEN, km.STATE_EXEC_VERIFIED,
+        km.STATE_TICK_VERIFIED, km.FAILED_TICK_VERIFY))
 
 
 # ===========================================================================
@@ -417,8 +430,11 @@ def test_exec_verify_failure_parks_and_keeps_plaintext(env):
     disk = env.disk()
     assert disk["secrets"]["backend"] == "config"       # flip happens only in step 3
     assert disk["anthropic"]["api_key"] == REAL_SECRETS["api_key"]
-    # Items were written (step 1 ran) — available for the retry.
-    assert env.fk.items == _expected_kc_keys()
+    # Items were written (step 1 ran) — available for the retry. Step 1 also
+    # provisions the self-mail HMAC item (A1-1); ignore it in the key comparison.
+    core = {k: v for k, v in env.fk.items.items() if k != ks.self_mail_account()}
+    assert core == _expected_kc_keys()
+    assert ks.self_mail_account() in env.fk.items
 
 
 def test_tick_verify_timeout_parks_in_shadow_mode(env):
@@ -569,7 +585,8 @@ def test_revert_off_keychain_restores_plaintext_and_deletes(env):
     _completed_env(env)
     out = km.revert_off_keychain(env.deps())
     assert out["unreadable"] == []
-    assert out["deleted"] == 3
+    # 3 configured secrets + the self-mail HMAC item provisioned by migration (A1-1).
+    assert out["deleted"] == 4
     disk = env.disk()
     assert disk["secrets"]["backend"] == "config"
     # BATCH-5 FLAG: clean revert now lands on the durable opt-out (was "none").
@@ -671,7 +688,8 @@ def test_revert_during_migration_aborts_not_resurrects(env):
     assert env.disk()["secrets"]["migration"]["state"] == km.STATE_ITEMS_WRITTEN
 
     out = km.revert_off_keychain(d)                       # user reverts NOW
-    assert out["deleted"] == 3
+    # 3 configured secrets + the self-mail HMAC item written in step 1 (A1-1).
+    assert out["deleted"] == 4
     after_revert = env.disk()
     assert after_revert["secrets"]["backend"] == "config"
 

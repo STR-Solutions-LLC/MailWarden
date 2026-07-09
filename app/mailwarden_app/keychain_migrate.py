@@ -37,6 +37,7 @@ gate, §11 row 3).
 from __future__ import annotations
 
 import os
+import secrets
 import subprocess
 import time
 from dataclasses import dataclass
@@ -277,11 +278,35 @@ def _aborted(deps: MigrationDeps) -> dict:
 # parked dict to stop this run at a failed:* state (never blocks the app).
 # ---------------------------------------------------------------------------
 
+def _ensure_self_mail_item(cfg: dict) -> None:
+    """Provision the per-install self-mail HMAC keychain item (Wave 6) alongside
+    the configured secrets. expected_account_keys / write_configured_secrets
+    deliberately omit it (it is auto-minted, not an owner-entered config field),
+    so without this the migration would destroy the plaintext at scrub and never
+    create the item, leaving the engine's self-mail stamp inert (A1-1).
+    Idempotent — read before write so an in-flight stamp's key never changes:
+    keep an existing item; otherwise write the config's real plaintext value if
+    present (non-empty, non-sentinel), else a freshly minted secret. A write
+    failure raises through _step_write exactly like any other step-1 item write
+    (no silent path). GUI-process only; the caller has already decided keychain
+    is in force."""
+    acct = keychain_store.self_mail_account()
+    existing = keychain_store.read_secret(acct)
+    if isinstance(existing, str) and existing.strip():
+        return
+    value = cfg.get(keychain_store.SELF_MAIL_SECRET_KEY)
+    if not (isinstance(value, str) and value.strip()
+            and not value.startswith(keychain_store.SENTINEL_PREFIX)):
+        value = secrets.token_hex(32)
+    keychain_store.write_secret(acct, keychain_store.label_for(acct), value)
+
+
 def _step_write(deps: MigrationDeps, cfg: dict, epoch: int) -> Optional[dict]:
     # Step 1: write every currently-plaintext configured secret, then read each
     # back IN-PROCESS to confirm the write. Plaintext stays untouched (backend is
     # still "config" here). Re-running re-upserts — safe.
     deps.write_secrets(cfg)
+    _ensure_self_mail_item(cfg)
     deps.checkpoint("after_write_items")
     verdict = deps.read_back(cfg)
     if not verdict.get("ok"):
@@ -903,6 +928,29 @@ def build_deps(log: Callable[[str], None] = _noop_log) -> MigrationDeps:
     )
 
 
+def _repair_self_mail_secret(cfg: dict, startup_log) -> None:
+    """Completed-install self-repair for the Wave-6 self-mail HMAC item (A1-1).
+    An install that COMPLETED migration before the item was folded into the
+    migration writer never got it created, so the engine stamps nothing. On a
+    keychain-backed, completed install with an unlocked keychain, ensure it
+    exists through the idempotent GUI getter (config_io.get_or_create_self_mail_
+    secret): a no-op when present, minted+written when absent, harmlessly retried
+    on a later Dashboard open when the keychain is locked. INERT at the config
+    backend and with no framework (so a config-backend / dev run is untouched)."""
+    if (keychain_store.backend_of(cfg) != "keychain"
+            or keychain_store.migration_state(cfg) != STATE_COMPLETE
+            or not keychain_store.available()):
+        return
+    try:
+        present = keychain_store.read_secret(keychain_store.self_mail_account())
+    except (keychain_store.KeychainLocked, keychain_store.KeychainError):
+        return  # locked/error: no state change, retried on a later open
+    if isinstance(present, str) and present.strip():
+        return  # already provisioned — nothing to repair
+    if config_io.get_or_create_self_mail_secret():
+        startup_log.step("keychain: provisioned missing self-mail signing key")
+
+
 def maybe_run(startup_log) -> dict:
     """_main_inner hook (§6.1), Dashboard-process only. Wraps run_migration so any
     failure is non-fatal — a keychain hiccup must never block the Dashboard
@@ -915,6 +963,13 @@ def maybe_run(startup_log) -> dict:
         startup_log.step(
             f"keychain migration: {result.get('action')} "
             f"state={result.get('state')}")
+        # A1-1: a migration that COMPLETED before the self-mail item was folded in
+        # never created it — self-repair it here (no-op unless keychain-backed +
+        # complete + present-and-unlocked check fails). Never blocks the launch.
+        try:
+            _repair_self_mail_secret(deps.load_config(), startup_log)
+        except Exception:  # noqa: BLE001 — repair is best-effort, retried next open
+            pass
         return result
     except Exception as e:  # noqa: BLE001
         # Log the FULL traceback, not just the message: keychain failures only
