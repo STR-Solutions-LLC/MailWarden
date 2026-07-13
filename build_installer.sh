@@ -22,7 +22,7 @@ DIST_DIR="$INSTALLER_ROOT/dist"
 COMPONENT_PKG="$INSTALLER_ROOT/build/MailWarden-component.pkg"
 FINAL_PKG="$DIST_DIR/MailWarden.pkg"
 APP_BUNDLE_ID="com.strsolutions.mailwarden"
-APP_VERSION="1.8.0"
+APP_VERSION="1.8.1"
 
 mkdir -p "$DIST_DIR" "$(dirname "$COMPONENT_PKG")"
 
