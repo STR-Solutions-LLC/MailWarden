@@ -1,5 +1,6 @@
 """Safe sender-approval feature — approved_senders store, report APPROVE
 replies, unified report numbering, and RULE 0 prompt plumbing."""
+import email as _email
 import inspect
 import json
 import logging as _logging
@@ -161,7 +162,15 @@ def _mwr_msg(subject="Re: MailWarden Report — July 01, 2026 — 2 moved to Jun
         "x_spam_score": "", "x_spam_flag": "", "x_spam_status": "",
         "list_unsubscribe": "",
         "received_headers": [], "received_headers_first_3": [],
-        "_mime_msg": None,
+        # Realistic delivered mail carries a Received chain (via a foreign MX,
+        # not the owner's own server). This keeps an owner-sent NON-command
+        # reply out of the owner-mail exemption's absent-host fallback (which
+        # only applies when there is truly no Received evidence, e.g. IMAP
+        # APPEND), so it still flows to classification as before.
+        "_mime_msg": _email.message_from_string(
+            "Received: from mx.provider.test (mx.provider.test [203.0.113.9]) "
+            "by mx.provider.test with esmtp id d1 for <owner@example.com>\n"
+            "\nbody\n"),
     }
 
 
@@ -264,8 +273,14 @@ def _approve_harness(monkeypatch, *, msg_data, dry_run=False,
                         lambda *a, **k: True)
     monkeypatch.setattr(spam_filter, "log_decision", lambda *a, **k: None)
 
-    monkeypatch.setattr(spam_filter, "_command_sender_is_owner",
-                        lambda *a, **k: sender_is_owner)
+    # Honor the parametrized owner intent for the OWNER's own address only
+    # (matches production owner-identity membership). This keeps command tests
+    # unchanged while preventing the owner-mail junking exemption (gate 0) from
+    # exempting non-owner senders that override from_email.
+    monkeypatch.setattr(
+        spam_filter, "_command_sender_is_owner",
+        lambda from_email, *a, **k: sender_is_owner
+        and (from_email or "").strip().lower() == "owner@example.com")
     monkeypatch.setattr(spam_filter, "_command_auth_ok",
                         lambda *a, **k: auth_ok)
 

@@ -3543,9 +3543,33 @@ def _command_auth_ok(msg_data: dict, from_email: str,
         return True
 
     # --- Path (b): authenticated submission into the account's OWN server. ---
-    # Build the own-host set: lowercased EXACT hostnames of this account's own
-    # mail infrastructure — the account's IMAP host plus the configured SMTP
-    # host. EXACT equality only (see docstring).
+    # The Received-chain walk is EXTRACTED to _submitted_via_own_server so the
+    # owner-mail junking exemption (_is_protected_owner_mail) reuses the exact
+    # same security-reviewed logic. Command auth stays STRICT: it trusts only
+    # path (a) above or this authenticated-submission proof — it deliberately
+    # gets NO absent-host fallback (that fallback lives only in the exemption).
+    return _submitted_via_own_server(msg_data, account, config)
+
+
+def _submitted_via_own_server(msg_data: dict, account: dict,
+                              config: dict) -> bool:
+    """Path (b): return True iff *msg_data* entered the account's OWN mail
+    server via AUTHENTICATED submission, proven by the server-written Received
+    chain (RFC 3848 ``esmtpa``/``esmtpsa``). Independent of SPF/DKIM/DMARC.
+
+    Extracted verbatim from _command_auth_ok so both the owner-command auth gate
+    and the owner-mail junking exemption share one implementation. Behavior is
+    unchanged from the original inline path (b):
+
+    * Own-host set = EXACT lowercased account IMAP host + configured SMTP host.
+      Never suffix matching (a co-tenant on the same shared provider must not be
+      able to relay a forgery in).
+    * Only the TOP-DOWN server-written chain is trusted; the walk stops at the
+      entry hop, so a forged ``esmtpsa`` planted lower is ignored.
+    * ``with local`` (same-box script submission) does NOT count.
+    * No Received chain at all (e.g. IMAP-APPENDed mail) → False: cannot prove
+      server-login submission.
+    """
     own_hosts = set()
     imap_host = (account.get("imap_host", "") or "").strip().lower()
     if imap_host:
@@ -3604,6 +3628,95 @@ def _command_auth_ok(msg_data: dict, from_email: str,
 
     # Received chain exhausted without finding an authenticated entry hop.
     return False
+
+
+def _has_received_chain(msg_data: dict) -> bool:
+    """True iff the message carries at least one server-written ``Received``
+    header. Used by _is_protected_owner_mail to tell "truly no Received evidence
+    to judge" (IMAP-APPENDed / zero-header hosts → absent-host fallback applies)
+    apart from "a Received chain exists but did not prove authenticated
+    submission" (where the fallback must NOT fire)."""
+    mime_msg = msg_data.get("_mime_msg")
+    if mime_msg is None:
+        return False
+    try:
+        received = mime_msg.get_all("Received")
+    except Exception:
+        received = None
+    return bool(received)
+
+
+def _is_protected_owner_mail(msg_data: dict, from_email: str,
+                             account: dict, config: dict) -> tuple[bool, str]:
+    """Owner-mail junking exemption: decide whether a NON-command message that
+    reaches classification is genuinely from the owner and therefore must NEVER
+    be junked. Returns ``(protected, path_label)`` where path_label is one of
+    ``"a"`` / ``"b"`` / ``"absent-fallback"`` when protected, else ``""``.
+
+    This is a high-precedence CLASSIFICATION exemption (see run_filter's gate 0).
+    It is SEPARATE from the email-COMMAND path and does not change command auth.
+
+    Authentication ladder (Matt-approved), evaluated only when the From is one of
+    the owner's own identities (_command_sender_is_owner):
+
+      1. Path (a) — strict SPF/DKIM/DMARC pass + alignment (from-domain lands in
+         ``authenticated_domains``)                       → PROTECTED ("a").
+      2. Path (b) — authenticated submission through the owner's own mail server
+         (_submitted_via_own_server; independent of SPF/DKIM) → PROTECTED ("b").
+      3. Authentication PRESENT but FAILED — any of spf/dkim/dmarc is a real
+         value other than "none"/"pass" (fail/softfail/neutral/permerror/…):
+         the spoof/broken case                            → NOT protected.
+      4. Authentication ENTIRELY ABSENT — spf==dkim==dmarc=="none" AND there is
+         no Received-chain evidence to judge either way (IMAP-APPEND / zero-auth
+         hosts): fall back to trusting the From address   → PROTECTED
+                                                             ("absent-fallback").
+
+    A From that is NOT an owner identity, or any other combination (e.g. an
+    unaligned bare pass, or absent auth WITH a foreign Received chain — the
+    strip-the-headers spoof), is NOT protected and flows to normal
+    classification unchanged.
+    """
+    # Gate: only the owner's own identities can ever be exempt. A stranger's mail
+    # (or a message with no parseable From) is never protected here.
+    if not _command_sender_is_owner(from_email, account, config):
+        return (False, "")
+
+    fe = (from_email or "")
+    from_dom = fe.split("@", 1)[1].strip().lower().rstrip(".") if "@" in fe else ""
+    if not from_dom:
+        return (False, "")
+
+    auth = summarize_authentication({
+        "Authentication-Results": msg_data.get("auth_results", ""),
+        "Received-SPF": msg_data.get("received_spf", ""),
+        "DKIM-Signature": msg_data.get("dkim_signature", ""),
+    }, from_domain=from_dom)
+
+    # Step 1 — strict aligned pass.
+    if from_dom in set(auth.get("authenticated_domains", [])):
+        return (True, "a")
+
+    # Step 2 — authenticated submission through the owner's own server.
+    if _submitted_via_own_server(msg_data, account, config):
+        return (True, "b")
+
+    # Steps 3 & 4 — judge by the authentication scalars.
+    scalars = [auth.get("spf", "none"), auth.get("dkim", "none"),
+               auth.get("dmarc", "none")]
+    if any(s not in ("none", "pass") for s in scalars):
+        # Step 3: authentication is present and did NOT pass for us (fail /
+        # softfail / neutral / permerror / temperror …). Spoof or broken — leave
+        # it filterable.
+        return (False, "")
+    if all(s == "none" for s in scalars) and not _has_received_chain(msg_data):
+        # Step 4: no auth headers AND no Received chain to judge — the only
+        # evidence is the From address itself (e.g. IMAP-APPENDed owner mail, or
+        # a host that stamps zero auth data). Trust the owner's From.
+        return (True, "absent-fallback")
+
+    # Everything else (e.g. an unaligned bare pass, or absent auth WITH a foreign
+    # Received chain) is not proof of the owner → normal classification.
+    return (False, "")
 
 
 def _notify_unverified_command(config, account, logger):
@@ -10351,6 +10464,41 @@ USER'S FOLLOW-UP:
                     # whitelist's existing trump over blacklist/keyword/pre-
                     # classifier. Empty in the common case -> byte-identical.
                     whitelisted_sender = ""
+
+                    # --- Precedence check 0: owner-mail exemption ---
+                    # HIGHEST-precedence junking exemption. A NON-command message
+                    # (commands were detected and handled earlier in this loop)
+                    # whose From is one of the owner's own identities AND can be
+                    # trusted as genuinely from the owner (SPF/DKIM aligned pass,
+                    # authenticated submission through the owner's own server, or
+                    # — when there is no auth data and no Received chain to judge —
+                    # the From address itself) must NEVER be junked. This outranks
+                    # EVERY downstream junking gate: blacklist address/name/domain,
+                    # subject-keyword, pre-classifier tripwires, and AI/curate
+                    # rules. It routes to the same "leave in inbox, do nothing"
+                    # outcome as a whitelisted address. A spoofed owner From whose
+                    # authentication is present-but-failed is NOT exempt and stays
+                    # fully filterable.
+                    owner_protected, owner_path = _is_protected_owner_mail(
+                        msg_data, msg_data.get("from_email", ""), account, config)
+                    if owner_protected:
+                        logger.info(
+                            f"  OWNER MAIL — exempt from junking (path "
+                            f"{owner_path}): {msg_data['from_display_name']} "
+                            f"<{msg_data['from_email']}>"
+                        )
+                        owner_result = {
+                            "decision": "OWNER-EXEMPT",
+                            "confidence": 0.0,
+                            "signals_hit": [f"owner_mail_{owner_path}"],
+                        }
+                        action = (f"No action taken — owner mail, exempt from "
+                                  f"junking (path {owner_path})")
+                        log_decision(account_name, msg_data, owner_result, action)
+                        _record_processed(processed, account_key,
+                                          account_processed, msg_id)
+                        total_evaluated += 1
+                        continue
 
                     # --- Precedence check 1: Whitelist specific address ---
                     # Highest priority — nothing can override

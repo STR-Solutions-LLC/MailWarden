@@ -829,8 +829,14 @@ def _snapshot_harness(monkeypatch, *, store, uids, msg_map):
     monkeypatch.setattr(spam_filter, "deliver_eula_if_needed",
                         lambda *a, **k: True)
     monkeypatch.setattr(spam_filter, "log_decision", lambda *a, **k: None)
-    monkeypatch.setattr(spam_filter, "_command_sender_is_owner",
-                        lambda *a, **k: True)
+    # Realistic owner check: True ONLY for the owner's own address (matches
+    # production). The old unconditional `True` also made the ordinary
+    # non-owner message (msg 2) look like the owner, which the owner-mail
+    # junking exemption (gate 0) would then exempt from classification.
+    monkeypatch.setattr(
+        spam_filter, "_command_sender_is_owner",
+        lambda from_email, *a, **k: (from_email or "").strip().lower()
+        == "owner@example.com")
     monkeypatch.setattr(spam_filter, "_command_auth_ok", lambda *a, **k: True)
     monkeypatch.setattr(spam_filter, "_notify_unverified_command",
                         lambda *a, **k: None)

@@ -147,8 +147,14 @@ def _run(monkeypatch, *, uid_to_msg, processed_seed=None, dry_seen_seed=None,
     monkeypatch.setattr(spam_filter, "deliver_eula_if_needed",
                         lambda *a, **k: True)
     monkeypatch.setattr(spam_filter, "log_decision", lambda *a, **k: None)
-    monkeypatch.setattr(spam_filter, "_command_sender_is_owner",
-                        lambda *a, **k: True)
+    # Realistic owner check: True ONLY for the owner's own address. The old
+    # unconditional `True` also made every non-owner sender look like the owner,
+    # which the owner-mail junking exemption (gate 0) would then exempt from
+    # classification. Match production so stranger mail still reaches the AI.
+    monkeypatch.setattr(
+        spam_filter, "_command_sender_is_owner",
+        lambda from_email, *a, **k: (from_email or "").strip().lower()
+        == _ACCOUNT_KEY)
     monkeypatch.setattr(spam_filter, "_command_auth_ok",
                         lambda *a, **k: True)
     monkeypatch.setattr(spam_filter, "_notify_unverified_command",

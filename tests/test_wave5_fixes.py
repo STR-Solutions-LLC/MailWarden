@@ -11,6 +11,7 @@ Covers the Fable integration-audit fixes implemented in this wave:
   E8  _expunge_one no longer self-reinforces its own deferrals.
   E9  precommit fires per genuine execution path, not on bare token match.
 """
+import email as _email
 import logging
 import types
 
@@ -504,10 +505,22 @@ def test_e8_still_defers_when_genuinely_foreign_deleted_present(monkeypatch,
 # E4 — auth-failed owner reply to a REAL pending report stays in inbox;
 #      an unknown token falls through to classification.
 # --------------------------------------------------------------------------- #
+def _delivered_mime():
+    """A real parsed message with a foreign-MX Received chain, as delivered mail
+    always carries. Keeps an owner-sent reply out of the owner-mail exemption's
+    absent-host fallback (which only applies when there is NO Received evidence,
+    e.g. IMAP APPEND), so a non-command owner reply still reaches classification
+    exactly as these tests expect."""
+    return _email.message_from_string(
+        "Received: from mx.provider.test (mx.provider.test [203.0.113.9]) "
+        "by mx.provider.test with esmtp id d1 for <owner@example.com>\n"
+        "\nbody\n")
+
+
 def _mwr_reply(token="tok123", mid="<mwr-1@x>"):
     return _base_msg(
         message_id=mid, subject=f"Re: MailWarden Report [MWR-{token}]",
-        plain_text_body="APPROVE 1")
+        plain_text_body="APPROVE 1", _mime_msg=_delivered_mime())
 
 
 def test_e4_authfail_reply_to_real_report_not_classified(monkeypatch):
@@ -539,7 +552,8 @@ def _mwr_noncommand(mid="<mwr-nc@x>"):
     # neither APPROVE nor KEEP/DROP/RESTORE
     return _base_msg(message_id=mid,
                      subject="Re: MailWarden Report [MWR-tok123]",
-                     plain_text_body="thanks, looks good!")
+                     plain_text_body="thanks, looks good!",
+                     _mime_msg=_delivered_mime())
 
 
 def test_e9_tagged_noncommand_failed_move_is_retried(monkeypatch):

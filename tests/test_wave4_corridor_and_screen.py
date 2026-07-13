@@ -268,8 +268,14 @@ def _run_harness(monkeypatch, *, command_uid_to_msg=None, unseen_uid_to_msg=None
     monkeypatch.setattr(spam_filter, "deliver_eula_if_needed",
                         lambda *a, **k: True)
     monkeypatch.setattr(spam_filter, "log_decision", lambda *a, **k: None)
-    monkeypatch.setattr(spam_filter, "_command_sender_is_owner",
-                        lambda *a, **k: True)
+    # Realistic owner check: True ONLY for the owner's own address (matches
+    # production). The old unconditional `True` also made non-owner senders look
+    # like the owner, which the owner-mail junking exemption (gate 0) would then
+    # exempt — so approved/stranger mail must still reach the AI.
+    monkeypatch.setattr(
+        spam_filter, "_command_sender_is_owner",
+        lambda from_email, *a, **k: (from_email or "").strip().lower()
+        == _ACCOUNT_KEY)
     monkeypatch.setattr(spam_filter, "_command_auth_ok", lambda *a, **k: True)
     monkeypatch.setattr(spam_filter, "_notify_unverified_command",
                         lambda *a, **k: None)
