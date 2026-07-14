@@ -93,6 +93,14 @@ done
 # ----------------------------------------------------------------------------
 log "Preparing build venv..."
 rm -rf "$APP_DIR/build" "$APP_DIR/dist" "$BUILD_VENV"
+# py2app's packages= copy (setup_app.py "packages": [...], includes
+# "mailwarden_app") has no __pycache__/.pyc filter — it copies the app source
+# tree verbatim. A stray dev-time .pyc left over in mailwarden_app/__pycache__
+# is newer-looking to nothing (Python trusts the .pyc's embedded source mtime,
+# not directory copy time) and can silently shadow the current .py at runtime.
+# This shipped a stale help_content.pyc in the 1.8.1 wrong-version-label
+# incident (2026-07-14). Purge before py2app ever reads this tree.
+find "$APP_DIR/mailwarden_app" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
 # Use the tested python.org universal2 Python 3.12 as the build runtime — it
 # ships tkinter and matches the notarized bundle layout. BUILD_PY may be set
 # explicitly to override (must be a Python that includes tkinter).
@@ -188,6 +196,22 @@ for item in typing_extensions.py PyObjCTools docstring_parser; do
         log "  (WARN: $item not found in build venv)"
     fi
 done
+
+# ----------------------------------------------------------------------------
+# Step 3.6 — recompile ALL bundled Python bytecode fresh, from scratch.
+# Two ways stale .pyc can reach the signed bundle: (1) py2app's packages=
+# copy has no .pyc filter, so a stray dev-time .pyc in the source tree ships
+# verbatim (guarded above, but belt-and-suspenders here too); (2) the Step 3.5
+# manual `cp -R` above bumps the copied packages' .py mtimes to "now" AFTER
+# py2app already compiled them, which can leave their bundled .pyc looking
+# mtime-stale relative to the .py sitting next to it. Force-recompile
+# everything under the bundle's site-packages dir now, before the runtime
+# gate and before codesigning, so the signature covers bytecode that
+# actually matches shipped source (1.8.1 wrong-version-label incident,
+# 2026-07-14). Target the bundle's python lib dir, not python312.zip.
+# ----------------------------------------------------------------------------
+log "Recompiling bundle bytecode fresh (no stale .pyc may ship)..."
+"$BUILD_PY" -m compileall -f -q "$BUNDLE_SITE" 2>/dev/null || true
 
 # ----------------------------------------------------------------------------
 # Step 3.75 — runtime import gate. Invoke the REAL app binary with --diagnose.
